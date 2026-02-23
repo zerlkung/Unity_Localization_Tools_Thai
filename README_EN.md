@@ -59,6 +59,8 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
 | `--use-game-line-metrics` | Keep in-game line metrics (LineHeight/Ascender/Descender, etc.) for SDF replacement (pointSize still follows replacement font) |
 | `--original-compress` | Prefer original compression mode on save (default: uncompressed-family first) |
 | `--temp-dir <path>` | Set root path for temporary save files (fast SSD/NVMe recommended) |
+| `--scan-jobs <N>` | Set number of parallel scan workers (default: `1`, used by `--parse`/bulk scan paths) |
+| `--ps5-swizzle` | Enable PS5 atlas swizzle detect/transform mode (adds `swizzle` fields and applies auto transform) |
 | `--split-save-force` | Skip one-shot and force one-by-one SDF split save for large multi-SDF replacements |
 | `--oneshot-save-force` | Force one-shot only (disable split-save fallback) even for large multi-SDF replacements |
 
@@ -67,6 +69,9 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
 ```bat
 :: Export font info (creates Muck.json)
 unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --parse
+
+:: Export font info with parallel workers + PS5 swizzle detection fields
+unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --parse --scan-jobs 10 --ps5-swizzle
 
 :: Replace all fonts with Mulmaru
 unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --mulmaru
@@ -105,7 +110,7 @@ unity_font_replacer_en.exe --gamepath "D:\Games\Muck" --list Muck.json
 2. Fill `Replace_to` for entries you want to replace.
 3. Run with `--list`.
 
-JSON example:
+JSON example (without `--ps5-swizzle`):
 
 ```json
 {
@@ -123,6 +128,28 @@ JSON example:
         "Path_ID": 456,
         "Type": "SDF",
         "Name": "Arial SDF",
+        "Replace_to": ""
+    }
+}
+```
+
+- If you run `--parse` with `--ps5-swizzle`, SDF entries include two additional fields:
+  - `swizzle`: auto-detected target atlas state (`"True"`/`"False"`)
+  - `process_swizzle`: whether to force replacement atlas into swizzled state (default `"False"`)
+- `swizzle` and `process_swizzle` are inserted into JSON only when `--ps5-swizzle` is enabled.
+
+JSON example (with `--ps5-swizzle`, SDF):
+
+```json
+{
+    "sharedassets0.assets|sharedassets0.assets|Arial SDF|SDF|456": {
+        "File": "sharedassets0.assets",
+        "assets_name": "sharedassets0.assets",
+        "Path_ID": 456,
+        "Type": "SDF",
+        "Name": "Arial SDF",
+        "swizzle": "True",
+        "process_swizzle": "False",
         "Replace_to": ""
     }
 }
@@ -222,7 +249,10 @@ python export_fonts_en.py "D:\MyGame"
 - Use `--original-compress` to prefer original compression mode first.
 - If save is slow, try `--temp-dir` and point it to a fast SSD/NVMe path.
 - `--parse` scans via per-file worker processes so a crash in one file does not terminate the whole scan.
+- You can increase scan throughput with `--scan-jobs`.
 - Scanning uses blacklist-based exclusion (`*.bak`, `.info`, `.config`, etc.).
+- With `--ps5-swizzle`, the tool auto-detects target SDF atlas swizzle state and swizzles/unswizzles replacement atlases when needed.
+- `swizzle` and `process_swizzle` are added to `--parse` JSON only when `--ps5-swizzle` is used.
 - For large multi-SDF replacements, split-save fallback is enabled by default when one-shot fails (adaptive batch size).
   - `--split-save-force`: skip one-shot and force one-by-one SDF split-save.
   - `--oneshot-save-force`: disable split-save fallback and try one-shot only.

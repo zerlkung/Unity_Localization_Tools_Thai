@@ -57,6 +57,8 @@ unity_font_replacer.exe --gamepath "D:\Games\Muck" --mulmaru
 | `--use-game-line-metrics` | SDF 교체 시 게임 원본 줄 간격 메트릭 사용 (기본: 교체 폰트 메트릭 보정 적용, pointSize는 교체값 유지) |
 | `--original-compress` | 저장 시 원본 압축 모드를 우선 사용 (기본: 무압축 계열 우선) |
 | `--temp-dir <경로>` | 임시 저장 폴더 루트 경로 지정 (빠른 SSD/NVMe 권장) |
+| `--scan-jobs <N>` | 폰트 스캔 병렬 워커 수 지정 (기본: `1`, `--parse`/일괄교체 스캔에 적용) |
+| `--ps5-swizzle` | PS5 Atlas swizzle 자동 판별/변환 모드 활성화 (`swizzle` 필드 생성 및 자동 변환) |
 | `--split-save-force` | 대형 SDF 다건 교체에서 one-shot을 건너뛰고 SDF 1개씩 강제 분할 저장 |
 | `--oneshot-save-force` | 대형 SDF 다건 교체에서도 분할 저장 폴백 없이 one-shot만 시도 |
 
@@ -65,6 +67,9 @@ unity_font_replacer.exe --gamepath "D:\Games\Muck" --mulmaru
 ```bat
 :: 폰트 정보 파싱 (Muck.json 생성)
 unity_font_replacer.exe --gamepath "D:\Games\Muck" --parse
+
+:: 폰트 정보 파싱 + 병렬 워커 + PS5 swizzle 판별 필드 포함
+unity_font_replacer.exe --gamepath "D:\Games\Muck" --parse --scan-jobs 10 --ps5-swizzle
 
 :: Mulmaru로 전체 교체
 unity_font_replacer.exe --gamepath "D:\Games\Muck" --mulmaru
@@ -103,7 +108,7 @@ unity_font_replacer.exe --gamepath "D:\Games\Muck" --list Muck.json
 2. JSON의 `Replace_to` 필드에 원하는 폰트 이름 입력
 3. `--list`로 교체 실행
 
-JSON 예시:
+JSON 예시 (`--ps5-swizzle` 미사용):
 
 ```json
 {
@@ -121,6 +126,28 @@ JSON 예시:
         "Path_ID": 456,
         "Type": "SDF",
         "Name": "Arial SDF",
+        "Replace_to": ""
+    }
+}
+```
+
+- `--ps5-swizzle`를 함께 사용해 `--parse`하면, SDF 항목에 아래 2개 필드가 추가됩니다.
+  - `swizzle`: 원본 대상 Atlas의 자동 판별 결과 (`"True"`/`"False"`)
+  - `process_swizzle`: 교체 Atlas를 swizzle 상태로 강제 변환할지 여부 (기본 `"False"`)
+- `swizzle`/`process_swizzle` 필드는 `--ps5-swizzle` 옵션이 있을 때만 JSON에 삽입됩니다.
+
+JSON 예시 (`--ps5-swizzle` 사용, SDF):
+
+```json
+{
+    "sharedassets0.assets|sharedassets0.assets|Arial SDF|SDF|456": {
+        "File": "sharedassets0.assets",
+        "assets_name": "sharedassets0.assets",
+        "Path_ID": 456,
+        "Type": "SDF",
+        "Name": "Arial SDF",
+        "swizzle": "True",
+        "process_swizzle": "False",
         "Replace_to": ""
     }
 }
@@ -220,7 +247,10 @@ python export_fonts.py "D:\MyGame"
 - 저장 속도가 느리면 `--temp-dir`로 임시 저장 폴더를 빠른 SSD/NVMe 경로로 지정해 보세요.
 - 프로그램 종료 시 임시 폴더는 자동 정리됩니다.
 - `--parse`는 파일 단위 워커 프로세스로 스캔해 단일 파일 크래시가 전체 작업 중단으로 이어지지 않도록 격리합니다.
+- 스캔 속도를 높이려면 `--scan-jobs`로 워커 수를 늘릴 수 있습니다.
 - 스캔은 블랙리스트 기반 제외를 사용합니다 (`*.bak`, `.info`, `.config` 등 제외).
+- `--ps5-swizzle`를 사용하면 SDF Atlas의 swizzle 상태를 자동 판별하고, 필요 시 교체 Atlas를 swizzle/unswizzle 변환합니다.
+- `swizzle`/`process_swizzle` 필드는 `--ps5-swizzle` 모드에서만 `--parse` JSON에 추가됩니다.
 - 대형 SDF 다건 교체에서는 기본적으로 one-shot 실패 시 적응형 분할 저장(배치 크기 자동 조절)으로 폴백합니다.
   - `--split-save-force`: one-shot을 건너뛰고 SDF 1개씩 강제 분할 저장
   - `--oneshot-save-force`: 분할 저장 폴백 비활성화(one-shot만 시도)

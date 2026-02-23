@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import traceback as tb_module
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import Any, Callable, Iterable, Literal, NoReturn, cast
 
@@ -23,6 +24,9 @@ from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 Language = Literal["ko", "en"]
 JsonDict = dict[str, Any]
 _REGISTERED_TEMP_DIRS: set[str] = set()
+PS5_SWIZZLE_MASK_X = 0x385F0
+PS5_SWIZZLE_MASK_Y = 0x07A0F
+PS5_SWIZZLE_ROTATE = 90
 
 
 class TeeWriter:
@@ -216,6 +220,18 @@ def parse_target_files_arg(target_file_args: list[str] | None) -> set[str]:
     return selected_files
 
 
+def strip_wrapping_quotes_repeated(value: str) -> str:
+    """KR: 앞뒤 따옴표(' 또는 ")를 반복 제거합니다.
+    EN: Repeatedly strip wrapping quotes (' or ") from both ends.
+    """
+    text = str(value).strip()
+    while True:
+        updated = text.strip().strip('"').strip("'")
+        if updated == text:
+            return updated
+        text = updated
+
+
 def register_temp_dir_for_cleanup(path: str) -> str:
     """KR: 종료 시 삭제할 임시 디렉터리를 등록하고 정규화 경로를 반환합니다.
     EN: Register a temp directory for cleanup at exit and return normalized path.
@@ -301,6 +317,458 @@ def normalize_font_name(name: str) -> str:
             name = name[:-len(suffix)]
             break
     return name
+
+
+def parse_bool_flag(value: Any) -> bool:
+    """KR: 문자열/숫자/불리언 입력을 안전하게 bool로 해석합니다.
+    EN: Safely interpret string/number/bool values as bool.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "y", "on"}
+
+
+@lru_cache(maxsize=128)
+def _ps5_bit_positions(mask: int) -> tuple[int, ...]:
+    return tuple(i for i in range(max(mask.bit_length(), 0)) if (mask >> i) & 1)
+
+
+@lru_cache(maxsize=128)
+def _ps5_axis_tile_size(mask: int) -> int:
+    positions = _ps5_bit_positions(mask)
+    return 1 << len(positions) if positions else 1
+
+
+@lru_cache(maxsize=128)
+def _ps5_deposit_table(mask: int) -> tuple[int, ...]:
+    """KR: 마스크 비트폭(타일 기준) pdep 유사 배치 테이블을 생성합니다.
+    EN: Build a pdep-like deposit table using mask bit-width (tile-local axis).
+    """
+    positions = _ps5_bit_positions(mask)
+    axis_size = _ps5_axis_tile_size(mask)
+    table: list[int] = [0] * axis_size
+    for value in range(axis_size):
+        deposited = 0
+        for bit_index, dst_bit in enumerate(positions):
+            if (value >> bit_index) & 1:
+                deposited |= (1 << dst_bit)
+        table[value] = deposited
+    return tuple(table)
+
+
+def _ps5_validate_texture_shape(data: bytes, width: int, height: int, bytes_per_element: int) -> int:
+    if width <= 0 or height <= 0 or bytes_per_element <= 0:
+        raise ValueError(
+            f"Invalid texture shape for swizzle: width={width}, height={height}, bpe={bytes_per_element}"
+        )
+    total_elements = width * height
+    expected_size = total_elements * bytes_per_element
+    if len(data) != expected_size:
+        raise ValueError(
+            f"Texture data size mismatch: expected={expected_size}, got={len(data)} "
+            f"(w={width}, h={height}, bpe={bytes_per_element})"
+        )
+    return total_elements
+
+
+def ps5_unswizzle_bytes(
+    data: bytes,
+    width: int,
+    height: int,
+    bytes_per_element: int,
+    mask_x: int = PS5_SWIZZLE_MASK_X,
+    mask_y: int = PS5_SWIZZLE_MASK_Y,
+) -> bytes:
+    """KR: PS5 swizzled 바이트 배열을 선형 순서로 변환합니다.
+    EN: Convert PS5-swizzled bytes into linear row-major bytes.
+    """
+    total_elements = _ps5_validate_texture_shape(data, width, height, bytes_per_element)
+    src = memoryview(data)
+    dst = bytearray(len(data))
+    tile_w = _ps5_axis_tile_size(mask_x)
+    tile_h = _ps5_axis_tile_size(mask_y)
+    xdep = _ps5_deposit_table(mask_x)
+    ydep = _ps5_deposit_table(mask_y)
+    macro_cols = (width + tile_w - 1) // tile_w
+    tile_elements = tile_w * tile_h
+
+    for y in range(height):
+        row_start = y * width
+        macro_y = y // tile_h
+        local_y = y % tile_h
+        row_offset = ydep[local_y]
+        for x in range(width):
+            macro_x = x // tile_w
+            local_x = x % tile_w
+            tile_base = ((macro_y * macro_cols) + macro_x) * tile_elements
+            src_idx = tile_base + row_offset + xdep[local_x]
+            if src_idx < 0 or src_idx >= total_elements:
+                raise ValueError(
+                    f"PS5 unswizzle index out of range: idx={src_idx}, total={total_elements}, "
+                    f"w={width}, h={height}, mask_x={mask_x:#x}, mask_y={mask_y:#x}"
+                )
+            src_off = src_idx * bytes_per_element
+            dst_off = (row_start + x) * bytes_per_element
+            dst[dst_off: dst_off + bytes_per_element] = src[src_off: src_off + bytes_per_element]
+
+    return bytes(dst)
+
+
+def ps5_swizzle_bytes(
+    data: bytes,
+    width: int,
+    height: int,
+    bytes_per_element: int,
+    mask_x: int = PS5_SWIZZLE_MASK_X,
+    mask_y: int = PS5_SWIZZLE_MASK_Y,
+) -> bytes:
+    """KR: 선형 순서 바이트 배열을 PS5 swizzle 순서로 변환합니다.
+    EN: Convert linear row-major bytes into PS5-swizzled order.
+    """
+    total_elements = _ps5_validate_texture_shape(data, width, height, bytes_per_element)
+    src = memoryview(data)
+    dst = bytearray(len(data))
+    tile_w = _ps5_axis_tile_size(mask_x)
+    tile_h = _ps5_axis_tile_size(mask_y)
+    xdep = _ps5_deposit_table(mask_x)
+    ydep = _ps5_deposit_table(mask_y)
+    macro_cols = (width + tile_w - 1) // tile_w
+    tile_elements = tile_w * tile_h
+
+    for y in range(height):
+        row_start = y * width
+        macro_y = y // tile_h
+        local_y = y % tile_h
+        row_offset = ydep[local_y]
+        for x in range(width):
+            macro_x = x // tile_w
+            local_x = x % tile_w
+            tile_base = ((macro_y * macro_cols) + macro_x) * tile_elements
+            dst_idx = tile_base + row_offset + xdep[local_x]
+            if dst_idx < 0 or dst_idx >= total_elements:
+                raise ValueError(
+                    f"PS5 swizzle index out of range: idx={dst_idx}, total={total_elements}, "
+                    f"w={width}, h={height}, mask_x={mask_x:#x}, mask_y={mask_y:#x}"
+                )
+            src_off = (row_start + x) * bytes_per_element
+            dst_off = dst_idx * bytes_per_element
+            dst[dst_off: dst_off + bytes_per_element] = src[src_off: src_off + bytes_per_element]
+
+    return bytes(dst)
+
+
+def _ps5_mode_for_swizzle(image: Image.Image) -> str:
+    mode = image.mode
+    if mode in {"L", "LA", "RGB", "RGBA"}:
+        return mode
+    if mode == "P":
+        return "L"
+    return "RGBA"
+
+
+def _ps5_prepare_image(image: Image.Image) -> Image.Image:
+    mode = _ps5_mode_for_swizzle(image)
+    if image.mode == mode:
+        return image
+    return image.convert(mode)
+
+
+def _ps5_roughness_score(
+    data: bytes,
+    width: int,
+    height: int,
+    bytes_per_element: int,
+    max_axis_samples: int = 256,
+) -> float:
+    """KR: 로컬 픽셀 변화량 기반 거칠기 점수를 계산합니다.
+    EN: Compute a local variation roughness score.
+    """
+    _ps5_validate_texture_shape(data, width, height, bytes_per_element)
+    view = memoryview(data)
+    step_x = max(1, width // max_axis_samples)
+    step_y = max(1, height // max_axis_samples)
+
+    channel_index = 0
+    if bytes_per_element > 1:
+        sums = [0.0] * bytes_per_element
+        sums_sq = [0.0] * bytes_per_element
+        sample_count = 0
+        for y in range(0, height, step_y):
+            row_base = y * width * bytes_per_element
+            for x in range(0, width, step_x):
+                base = row_base + x * bytes_per_element
+                sample_count += 1
+                for channel in range(bytes_per_element):
+                    value = float(view[base + channel])
+                    sums[channel] += value
+                    sums_sq[channel] += value * value
+        if sample_count > 0:
+            best_var = -1.0
+            for channel in range(bytes_per_element):
+                mean = sums[channel] / sample_count
+                variance = (sums_sq[channel] / sample_count) - (mean * mean)
+                if variance > best_var:
+                    best_var = variance
+                    channel_index = channel
+
+    dx_sum = 0.0
+    dx_count = 0
+    if width > step_x:
+        for y in range(0, height, step_y):
+            row_base = y * width * bytes_per_element
+            for x in range(0, width - step_x, step_x):
+                left_idx = row_base + x * bytes_per_element + channel_index
+                right_idx = left_idx + step_x * bytes_per_element
+                dx_sum += abs(float(view[right_idx]) - float(view[left_idx]))
+                dx_count += 1
+
+    dy_sum = 0.0
+    dy_count = 0
+    if height > step_y:
+        row_stride = width * bytes_per_element
+        for y in range(0, height - step_y, step_y):
+            row_base = y * row_stride
+            down_base = row_base + step_y * row_stride
+            for x in range(0, width, step_x):
+                up_idx = row_base + x * bytes_per_element + channel_index
+                down_idx = down_base + x * bytes_per_element + channel_index
+                dy_sum += abs(float(view[down_idx]) - float(view[up_idx]))
+                dy_count += 1
+
+    dx = dx_sum / dx_count if dx_count else 0.0
+    dy = dy_sum / dy_count if dy_count else 0.0
+    return float(dx + dy)
+
+
+def detect_ps5_swizzle_state(
+    data: bytes,
+    width: int,
+    height: int,
+    bytes_per_element: int,
+    mask_x: int = PS5_SWIZZLE_MASK_X,
+    mask_y: int = PS5_SWIZZLE_MASK_Y,
+) -> tuple[str, float, float, float, bytes, bytes]:
+    """KR: 입력 바이트가 swizzled인지 휴리스틱으로 판별합니다.
+    EN: Heuristically detect whether input bytes are likely swizzled.
+    """
+    raw_score = _ps5_roughness_score(data, width, height, bytes_per_element)
+    unswizzled = ps5_unswizzle_bytes(data, width, height, bytes_per_element, mask_x=mask_x, mask_y=mask_y)
+    swizzled = ps5_swizzle_bytes(data, width, height, bytes_per_element, mask_x=mask_x, mask_y=mask_y)
+    unsw_score = _ps5_roughness_score(unswizzled, width, height, bytes_per_element)
+    swz_score = _ps5_roughness_score(swizzled, width, height, bytes_per_element)
+
+    if unsw_score < raw_score * 0.92 and unsw_score <= swz_score * 0.98:
+        verdict = "likely_swizzled_input"
+    elif raw_score <= unsw_score * 0.92 and raw_score <= swz_score * 0.92:
+        verdict = "likely_linear_input"
+    else:
+        verdict = "inconclusive"
+
+    return verdict, raw_score, unsw_score, swz_score, unswizzled, swizzled
+
+
+def detect_ps5_swizzle_state_from_image(
+    image: Image.Image,
+    mask_x: int = PS5_SWIZZLE_MASK_X,
+    mask_y: int = PS5_SWIZZLE_MASK_Y,
+    rotate: int = PS5_SWIZZLE_ROTATE,
+) -> tuple[str, float, float, float]:
+    """KR: Pillow 이미지의 swizzle 상태를 판별합니다.
+    EN: Detect swizzle state from a Pillow image.
+    """
+    prepared = _ps5_prepare_image(image)
+    if rotate % 360 != 0 and prepared.width == prepared.height:
+        prepared = prepared.rotate(rotate % 360, expand=False)
+
+    data = prepared.tobytes()
+    bytes_per_element = len(prepared.getbands())
+    verdict, raw_score, unsw_score, swz_score, _, _ = detect_ps5_swizzle_state(
+        data,
+        prepared.width,
+        prepared.height,
+        bytes_per_element,
+        mask_x=mask_x,
+        mask_y=mask_y,
+    )
+    return verdict, raw_score, unsw_score, swz_score
+
+
+def apply_ps5_swizzle_to_image(
+    image: Image.Image,
+    mask_x: int = PS5_SWIZZLE_MASK_X,
+    mask_y: int = PS5_SWIZZLE_MASK_Y,
+    rotate: int = PS5_SWIZZLE_ROTATE,
+) -> Image.Image:
+    """KR: 선형 이미지에 PS5 swizzle 변환을 적용합니다.
+    EN: Apply PS5 swizzle transform to a linear image.
+    """
+    prepared = _ps5_prepare_image(image)
+    if rotate % 360 != 0 and prepared.width == prepared.height:
+        prepared = prepared.rotate(rotate % 360, expand=False)
+
+    data = prepared.tobytes()
+    bytes_per_element = len(prepared.getbands())
+    swizzled = ps5_swizzle_bytes(
+        data,
+        prepared.width,
+        prepared.height,
+        bytes_per_element,
+        mask_x=mask_x,
+        mask_y=mask_y,
+    )
+    return Image.frombytes(prepared.mode, (prepared.width, prepared.height), swizzled)
+
+
+def apply_ps5_unswizzle_to_image(
+    image: Image.Image,
+    mask_x: int = PS5_SWIZZLE_MASK_X,
+    mask_y: int = PS5_SWIZZLE_MASK_Y,
+    rotate: int = PS5_SWIZZLE_ROTATE,
+) -> Image.Image:
+    """KR: swizzled 이미지에 PS5 unswizzle 변환을 적용합니다.
+    EN: Apply PS5 unswizzle transform to a swizzled image.
+    """
+    prepared = _ps5_prepare_image(image)
+    data = prepared.tobytes()
+    bytes_per_element = len(prepared.getbands())
+    unswizzled = ps5_unswizzle_bytes(
+        data,
+        prepared.width,
+        prepared.height,
+        bytes_per_element,
+        mask_x=mask_x,
+        mask_y=mask_y,
+    )
+    output = Image.frombytes(prepared.mode, (prepared.width, prepared.height), unswizzled)
+    if rotate % 360 != 0 and output.width == output.height:
+        output = output.rotate((-rotate) % 360, expand=False)
+    return output
+
+
+def detect_texture_object_ps5_swizzle(
+    texture_obj: Any,
+    mask_x: int = PS5_SWIZZLE_MASK_X,
+    mask_y: int = PS5_SWIZZLE_MASK_Y,
+    rotate: int = PS5_SWIZZLE_ROTATE,
+) -> str | None:
+    """KR: Texture2D 오브젝트의 swizzle 상태를 판별합니다.
+    EN: Detect swizzle state for a Texture2D object.
+    """
+    verdict, _ = detect_texture_object_ps5_swizzle_detail(
+        texture_obj,
+        mask_x=mask_x,
+        mask_y=mask_y,
+        rotate=rotate,
+    )
+    return verdict
+
+
+def detect_texture_object_ps5_swizzle_detail(
+    texture_obj: Any,
+    mask_x: int = PS5_SWIZZLE_MASK_X,
+    mask_y: int = PS5_SWIZZLE_MASK_Y,
+    rotate: int = PS5_SWIZZLE_ROTATE,
+) -> tuple[str | None, str | None]:
+    """KR: Texture2D 오브젝트의 swizzle 상태를 판별합니다.
+    KR: 반환값은 (판정값, 판정근거)입니다.
+    EN: Detect swizzle state for a Texture2D object.
+    EN: Returns (verdict, source).
+    """
+    try:
+        texture = texture_obj.parse_as_object()
+        width = int(getattr(texture, "m_Width", 0) or 0)
+        height = int(getattr(texture, "m_Height", 0) or 0)
+        stream_data = getattr(texture, "m_StreamData", None)
+        try:
+            stream_size = int(getattr(stream_data, "size", 0) or 0)
+        except Exception:
+            stream_size = 0
+        is_readable = bool(getattr(texture, "m_IsReadable", False))
+        try:
+            texture_format = int(getattr(texture, "m_TextureFormat", -1) or -1)
+        except Exception:
+            texture_format = -1
+
+        image_data = getattr(texture, "image_data", None)
+        if isinstance(image_data, (bytes, bytearray)):
+            image_data_len = len(image_data)
+        else:
+            image_data_len = 0
+
+        # KR: PS5 샘플에서 stream-backed + non-readable 조합은 swizzle 가능성이 매우 높고,
+        # KR: inline readable(image_data) 조합은 linear인 경우가 많습니다.
+        # EN: In PS5 samples, stream-backed + non-readable textures are strong swizzle candidates,
+        # EN: while inline readable(image_data) payloads are often linear.
+        meta_hint: str | None = None
+        meta_source: str | None = None
+        if width > 0 and height > 0:
+            expected_alpha8_size = width * height
+            if texture_format == 1 and stream_size > 0 and not is_readable and stream_size == expected_alpha8_size:
+                meta_hint = "likely_swizzled_input"
+                meta_source = "meta-alpha8-stream"
+            elif stream_size > 0 and not is_readable:
+                meta_hint = "likely_swizzled_input"
+                meta_source = "meta-stream"
+            elif stream_size == 0 and is_readable and image_data_len > 0:
+                meta_hint = "likely_linear_input"
+                meta_source = "meta-inline"
+
+        # KR: 메타 기준이 확실하면 유사도보다 우선합니다.
+        # EN: Prefer metadata verdict when it is available.
+        if meta_hint is not None:
+            return meta_hint, meta_source or "meta"
+
+        if width > 0 and height > 0:
+            raw_data: bytes | None = None
+            get_image_data = getattr(texture, "get_image_data", None)
+            if callable(get_image_data):
+                try:
+                    candidate = get_image_data()
+                    if isinstance(candidate, (bytes, bytearray)):
+                        raw_data = bytes(candidate)
+                except Exception:
+                    raw_data = None
+            if raw_data is None:
+                image_data = getattr(texture, "image_data", None)
+                if isinstance(image_data, (bytes, bytearray)):
+                    raw_data = bytes(image_data)
+
+            if raw_data:
+                total_elements = width * height
+                if total_elements > 0 and (len(raw_data) % total_elements) == 0:
+                    bytes_per_element = len(raw_data) // total_elements
+                    if bytes_per_element > 0:
+                        try:
+                            verdict, *_ = detect_ps5_swizzle_state(
+                                raw_data,
+                                width,
+                                height,
+                                bytes_per_element,
+                                mask_x=mask_x,
+                                mask_y=mask_y,
+                            )
+                            if verdict != "inconclusive":
+                                return verdict, "raw-data"
+                        except Exception:
+                            pass
+
+        image = getattr(texture, "image", None)
+        if isinstance(image, Image.Image):
+            verdict, _, _, _ = detect_ps5_swizzle_state_from_image(
+                image,
+                mask_x=mask_x,
+                mask_y=mask_y,
+                rotate=rotate,
+            )
+            return verdict, "image"
+        return None, None
+    except Exception:
+        return None, None
 
 
 def warn_unitypy_version(
@@ -845,11 +1313,23 @@ def _create_generator(
     return generator
 
 
-def _scan_fonts_from_env(env: Any, file_name: str, lang: Language = "ko") -> dict[str, list[JsonDict]]:
+def _scan_fonts_from_env(
+    env: Any,
+    file_name: str,
+    lang: Language = "ko",
+    detect_ps5_swizzle: bool = False,
+) -> dict[str, list[JsonDict]]:
     """KR: 로드된 UnityPy env에서 TTF/SDF 폰트 정보를 추출합니다.
     EN: Extract TTF/SDF font entries from a loaded UnityPy env.
     """
     scanned: dict[str, list[JsonDict]] = {"ttf": [], "sdf": []}
+    texture_lookup: dict[tuple[str, int], Any] = {}
+    texture_swizzle_cache: dict[str, str | None] = {}
+    if detect_ps5_swizzle:
+        for item in env.objects:
+            if item.type.name != "Texture2D":
+                continue
+            texture_lookup[(item.assets_file.name, int(item.path_id))] = item
 
     for obj in env.objects:
         try:
@@ -870,6 +1350,8 @@ def _scan_fonts_from_env(env: Any, file_name: str, lang: Language = "ko") -> dic
             elif obj.type.name == "MonoBehaviour":
                 parse_dict = None
                 is_font = False
+                atlas_file_id = 0
+                atlas_path_id = 0
                 try:
                     parse_dict = obj.parse_as_dict()
                     # KR: TMP 스키마 판별: 신형(m_FaceInfo/m_AtlasTextures) 또는 구형(m_fontInfo/atlas)
@@ -891,18 +1373,19 @@ def _scan_fonts_from_env(env: Any, file_name: str, lang: Language = "ko") -> dic
                         parse_dict = obj.parse_as_dict()
                     atlas_textures = parse_dict.get("m_AtlasTextures", [])
                     glyph_count = len(parse_dict.get("m_GlyphTable", []))
-                    if not atlas_textures and "atlas" in parse_dict:
-                        atlas_textures = []
+                    if not atlas_textures and isinstance(parse_dict.get("atlas"), dict):
+                        atlas_textures = [cast(JsonDict, parse_dict.get("atlas"))]
                     if glyph_count == 0:
                         glyph_count = len(parse_dict.get("m_glyphInfoList", []))
                     if atlas_textures:
                         first_atlas = atlas_textures[0]
-                        file_id = first_atlas.get("m_FileID", 0)
-                        path_id = first_atlas.get("m_PathID", 0)
-                        # KR: 외부 참조 stub(FileID!=0, PathID=0)은 실제 교체 대상이 아닙니다.
-                        # EN: External stubs (FileID!=0, PathID=0) are not valid replacement targets.
-                        if file_id != 0 and path_id == 0:
-                            continue
+                        if isinstance(first_atlas, dict):
+                            atlas_file_id = int(first_atlas.get("m_FileID", 0) or 0)
+                            atlas_path_id = int(first_atlas.get("m_PathID", 0) or 0)
+                            # KR: 외부 참조 stub(FileID!=0, PathID=0)은 실제 교체 대상이 아닙니다.
+                            # EN: External stubs (FileID!=0, PathID=0) are not valid replacement targets.
+                            if atlas_file_id != 0 and atlas_path_id == 0:
+                                continue
                     if glyph_count == 0:
                         continue
                 except Exception:
@@ -912,12 +1395,30 @@ def _scan_fonts_from_env(env: Any, file_name: str, lang: Language = "ko") -> dic
                         debug_parse_log(f"[scan_fonts] SDF field check failed: {file_name} | PathID {obj.path_id}")
                     continue
 
-                scanned["sdf"].append({
+                sdf_info: JsonDict = {
                     "file": file_name,
                     "assets_name": obj.assets_file.name,
                     "name": obj.peek_name(),
                     "path_id": obj.path_id,
-                })
+                }
+                if detect_ps5_swizzle:
+                    swizzle_state = False
+                    if atlas_file_id == 0 and atlas_path_id != 0:
+                        cache_key = f"{obj.assets_file.name}|{atlas_path_id}"
+                        if cache_key in texture_swizzle_cache:
+                            swizzle_verdict = texture_swizzle_cache[cache_key]
+                        else:
+                            texture_obj = texture_lookup.get((obj.assets_file.name, atlas_path_id))
+                            swizzle_verdict = (
+                                detect_texture_object_ps5_swizzle(texture_obj)
+                                if texture_obj is not None
+                                else None
+                            )
+                            texture_swizzle_cache[cache_key] = swizzle_verdict
+                        swizzle_state = swizzle_verdict == "likely_swizzled_input"
+                    sdf_info["swizzle"] = "True" if swizzle_state else "False"
+
+                scanned["sdf"].append(sdf_info)
         except Exception as e:
             if lang == "ko":
                 print(f"[scan_fonts] 오브젝트 처리 실패: {file_name} | PathID {obj.path_id} ({e})")
@@ -932,6 +1433,7 @@ def _scan_fonts_in_asset_file(
     assets_file: str,
     generator: TypeTreeGenerator,
     lang: Language = "ko",
+    detect_ps5_swizzle: bool = False,
 ) -> tuple[dict[str, list[JsonDict]], str | None]:
     """KR: 단일 에셋 파일을 로드해 폰트 정보를 추출합니다.
     EN: Load one asset file and extract font entries.
@@ -949,7 +1451,7 @@ def _scan_fonts_in_asset_file(
         return scanned, f"UnityPy.load failed: {assets_file} ({e})"
 
     try:
-        scanned = _scan_fonts_from_env(env, file_name, lang=lang)
+        scanned = _scan_fonts_from_env(env, file_name, lang=lang, detect_ps5_swizzle=detect_ps5_swizzle)
     finally:
         close_unitypy_env(env)
         env = None
@@ -962,6 +1464,7 @@ def _scan_fonts_via_worker(
     game_path: str,
     assets_file: str,
     lang: Language = "ko",
+    detect_ps5_swizzle: bool = False,
 ) -> tuple[dict[str, list[JsonDict]], str | None]:
     """KR: 파일 단위 서브프로세스 워커로 스캔해 크래시를 격리합니다.
     EN: Scan using a per-file subprocess worker to isolate hard crashes.
@@ -994,6 +1497,8 @@ def _scan_fonts_via_worker(
                 "--_scan-file-worker-output",
                 output_path,
             ]
+        if detect_ps5_swizzle:
+            cmd.append("--ps5-swizzle")
 
         proc = subprocess.run(
             cmd,
@@ -1045,13 +1550,17 @@ def scan_fonts(
     lang: Language = "ko",
     target_files: set[str] | None = None,
     isolate_files: bool = True,
+    scan_jobs: int = 1,
+    ps5_swizzle: bool = False,
 ) -> dict[str, list[JsonDict]]:
     """KR: 게임 에셋을 스캔해 TTF/SDF 폰트 목록을 반환합니다.
     KR: target_files가 있으면 해당 파일만 스캔합니다.
     KR: isolate_files=True면 파일 단위 워커 프로세스로 스캔해 크래시를 격리합니다.
+    KR: scan_jobs>1이면 isolate_files 경로에서 워커를 병렬 실행합니다.
     EN: Scan game assets and return TTF/SDF font entries.
     EN: If target_files is provided, only scan those files.
     EN: If isolate_files=True, scan each file via worker subprocess to isolate hard crashes.
+    EN: If scan_jobs>1, worker subprocesses are executed in parallel for isolate_files mode.
     """
     data_path = get_data_path(game_path, lang=lang)
     unity_version = get_unity_version(game_path, lang=lang)
@@ -1065,6 +1574,12 @@ def scan_fonts(
     }
 
     total_files = len(assets_files)
+    try:
+        scan_jobs = int(scan_jobs)
+    except Exception:
+        scan_jobs = 1
+    if scan_jobs < 1:
+        scan_jobs = 1
     if lang == "ko":
         if target_files:
             print(f"[scan_fonts] --target-file 기준 스캔 시작: {total_files}개 파일")
@@ -1076,15 +1591,46 @@ def scan_fonts(
         else:
             print(f"[scan_fonts] Starting full scan: {total_files} file(s)")
 
-    for idx, assets_file in enumerate(assets_files, start=1):
-        fn = os.path.basename(assets_file)
+    if isolate_files and scan_jobs > 1 and total_files > 1:
+        max_workers = min(scan_jobs, total_files)
         if lang == "ko":
-            print(f"[scan_fonts] 진행 {idx}/{total_files}: {fn}")
+            print(f"[scan_fonts] 병렬 워커 모드: {max_workers}개")
         else:
-            print(f"[scan_fonts] Progress {idx}/{total_files}: {fn}")
+            print(f"[scan_fonts] Parallel worker mode: {max_workers}")
 
-        if isolate_files:
-            scanned, worker_error = _scan_fonts_via_worker(game_path, assets_file, lang=lang)
+        indexed_results: dict[int, tuple[dict[str, list[JsonDict]], str | None, str]] = {}
+        completed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_meta = {
+                executor.submit(
+                    _scan_fonts_via_worker,
+                    game_path,
+                    assets_file,
+                    lang,
+                    ps5_swizzle,
+                ): (idx, os.path.basename(assets_file))
+                for idx, assets_file in enumerate(assets_files)
+            }
+            for future in as_completed(future_to_meta):
+                idx, fn = future_to_meta[future]
+                try:
+                    scanned, worker_error = future.result()
+                except Exception as e:
+                    scanned = {"ttf": [], "sdf": []}
+                    worker_error = (
+                        f"scan worker 실행 실패: {e!r}"
+                        if lang == "ko"
+                        else f"failed to run scan worker: {e!r}"
+                    )
+                indexed_results[idx] = (scanned, worker_error, fn)
+                completed += 1
+                if lang == "ko":
+                    print(f"[scan_fonts] 진행 {completed}/{total_files}: {fn}")
+                else:
+                    print(f"[scan_fonts] Progress {completed}/{total_files}: {fn}")
+
+        for idx in range(total_files):
+            scanned, worker_error, _ = indexed_results.get(idx, ({"ttf": [], "sdf": []}, None, ""))
             if worker_error:
                 if lang == "ko":
                     print(f"[scan_fonts] 워커 경고: {worker_error}")
@@ -1092,14 +1638,41 @@ def scan_fonts(
                     print(f"[scan_fonts] Worker warning: {worker_error}")
             fonts["ttf"].extend(scanned.get("ttf", []))
             fonts["sdf"].extend(scanned.get("sdf", []))
-            continue
+    else:
+        for idx, assets_file in enumerate(assets_files, start=1):
+            fn = os.path.basename(assets_file)
+            if lang == "ko":
+                print(f"[scan_fonts] 진행 {idx}/{total_files}: {fn}")
+            else:
+                print(f"[scan_fonts] Progress {idx}/{total_files}: {fn}")
 
-        scanned, load_error = _scan_fonts_in_asset_file(assets_file, generator, lang=lang)
-        if load_error:
-            print(f"[scan_fonts] {load_error}")
-            continue
-        fonts["ttf"].extend(scanned.get("ttf", []))
-        fonts["sdf"].extend(scanned.get("sdf", []))
+            if isolate_files:
+                scanned, worker_error = _scan_fonts_via_worker(
+                    game_path,
+                    assets_file,
+                    lang=lang,
+                    detect_ps5_swizzle=ps5_swizzle,
+                )
+                if worker_error:
+                    if lang == "ko":
+                        print(f"[scan_fonts] 워커 경고: {worker_error}")
+                    else:
+                        print(f"[scan_fonts] Worker warning: {worker_error}")
+                fonts["ttf"].extend(scanned.get("ttf", []))
+                fonts["sdf"].extend(scanned.get("sdf", []))
+                continue
+
+            scanned, load_error = _scan_fonts_in_asset_file(
+                assets_file,
+                generator,
+                lang=lang,
+                detect_ps5_swizzle=ps5_swizzle,
+            )
+            if load_error:
+                print(f"[scan_fonts] {load_error}")
+                continue
+            fonts["ttf"].extend(scanned.get("ttf", []))
+            fonts["sdf"].extend(scanned.get("sdf", []))
 
     return fonts
 
@@ -1108,6 +1681,8 @@ def parse_fonts(
     game_path: str,
     lang: Language = "ko",
     target_files: set[str] | None = None,
+    scan_jobs: int = 1,
+    ps5_swizzle: bool = False,
 ) -> str:
     """KR: 스캔한 폰트를 JSON으로 저장하고 결과 파일 경로를 반환합니다.
     KR: target_files가 있으면 해당 파일만 파싱합니다.
@@ -1116,7 +1691,14 @@ def parse_fonts(
     """
     # KR: parse 모드는 파일 단위 워커로 스캔해 UnityPy 하드 크래시를 격리합니다.
     # EN: Parse mode scans via per-file workers to isolate hard UnityPy crashes.
-    fonts = scan_fonts(game_path, lang=lang, target_files=target_files, isolate_files=True)
+    fonts = scan_fonts(
+        game_path,
+        lang=lang,
+        target_files=target_files,
+        isolate_files=True,
+        scan_jobs=scan_jobs,
+        ps5_swizzle=ps5_swizzle,
+    )
     game_name = os.path.basename(game_path)
     output_file = os.path.join(get_script_dir(), f"{game_name}.json")
 
@@ -1135,14 +1717,31 @@ def parse_fonts(
 
     for font in fonts["sdf"]:
         key = f"{font['file']}|{font['assets_name']}|{font['name']}|SDF|{font['path_id']}"
-        result[key] = {
-            "File": font["file"],
-            "assets_name": font["assets_name"],
-            "Path_ID": font["path_id"],
-            "Type": "SDF",
-            "Name": font["name"],
-            "Replace_to": ""
-        }
+        if ps5_swizzle:
+            swizzle_flag = "True" if parse_bool_flag(font.get("swizzle")) else "False"
+            process_swizzle_flag = (
+                "True" if parse_bool_flag(font.get("process_swizzle")) else "False"
+            )
+            entry: JsonDict = {
+                "File": font["file"],
+                "assets_name": font["assets_name"],
+                "Path_ID": font["path_id"],
+                "Type": "SDF",
+                "Name": font["name"],
+                "swizzle": swizzle_flag,
+                "process_swizzle": process_swizzle_flag,
+                "Replace_to": "",
+            }
+        else:
+            entry = {
+                "File": font["file"],
+                "assets_name": font["assets_name"],
+                "Path_ID": font["path_id"],
+                "Type": "SDF",
+                "Name": font["name"],
+                "Replace_to": "",
+            }
+        result[key] = entry
 
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=4, ensure_ascii=False)
@@ -1214,6 +1813,8 @@ def _load_font_assets_cached(script_dir: str, normalized: str) -> JsonDict:
 
     sdf_data = None
     sdf_data_normalized = None
+    sdf_swizzle = False
+    sdf_process_swizzle = False
     for name_candidate in name_candidates:
         sdf_json_path = os.path.join(kr_assets, f"{name_candidate}.json")
         if not os.path.exists(sdf_json_path):
@@ -1222,6 +1823,8 @@ def _load_font_assets_cached(script_dir: str, normalized: str) -> JsonDict:
             sdf_data = json.load(f)
         if isinstance(sdf_data, dict):
             sdf_data_normalized = normalize_sdf_data(sdf_data, deep_copy=True)
+            sdf_swizzle = parse_bool_flag(sdf_data.get("swizzle"))
+            sdf_process_swizzle = parse_bool_flag(sdf_data.get("process_swizzle"))
         break
 
     sdf_atlas = None
@@ -1248,7 +1851,9 @@ def _load_font_assets_cached(script_dir: str, normalized: str) -> JsonDict:
         "sdf_data": sdf_data,
         "sdf_data_normalized": sdf_data_normalized,
         "sdf_atlas": sdf_atlas,
-        "sdf_materials": sdf_material_data
+        "sdf_materials": sdf_material_data,
+        "sdf_swizzle": sdf_swizzle,
+        "sdf_process_swizzle": sdf_process_swizzle,
     }
 
 
@@ -1266,6 +1871,8 @@ def load_font_assets(font_name: str) -> JsonDict:
         # Reuse cached atlas object to avoid per-replacement image duplication.
         "sdf_atlas": atlas,
         "sdf_materials": cached_assets["sdf_materials"],
+        "sdf_swizzle": cached_assets.get("sdf_swizzle"),
+        "sdf_process_swizzle": bool(cached_assets.get("sdf_process_swizzle", False)),
     }
 
 
@@ -1283,6 +1890,7 @@ def replace_fonts_in_file(
     temp_root_dir: str | None = None,
     generator: TypeTreeGenerator | None = None,
     replacement_lookup: dict[tuple[str, str, str, int], str] | None = None,
+    ps5_swizzle: bool = False,
     lang: Language = "ko",
 ) -> bool:
     """KR: 단일 assets 파일의 TTF/SDF 폰트를 교체하고 저장합니다.
@@ -1292,6 +1900,7 @@ def replace_fonts_in_file(
     KR: pointSize는 옵션과 무관하게 교체 폰트 값을 유지합니다.
     KR: material_scale_by_padding=True면 SDF 머티리얼 float를 (게임 padding / 교체 padding) 비율로 보정합니다.
     KR: prefer_original_compress=True면 원본 압축 우선, False면 무압축 계열 우선 저장 전략을 사용합니다.
+    KR: ps5_swizzle=True면 대상 Atlas의 swizzle 상태를 판별해 교체 Atlas를 자동 swizzle/unswizzle합니다.
     KR: temp_root_dir가 지정되면 임시 저장 디렉터리 루트로 사용합니다.
     EN: Replace TTF/SDF fonts in one assets file and save changes.
     EN: By default, line-related metrics (LineHeight/Ascender/Descender, etc.) are adjusted from in-game ratios
@@ -1300,6 +1909,7 @@ def replace_fonts_in_file(
     EN: pointSize still follows replacement font data regardless of this option.
     EN: If material_scale_by_padding=True, SDF material floats are adjusted by (game padding / replacement padding).
     EN: When prefer_original_compress=True, original compression is tried first; otherwise uncompressed-family is preferred.
+    EN: If ps5_swizzle=True, auto-detect target atlas swizzle state and swizzle/unswizzle replacement atlas.
     EN: If temp_root_dir is set, it is used as the root directory for temporary save files.
     """
     fn_without_path = os.path.basename(assets_file)
@@ -1352,6 +1962,30 @@ def replace_fonts_in_file(
     env.typetree_generator = generator
     if replacement_lookup is None:
         replacement_lookup, _ = build_replacement_lookup(replacements)
+    replacement_meta_lookup: dict[tuple[str, str, str, int], JsonDict] = {}
+    for info in replacements.values():
+        if not isinstance(info, dict):
+            continue
+        if not info.get("Replace_to"):
+            continue
+        type_raw = info.get("Type")
+        file_raw = info.get("File")
+        assets_raw = info.get("assets_name")
+        path_raw = info.get("Path_ID")
+        if not isinstance(type_raw, str) or not isinstance(file_raw, str) or not isinstance(assets_raw, str):
+            continue
+        try:
+            path_id = int(path_raw)
+        except (TypeError, ValueError):
+            continue
+        replacement_meta_lookup[(type_raw, file_raw, assets_raw, path_id)] = info
+
+    texture_object_lookup: dict[tuple[str, int], Any] = {}
+    texture_swizzle_state_cache: dict[str, tuple[str | None, str | None]] = {}
+    for item in env.objects:
+        if item.type.name != "Texture2D":
+            continue
+        texture_object_lookup[(item.assets_file.name, int(item.path_id))] = item
 
     target_sdf_pathids: set[int] = set()
     target_sdf_font_by_pathid: dict[int, str] = {}
@@ -1446,6 +2080,20 @@ def replace_fonts_in_file(
         except Exception:
             pass
         return 1.0
+
+    def _detect_target_texture_swizzle(assets_name: str, path_id: int) -> tuple[str | None, str | None]:
+        cache_key = f"{assets_name}|{path_id}"
+        if cache_key in texture_swizzle_state_cache:
+            return texture_swizzle_state_cache[cache_key]
+        texture_obj = texture_object_lookup.get((assets_name, int(path_id)))
+        verdict, source = (
+            detect_texture_object_ps5_swizzle_detail(texture_obj)
+            if texture_obj is not None
+            else (None, None)
+        )
+        texture_swizzle_state_cache[cache_key] = (verdict, source)
+        return verdict, source
+
     if replace_sdf:
         for key, value in replacement_lookup.items():
             if len(key) == 4 and key[0] == "SDF" and key[1] == fn_without_path:
@@ -1567,6 +2215,12 @@ def replace_fonts_in_file(
                     replacement_font = target_sdf_font_by_pathid.get(pathid)
 
                 if replacement_font:
+                    replacement_meta = replacement_meta_lookup.get(
+                        ("SDF", fn_without_path, assets_name, int(pathid)),
+                        {},
+                    )
+                    replacement_process_swizzle = parse_bool_flag(replacement_meta.get("process_swizzle"))
+                    replacement_swizzle_hint = parse_bool_flag(replacement_meta.get("swizzle"))
                     matched_sdf_targets += 1
                     assets = load_font_assets(replacement_font)
                     if assets["sdf_data"] and assets["sdf_atlas"]:
@@ -1574,6 +2228,12 @@ def replace_fonts_in_file(
                             print(f"SDF 폰트 교체: {assets_name} | {objname} | (PathID: {pathid}) -> {replacement_font}")
                         else:
                             print(f"SDF font replaced: {assets_name} | {objname} | (PathID: {pathid}) -> {replacement_font}")
+                        source_atlas = assets["sdf_atlas"]
+                        source_swizzled = parse_bool_flag(assets.get("sdf_swizzle"))
+                        asset_process_swizzle = parse_bool_flag(assets.get("sdf_process_swizzle"))
+                        target_swizzle_verdict: str | None = None
+                        target_swizzle_source: str | None = None
+                        target_is_swizzled: bool | None = None
 
                         # KR: 입력 JSON이 신형/구형이어도 내부 교체는 신형 TMP 스키마로 통일합니다.
                         # EN: Normalize replacement JSON to the new TMP schema regardless of input format.
@@ -1785,7 +2445,69 @@ def replace_fonts_in_file(
                             parse_dict["atlas"]["m_FileID"] = m_AtlasTextures_FileID
                             parse_dict["atlas"]["m_PathID"] = m_AtlasTextures_PathID
 
-                        texture_replacements[f"{assets_name}|{m_AtlasTextures_PathID}"] = assets["sdf_atlas"]
+                        desired_swizzle_state = source_swizzled
+                        if ps5_swizzle:
+                            target_swizzle_verdict, target_swizzle_source = _detect_target_texture_swizzle(
+                                assets_name,
+                                int(m_AtlasTextures_PathID),
+                            )
+                            if target_swizzle_verdict == "likely_swizzled_input":
+                                target_is_swizzled = True
+                            elif target_swizzle_verdict == "likely_linear_input":
+                                target_is_swizzled = False
+                            elif replacement_swizzle_hint:
+                                target_is_swizzled = True
+
+                            if target_is_swizzled is not None:
+                                desired_swizzle_state = target_is_swizzled
+                        if replacement_process_swizzle or asset_process_swizzle:
+                            desired_swizzle_state = True
+
+                        if ps5_swizzle:
+                            if target_swizzle_verdict == "likely_swizzled_input":
+                                if lang == "ko":
+                                    reason = f" (근거: {target_swizzle_source})" if target_swizzle_source else ""
+                                    print(f"  PS5 swizzle 감지: 대상 Atlas가 swizzled 상태로 판별되었습니다.{reason}")
+                                else:
+                                    reason = f" (source: {target_swizzle_source})" if target_swizzle_source else ""
+                                    print(f"  PS5 swizzle detect: target atlas is likely swizzled.{reason}")
+                            elif target_swizzle_verdict == "likely_linear_input":
+                                if lang == "ko":
+                                    reason = f" (근거: {target_swizzle_source})" if target_swizzle_source else ""
+                                    print(f"  PS5 swizzle 감지: 대상 Atlas가 선형(linear) 상태로 판별되었습니다.{reason}")
+                                else:
+                                    reason = f" (source: {target_swizzle_source})" if target_swizzle_source else ""
+                                    print(f"  PS5 swizzle detect: target atlas is likely linear.{reason}")
+                            elif replacement_swizzle_hint:
+                                if lang == "ko":
+                                    print("  PS5 swizzle 힌트: JSON swizzle=yes 값을 기준으로 swizzle 적용합니다.")
+                                else:
+                                    print("  PS5 swizzle hint: applying swizzle based on JSON swizzle=yes.")
+                            elif lang == "ko":
+                                print("  PS5 swizzle 감지: inconclusive, 교체 Atlas 원본 상태를 유지합니다.")
+                            else:
+                                print("  PS5 swizzle detect: inconclusive, keeping replacement atlas state.")
+                        elif replacement_process_swizzle:
+                            if lang == "ko":
+                                print("  process_swizzle=True: 교체 Atlas를 swizzle 상태로 변환합니다.")
+                            else:
+                                print("  process_swizzle=True: converting replacement atlas to swizzled state.")
+
+                        atlas_for_write = source_atlas
+                        if desired_swizzle_state != source_swizzled:
+                            try:
+                                if desired_swizzle_state:
+                                    atlas_for_write = apply_ps5_swizzle_to_image(source_atlas)
+                                else:
+                                    atlas_for_write = apply_ps5_unswizzle_to_image(source_atlas)
+                            except Exception as swizzle_error:
+                                atlas_for_write = source_atlas
+                                if lang == "ko":
+                                    print(f"  경고: PS5 swizzle 변환 실패, 원본 Atlas를 사용합니다. ({swizzle_error})")
+                                else:
+                                    print(f"  Warning: PS5 swizzle transform failed; using original atlas. ({swizzle_error})")
+
+                        texture_replacements[f"{assets_name}|{m_AtlasTextures_PathID}"] = atlas_for_write
                         if m_Material_FileID == 0 and m_Material_PathID != 0:
                             gradient_scale = None
                             apply_replacement_material = not use_game_mat
@@ -1855,8 +2577,8 @@ def replace_fonts_in_file(
                                         f"(x{material_padding_ratio:.3f})"
                                     )
                             material_replacements[f"{assets_name}|{m_Material_PathID}"] = {
-                                "w": assets["sdf_atlas"].width,
-                                "h": assets["sdf_atlas"].height,
+                                "w": atlas_for_write.width,
+                                "h": atlas_for_write.height,
                                 "gs": gradient_scale,
                                 "float_overrides": float_overrides,
                             }
@@ -2215,14 +2937,22 @@ def create_batch_replacements(
     replace_ttf: bool = True,
     replace_sdf: bool = True,
     target_files: set[str] | None = None,
+    scan_jobs: int = 1,
     lang: Language = "ko",
+    ps5_swizzle: bool = False,
 ) -> dict[str, JsonDict]:
     """KR: 게임 내 모든 폰트를 지정 폰트로 치환하는 배치 매핑을 생성합니다.
     KR: target_files가 있으면 해당 파일만 대상으로 매핑을 생성합니다.
     EN: Create batch replacement mapping for all fonts in a game.
     EN: If target_files is provided, build mapping only for those files.
     """
-    fonts = scan_fonts(game_path, lang=lang, target_files=target_files)
+    fonts = scan_fonts(
+        game_path,
+        lang=lang,
+        target_files=target_files,
+        scan_jobs=scan_jobs,
+        ps5_swizzle=ps5_swizzle,
+    )
     replacements: dict[str, JsonDict] = {}
 
     if replace_ttf:
@@ -2240,14 +2970,31 @@ def create_batch_replacements(
     if replace_sdf:
         for font in fonts["sdf"]:
             key = f"{font['file']}|SDF|{font['path_id']}"
-            replacements[key] = {
-                "Name": font["name"],
-                "assets_name": font["assets_name"],
-                "Path_ID": font["path_id"],
-                "Type": "SDF",
-                "File": font["file"],
-                "Replace_to": font_name
-            }
+            if ps5_swizzle:
+                swizzle_flag = "True" if parse_bool_flag(font.get("swizzle")) else "False"
+                process_swizzle_flag = (
+                    "True" if parse_bool_flag(font.get("process_swizzle")) else "False"
+                )
+                entry: JsonDict = {
+                    "File": font["file"],
+                    "assets_name": font["assets_name"],
+                    "Path_ID": font["path_id"],
+                    "Type": "SDF",
+                    "Name": font["name"],
+                    "swizzle": swizzle_flag,
+                    "process_swizzle": process_swizzle_flag,
+                    "Replace_to": font_name,
+                }
+            else:
+                entry = {
+                    "File": font["file"],
+                    "assets_name": font["assets_name"],
+                    "Path_ID": font["path_id"],
+                    "Type": "SDF",
+                    "Name": font["name"],
+                    "Replace_to": font_name,
+                }
+            replacements[key] = entry
 
     return replacements
 
@@ -2320,6 +3067,7 @@ def run_scan_file_worker(
     assets_file: str,
     output_path: str,
     lang: Language = "ko",
+    detect_ps5_swizzle: bool = False,
 ) -> int:
     """KR: 단일 파일 파싱 워커입니다. 결과를 JSON 파일로 저장합니다.
     EN: Single-file scan worker. Writes results to a JSON file.
@@ -2329,7 +3077,12 @@ def run_scan_file_worker(
         unity_version = get_unity_version(game_path, lang=lang)
         compile_method = get_compile_method(data_path)
         generator = _create_generator(unity_version, game_path, data_path, compile_method, lang=lang)
-        scanned, load_error = _scan_fonts_in_asset_file(assets_file, generator, lang=lang)
+        scanned, load_error = _scan_fonts_in_asset_file(
+            assets_file,
+            generator,
+            lang=lang,
+            detect_ps5_swizzle=detect_ps5_swizzle,
+        )
         payload: JsonDict = {
             "ttf": scanned.get("ttf", []),
             "sdf": scanned.get("sdf", []),
@@ -2375,8 +3128,10 @@ def main_cli(lang: Language = "ko") -> None:
         game_line_metrics_help = "SDF 교체 시 게임 원본 줄 간격 메트릭 사용 (기본: 교체 폰트 메트릭 보정 적용)"
         original_compress_help = "저장 시 원본 압축 모드를 우선 사용 (기본: 무압축 계열 우선)"
         temp_dir_help = "임시 저장 폴더 루트 경로 (가능하면 빠른 SSD/NVMe 권장)"
+        scan_jobs_help = "폰트 스캔 병렬 워커 수 (기본: 1, parse/일괄교체 스캔에 적용)"
         split_save_force_help = "대형 SDF 다건 교체에서 one-shot을 건너뛰고 SDF 1개씩 강제 분할 저장"
         oneshot_save_force_help = "대형 SDF 다건 교체에서도 분할 저장 폴백 없이 one-shot 저장만 시도"
+        ps5_swizzle_help = "PS5 swizzle 자동 판별/변환 모드 (mask_x=0x385F0, mask_y=0x07A0F, rotate=90)"
         verbose_help = "모든 로그를 verbose.txt 파일로 저장"
     else:
         description = "Replace Unity game fonts with Korean fonts."
@@ -2399,8 +3154,10 @@ Examples:
         game_line_metrics_help = "Use original in-game line metrics for SDF replacement (default: adjusted replacement font metrics)"
         original_compress_help = "Prefer original compression mode on save (default: uncompressed-family first)"
         temp_dir_help = "Root path for temporary save files (fast SSD/NVMe recommended)"
+        scan_jobs_help = "Number of parallel scan workers (default: 1, used for parse/bulk scan paths)"
         split_save_force_help = "Skip one-shot and force one-by-one SDF split save for large multi-SDF replacements"
         oneshot_save_force_help = "Force one-shot save even for large multi-SDF targets (disable split-save fallback)"
+        ps5_swizzle_help = "Enable PS5 swizzle detect/transform mode (mask_x=0x385F0, mask_y=0x07A0F, rotate=90)"
         verbose_help = "Save all logs to verbose.txt"
 
     parser = argparse.ArgumentParser(
@@ -2423,14 +3180,20 @@ Examples:
     parser.add_argument("--material-scale-by-padding", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--original-compress", action="store_true", help=original_compress_help)
     parser.add_argument("--temp-dir", type=str, metavar="PATH", help=temp_dir_help)
+    parser.add_argument("--scan-jobs", type=int, default=1, metavar="N", help=scan_jobs_help)
     parser.add_argument("--split-save-force", action="store_true", help=split_save_force_help)
     parser.add_argument("--oneshot-save-force", action="store_true", help=oneshot_save_force_help)
+    parser.add_argument("--ps5-swizzle", action="store_true", help=ps5_swizzle_help)
     parser.add_argument("--verbose", action="store_true", help=verbose_help)
     parser.add_argument("--_validate-bundle", type=str, metavar="BUNDLE_PATH", help=argparse.SUPPRESS)
     parser.add_argument("--_scan-file-worker", type=str, metavar="ASSET_FILE_PATH", help=argparse.SUPPRESS)
     parser.add_argument("--_scan-file-worker-output", type=str, metavar="OUTPUT_JSON_PATH", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+    if isinstance(args.gamepath, str):
+        args.gamepath = strip_wrapping_quotes_repeated(args.gamepath)
+    if isinstance(args.list, str):
+        args.list = strip_wrapping_quotes_repeated(args.list)
 
     # KR: 이전 옵션(--use-game-mat) 호환을 위해 새 옵션에 병합합니다.
     # EN: Merge legacy flag (--use-game-mat) into the new option for compatibility.
@@ -2456,6 +3219,11 @@ Examples:
     # KR: 기본은 split-save 폴백을 활성화합니다.
     # EN: Split-save fallback is enabled by default.
     args.split_save = not args.oneshot_save_force
+    if args.scan_jobs < 1:
+        if is_ko:
+            exit_with_error("--scan-jobs는 1 이상의 정수여야 합니다.", lang=lang)
+        else:
+            exit_with_error("--scan-jobs must be an integer greater than or equal to 1.", lang=lang)
 
     if args._scan_file_worker:
         if not args.gamepath:
@@ -2476,6 +3244,7 @@ Examples:
                 args._scan_file_worker,
                 args._scan_file_worker_output,
                 lang=lang,
+                detect_ps5_swizzle=args.ps5_swizzle,
             )
         )
 
@@ -2515,6 +3284,22 @@ Examples:
             print("Material 모드: 교체 Material 보정(패딩 비율)을 기본 적용합니다.")
         else:
             print("Material mode: using adjusted replacement material by default (padding ratio).")
+    if args.ps5_swizzle:
+        if is_ko:
+            print(
+                "PS5 swizzle 모드: 대상 Atlas swizzle을 자동 판별해 교체 Atlas를 변환합니다 "
+                f"(mask_x={PS5_SWIZZLE_MASK_X:#x}, mask_y={PS5_SWIZZLE_MASK_Y:#x}, rotate={PS5_SWIZZLE_ROTATE})."
+            )
+        else:
+            print(
+                "PS5 swizzle mode: auto-detecting target atlas swizzle state and transforming replacement atlas "
+                f"(mask_x={PS5_SWIZZLE_MASK_X:#x}, mask_y={PS5_SWIZZLE_MASK_Y:#x}, rotate={PS5_SWIZZLE_ROTATE})."
+            )
+    else:
+        if is_ko:
+            print("PS5 swizzle 모드: 비활성화")
+        else:
+            print("PS5 swizzle mode: disabled")
 
     if args._validate_bundle:
         raise SystemExit(run_validation_worker(args._validate_bundle, lang=lang))
@@ -2543,36 +3328,57 @@ Examples:
         else:
             print(f"[verbose] Saving logs to '{verbose_path}'.")
 
-    input_path = args.gamepath
+    input_path = strip_wrapping_quotes_repeated(args.gamepath) if args.gamepath else ""
     if not input_path:
-        if is_ko:
-            input_path = input("게임 경로를 입력하세요: ").strip()
+        while True:
+            if is_ko:
+                entered_path = input("게임 경로를 입력하세요: ").strip()
+            else:
+                entered_path = input("Enter game path: ").strip()
+            input_path = strip_wrapping_quotes_repeated(entered_path)
             if not input_path:
-                exit_with_error("게임 경로가 필요합니다.", lang=lang)
-        else:
-            input_path = input("Enter game path: ").strip()
-            if not input_path:
-                exit_with_error("Game path is required.", lang=lang)
+                if is_ko:
+                    print("게임 경로가 필요합니다. 다시 입력해주세요.")
+                else:
+                    print("Game path is required. Please try again.")
+                continue
+            if not os.path.isdir(input_path):
+                if is_ko:
+                    print(f"'{input_path}'는 유효한 디렉토리가 아닙니다. 다시 입력해주세요.")
+                else:
+                    print(f"'{input_path}' is not a valid directory. Please try again.")
+                continue
+            try:
+                game_path, data_path = resolve_game_path(input_path, lang=lang)
+            except FileNotFoundError as e:
+                if is_ko:
+                    print(f"{e}\n다시 입력해주세요.")
+                else:
+                    print(f"{e}\nPlease try again.")
+                continue
+            break
+    else:
+        if not os.path.isdir(input_path):
+            if is_ko:
+                exit_with_error(f"'{input_path}'는 유효한 디렉토리가 아닙니다.", lang=lang)
+            else:
+                exit_with_error(f"'{input_path}' is not a valid directory.", lang=lang)
+        try:
+            game_path, data_path = resolve_game_path(input_path, lang=lang)
+        except FileNotFoundError as e:
+            exit_with_error(str(e), lang=lang)
 
-    if not os.path.isdir(input_path):
-        if is_ko:
-            exit_with_error(f"'{input_path}'는 유효한 디렉토리가 아닙니다.", lang=lang)
-        else:
-            exit_with_error(f"'{input_path}' is not a valid directory.", lang=lang)
-
-    try:
-        game_path, data_path = resolve_game_path(input_path, lang=lang)
-        compile_method = get_compile_method(data_path)
-        if is_ko:
-            print(f"게임 경로: {game_path}")
-            print(f"데이터 경로: {data_path}")
-            print(f"컴파일 방식: {compile_method}")
-        else:
-            print(f"Game path: {game_path}")
-            print(f"Data path: {data_path}")
-            print(f"Compile method: {compile_method}")
-    except FileNotFoundError as e:
-        exit_with_error(str(e), lang=lang)
+    compile_method = get_compile_method(data_path)
+    if is_ko:
+        print(f"게임 경로: {game_path}")
+        print(f"데이터 경로: {data_path}")
+        print(f"컴파일 방식: {compile_method}")
+        print(f"스캔 워커 수: {args.scan_jobs}")
+    else:
+        print(f"Game path: {game_path}")
+        print(f"Data path: {data_path}")
+        print(f"Compile method: {compile_method}")
+        print(f"Scan workers: {args.scan_jobs}")
 
     if selected_files:
         target_text = ", ".join(sorted(selected_files))
@@ -2595,6 +3401,7 @@ Examples:
 
     replacements: dict[str, JsonDict] | None = None
     mode: str | None = None
+    interactive_session = False
     if args.parse:
         mode = "parse"
     elif args.mulmaru:
@@ -2604,44 +3411,59 @@ Examples:
     elif args.list:
         mode = "list"
     else:
+        interactive_session = True
         if is_ko:
-            print("작업을 선택하세요:")
-            print("  1. 폰트 정보 추출 (JSON 파일 생성)")
-            print("  2. JSON 파일로 폰트 교체")
-            print("  3. Mulmaru(물마루체)로 일괄 교체")
-            print("  4. NanumGothic(나눔고딕)으로 일괄 교체")
-            print()
-            choice = input("선택 (1-4): ").strip()
+            while True:
+                print("작업을 선택하세요:")
+                print("  1. 폰트 정보 추출 (JSON 파일 생성)")
+                print("  2. JSON 파일로 폰트 교체")
+                print("  3. Mulmaru(물마루체)로 일괄 교체")
+                print("  4. NanumGothic(나눔고딕)으로 일괄 교체")
+                print()
+                choice = input("선택 (1-4): ").strip()
+                if choice in {"1", "2", "3", "4"}:
+                    break
+                print("잘못된 선택입니다. 다시 입력해주세요.")
         else:
-            print("Select a task:")
-            print("  1. Export font info (create JSON)")
-            print("  2. Replace fonts using JSON")
-            print("  3. Bulk replace with Mulmaru")
-            print("  4. Bulk replace with NanumGothic")
-            print()
-            choice = input("Choose (1-4): ").strip()
+            while True:
+                print("Select a task:")
+                print("  1. Export font info (create JSON)")
+                print("  2. Replace fonts using JSON")
+                print("  3. Bulk replace with Mulmaru")
+                print("  4. Bulk replace with NanumGothic")
+                print()
+                choice = input("Choose (1-4): ").strip()
+                if choice in {"1", "2", "3", "4"}:
+                    break
+                print("Invalid selection. Please try again.")
 
         if choice == "1":
             mode = "parse"
         elif choice == "2":
             mode = "list"
-            if is_ko:
-                args.list = input("JSON 파일 경로를 입력하세요: ").strip()
-                if not args.list:
-                    exit_with_error("JSON 파일 경로가 필요합니다.", lang=lang)
-            else:
-                args.list = input("Enter JSON file path: ").strip()
-                if not args.list:
-                    exit_with_error("JSON file path is required.", lang=lang)
+            while True:
+                if is_ko:
+                    entered = input("JSON 파일 경로를 입력하세요: ").strip()
+                else:
+                    entered = input("Enter JSON file path: ").strip()
+                entered = strip_wrapping_quotes_repeated(entered)
+                if not entered:
+                    if is_ko:
+                        print("JSON 파일 경로가 필요합니다. 다시 입력해주세요.")
+                    else:
+                        print("JSON file path is required. Please try again.")
+                    continue
+                if os.path.exists(entered):
+                    args.list = entered
+                    break
+                if is_ko:
+                    print(f"파일을 찾을 수 없습니다: '{entered}'")
+                else:
+                    print(f"File not found: '{entered}'")
         elif choice == "3":
             mode = "mulmaru"
         elif choice == "4":
             mode = "nanumgothic"
-        else:
-            if is_ko:
-                exit_with_error("잘못된 선택입니다.", lang=lang)
-            else:
-                exit_with_error("Invalid selection.", lang=lang)
 
     if compile_method == "Il2cpp" and not os.path.exists(os.path.join(data_path, "Managed")):
         binary_path = os.path.join(game_path, "GameAssembly.dll")
@@ -2705,7 +3527,13 @@ Examples:
                 exit_with_error(f"Exception while running Il2CppDumper: {e}", lang=lang)
 
     if mode == "parse":
-        parse_fonts(game_path, lang=lang, target_files=selected_files if selected_files else None)
+        parse_fonts(
+            game_path,
+            lang=lang,
+            target_files=selected_files if selected_files else None,
+            scan_jobs=args.scan_jobs,
+            ps5_swizzle=args.ps5_swizzle,
+        )
         if is_ko:
             input("\n엔터를 눌러 종료...")
         else:
@@ -2723,7 +3551,9 @@ Examples:
             replace_ttf,
             replace_sdf,
             target_files=selected_files if selected_files else None,
+            scan_jobs=args.scan_jobs,
             lang=lang,
+            ps5_swizzle=args.ps5_swizzle,
         )
         ttf_count = sum(1 for v in replacements.values() if v["Type"] == "TTF")
         sdf_count = sum(1 for v in replacements.values() if v["Type"] == "SDF")
@@ -2742,7 +3572,9 @@ Examples:
             replace_ttf,
             replace_sdf,
             target_files=selected_files if selected_files else None,
+            scan_jobs=args.scan_jobs,
             lang=lang,
+            ps5_swizzle=args.ps5_swizzle,
         )
         ttf_count = sum(1 for v in replacements.values() if v["Type"] == "TTF")
         sdf_count = sum(1 for v in replacements.values() if v["Type"] == "SDF")
@@ -2751,6 +3583,22 @@ Examples:
         else:
             print(f"Found fonts: TTF {ttf_count}, SDF {sdf_count}")
     elif mode == "list":
+        if isinstance(args.list, str):
+            args.list = strip_wrapping_quotes_repeated(args.list)
+
+        if interactive_session:
+            while not args.list or not os.path.exists(args.list):
+                if args.list:
+                    if is_ko:
+                        print(f"'{args.list}' 파일을 찾을 수 없습니다.")
+                    else:
+                        print(f"File not found: '{args.list}'")
+                if is_ko:
+                    entered = input("JSON 파일 경로를 다시 입력하세요: ").strip()
+                else:
+                    entered = input("Re-enter JSON file path: ").strip()
+                args.list = strip_wrapping_quotes_repeated(entered)
+
         if not args.list or not os.path.exists(args.list):
             if is_ko:
                 exit_with_error(f"'{args.list}' 파일을 찾을 수 없습니다.", lang=lang)
@@ -2866,6 +3714,7 @@ Examples:
                             temp_root_dir=args.temp_dir,
                             generator=generator,
                             replacement_lookup=file_lookup,
+                            ps5_swizzle=args.ps5_swizzle,
                             lang=lang,
                         )
                     except MemoryError as e:
@@ -2904,6 +3753,7 @@ Examples:
                                 temp_root_dir=args.temp_dir,
                                 generator=generator,
                                 replacement_lookup=file_ttf_lookup,
+                                ps5_swizzle=args.ps5_swizzle,
                                 lang=lang,
                             ):
                                 file_modified = True
@@ -2944,6 +3794,7 @@ Examples:
                                         temp_root_dir=args.temp_dir,
                                         generator=generator,
                                         replacement_lookup=batch_lookup,
+                                        ps5_swizzle=args.ps5_swizzle,
                                         lang=lang,
                                     )
                                 except Exception as e:
@@ -3010,6 +3861,7 @@ Examples:
                         temp_root_dir=args.temp_dir,
                         generator=generator,
                         replacement_lookup=replacement_lookup,
+                        ps5_swizzle=args.ps5_swizzle,
                         lang=lang,
                     ):
                         file_modified = True

@@ -1,21 +1,6 @@
 @echo off
 setlocal
 
-set "VERSION="
-set /p VERSION=Enter version (e.g. v1.0.6): 
-for /f "tokens=* delims= " %%A in ("%VERSION%") do set "VERSION=%%A"
-:trim_version_tail
-if "%VERSION%"=="" goto version_check
-if not "%VERSION:~-1%"==" " goto version_check
-set "VERSION=%VERSION:~0,-1%"
-goto trim_version_tail
-
-:version_check
-if "%VERSION%"=="" (
-  echo Version is required.
-  exit /b 1
-)
-
 set "VENV_DIR=venv"
 set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
 
@@ -82,13 +67,6 @@ xcopy Il2CppDumper release\Il2CppDumper\ /E /I >nul
 copy README.md release\ >nul
 if exist CharList_3911.txt copy CharList_3911.txt release\ >nul
 
-set ZIP_NAME=Unity_Font_Replacer_%VERSION%.zip
-if exist "%ZIP_NAME%" del "%ZIP_NAME%"
-powershell -NoProfile -Command "Compress-Archive -Path release\* -DestinationPath '%ZIP_NAME%'"
-if errorlevel 1 (
-  echo Failed to create zip.
-  exit /b 1
-)
-
-echo Build complete. Output in release\ and dist\, zip: %ZIP_NAME%
+echo Build complete. Output in release\ and dist\
+pause
 endlocal
