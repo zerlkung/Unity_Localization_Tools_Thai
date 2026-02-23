@@ -232,6 +232,37 @@ def strip_wrapping_quotes_repeated(value: str) -> str:
         text = updated
 
 
+def sanitize_filename_component(value: str, fallback: str = "unnamed", max_len: int = 96) -> str:
+    """KR: 파일명 구성요소에서 경로/예약 문자를 안전한 문자로 치환합니다.
+    EN: Sanitize filename component by replacing path/reserved characters.
+    """
+    text = str(value or "").strip()
+    invalid_chars = '<>:"/\\|?*'
+    cleaned = "".join("_" if ch in invalid_chars else ch for ch in text)
+    cleaned = cleaned.strip().strip(".")
+    if not cleaned:
+        cleaned = fallback
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len]
+    return cleaned
+
+
+def resolve_output_only_path(source_file: str, data_path: str, output_root: str) -> str:
+    """KR: output-only 저장 시 원본 data_path 기준 상대 경로를 유지한 출력 경로를 계산합니다.
+    EN: Resolve output-only destination path while preserving path relative to data_path.
+    """
+    source_abs = os.path.abspath(source_file)
+    data_abs = os.path.abspath(data_path)
+    output_abs = os.path.abspath(output_root)
+    try:
+        rel_path = os.path.relpath(source_abs, data_abs)
+    except ValueError:
+        rel_path = os.path.basename(source_abs)
+    if rel_path.startswith("..") or os.path.isabs(rel_path):
+        rel_path = os.path.basename(source_abs)
+    return os.path.join(output_abs, rel_path)
+
+
 def register_temp_dir_for_cleanup(path: str) -> str:
     """KR: 종료 시 삭제할 임시 디렉터리를 등록하고 정규화 경로를 반환합니다.
     EN: Register a temp directory for cleanup at exit and return normalized path.
@@ -582,8 +613,6 @@ def detect_ps5_swizzle_state_from_image(
     EN: Detect swizzle state from a Pillow image.
     """
     prepared = _ps5_prepare_image(image)
-    if rotate % 360 != 0 and prepared.width == prepared.height:
-        prepared = prepared.rotate(rotate % 360, expand=False)
 
     data = prepared.tobytes()
     bytes_per_element = len(prepared.getbands())
@@ -608,8 +637,10 @@ def apply_ps5_swizzle_to_image(
     EN: Apply PS5 swizzle transform to a linear image.
     """
     prepared = _ps5_prepare_image(image)
+    # KR: PS5 atlas 좌표계 보정을 위해 정사각 Atlas에서는 swizzle 전에 역방향 회전을 적용합니다.
+    # EN: For PS5 atlas orientation, apply inverse rotation before swizzle on square atlases.
     if rotate % 360 != 0 and prepared.width == prepared.height:
-        prepared = prepared.rotate(rotate % 360, expand=False)
+        prepared = prepared.rotate((-rotate) % 360, expand=False)
 
     data = prepared.tobytes()
     bytes_per_element = len(prepared.getbands())
@@ -646,7 +677,7 @@ def apply_ps5_unswizzle_to_image(
     )
     output = Image.frombytes(prepared.mode, (prepared.width, prepared.height), unswizzled)
     if rotate % 360 != 0 and output.width == output.height:
-        output = output.rotate((-rotate) % 360, expand=False)
+        output = output.rotate(rotate % 360, expand=False)
     return output
 
 
@@ -711,6 +742,14 @@ def detect_texture_object_ps5_swizzle_detail(
             if texture_format == 1 and stream_size > 0 and not is_readable and stream_size == expected_alpha8_size:
                 meta_hint = "likely_swizzled_input"
                 meta_source = "meta-alpha8-stream"
+            elif (
+                texture_format == 1
+                and stream_size == 0
+                and not is_readable
+                and image_data_len == expected_alpha8_size
+            ):
+                meta_hint = "likely_swizzled_input"
+                meta_source = "meta-alpha8-inline-nonread"
             elif stream_size > 0 and not is_readable:
                 meta_hint = "likely_swizzled_input"
                 meta_source = "meta-stream"
@@ -1891,6 +1930,8 @@ def replace_fonts_in_file(
     generator: TypeTreeGenerator | None = None,
     replacement_lookup: dict[tuple[str, str, str, int], str] | None = None,
     ps5_swizzle: bool = False,
+    preview: bool = False,
+    preview_root: str | None = None,
     lang: Language = "ko",
 ) -> bool:
     """KR: 단일 assets 파일의 TTF/SDF 폰트를 교체하고 저장합니다.
@@ -1901,6 +1942,7 @@ def replace_fonts_in_file(
     KR: material_scale_by_padding=True면 SDF 머티리얼 float를 (게임 padding / 교체 padding) 비율로 보정합니다.
     KR: prefer_original_compress=True면 원본 압축 우선, False면 무압축 계열 우선 저장 전략을 사용합니다.
     KR: ps5_swizzle=True면 대상 Atlas의 swizzle 상태를 판별해 교체 Atlas를 자동 swizzle/unswizzle합니다.
+    KR: preview=True이고 ps5_swizzle=True면 preview 폴더에 unswizzle 결과 PNG를 저장합니다.
     KR: temp_root_dir가 지정되면 임시 저장 디렉터리 루트로 사용합니다.
     EN: Replace TTF/SDF fonts in one assets file and save changes.
     EN: By default, line-related metrics (LineHeight/Ascender/Descender, etc.) are adjusted from in-game ratios
@@ -1910,6 +1952,7 @@ def replace_fonts_in_file(
     EN: If material_scale_by_padding=True, SDF material floats are adjusted by (game padding / replacement padding).
     EN: When prefer_original_compress=True, original compression is tried first; otherwise uncompressed-family is preferred.
     EN: If ps5_swizzle=True, auto-detect target atlas swizzle state and swizzle/unswizzle replacement atlas.
+    EN: If preview=True with ps5_swizzle=True, save unswizzled preview PNGs to preview folder.
     EN: If temp_root_dir is set, it is used as the root directory for temporary save files.
     """
     fn_without_path = os.path.basename(assets_file)
@@ -1963,10 +2006,9 @@ def replace_fonts_in_file(
     if replacement_lookup is None:
         replacement_lookup, _ = build_replacement_lookup(replacements)
     replacement_meta_lookup: dict[tuple[str, str, str, int], JsonDict] = {}
+    preview_target_lookup: dict[tuple[str, str, int], JsonDict] = {}
     for info in replacements.values():
         if not isinstance(info, dict):
-            continue
-        if not info.get("Replace_to"):
             continue
         type_raw = info.get("Type")
         file_raw = info.get("File")
@@ -1977,6 +2019,10 @@ def replace_fonts_in_file(
         try:
             path_id = int(path_raw)
         except (TypeError, ValueError):
+            continue
+        if type_raw == "SDF":
+            preview_target_lookup[(file_raw, assets_raw, path_id)] = info
+        if not info.get("Replace_to"):
             continue
         replacement_meta_lookup[(type_raw, file_raw, assets_raw, path_id)] = info
 
@@ -2093,6 +2139,252 @@ def replace_fonts_in_file(
         )
         texture_swizzle_state_cache[cache_key] = (verdict, source)
         return verdict, source
+
+    def _save_swizzle_preview(
+        image: Image.Image,
+        assets_name: str,
+        atlas_path_id: int,
+        font_name: str,
+        target_swizzled: bool,
+    ) -> None:
+        if not (preview and ps5_swizzle and preview_root):
+            return
+        try:
+            visible = _preview_visible_image(image)
+            file_dir = sanitize_filename_component(fn_without_path, fallback="assets_file")
+            out_dir = os.path.join(preview_root, file_dir)
+            os.makedirs(out_dir, exist_ok=True)
+            safe_assets = sanitize_filename_component(assets_name, fallback="assets")
+            safe_font = sanitize_filename_component(font_name, fallback="font")
+            state_label = "target_swizzled" if target_swizzled else "target_linear"
+            out_name = f"{safe_assets}__{atlas_path_id}__{safe_font}__unswizzled__{state_label}.png"
+            out_path = os.path.join(out_dir, out_name)
+            visible.save(out_path, format="PNG")
+            if lang == "ko":
+                print(f"  Preview 저장: {out_path}")
+            else:
+                print(f"  Preview saved: {out_path}")
+        except Exception as preview_error:
+            if lang == "ko":
+                print(f"  경고: preview 저장 실패 ({preview_error})")
+            else:
+                print(f"  Warning: failed to save preview ({preview_error})")
+
+    def _preview_visible_image(image: Image.Image) -> Image.Image:
+        """KR: RGBA/LA Atlas를 사람이 보기 쉬운 단일 채널 이미지로 정규화합니다.
+        EN: Normalize RGBA/LA atlas into a human-visible single-channel image.
+        """
+        try:
+            if image.mode == "RGBA":
+                alpha = image.getchannel("A")
+                rgb = image.convert("RGB")
+                rgb_bbox = rgb.getbbox()
+                alpha_bbox = alpha.getbbox()
+                if alpha_bbox and not rgb_bbox:
+                    return alpha
+                return alpha if alpha_bbox else image.convert("L")
+            if image.mode == "LA":
+                alpha = image.getchannel("A")
+                return alpha if alpha.getbbox() else image.getchannel("L")
+            if image.mode == "P":
+                return image.convert("L")
+            if image.mode not in {"L", "RGB"}:
+                return image.convert("L")
+            return image
+        except Exception:
+            return image.convert("L")
+
+    def _load_target_unswizzled_preview_image(
+        assets_name: str,
+        atlas_path_id: int,
+        swizzle_verdict: str | None,
+        preview_rotate: int = PS5_SWIZZLE_ROTATE,
+    ) -> Image.Image | None:
+        """KR: 대상 게임 Atlas(Texture2D)에서 검증용 unswizzle preview 이미지를 생성합니다.
+        EN: Build an unswizzled preview image from the target in-game Texture2D atlas.
+        """
+        texture_obj = texture_object_lookup.get((assets_name, int(atlas_path_id)))
+        if texture_obj is None:
+            return None
+        try:
+            texture = texture_obj.parse_as_object()
+            width = int(getattr(texture, "m_Width", 0) or 0)
+            height = int(getattr(texture, "m_Height", 0) or 0)
+            raw_data: bytes | None = None
+
+            get_image_data = getattr(texture, "get_image_data", None)
+            if callable(get_image_data):
+                try:
+                    candidate = get_image_data()
+                    if isinstance(candidate, (bytes, bytearray)):
+                        raw_data = bytes(candidate)
+                except Exception:
+                    raw_data = None
+            if raw_data is None:
+                image_data = getattr(texture, "image_data", None)
+                if isinstance(image_data, (bytes, bytearray)):
+                    raw_data = bytes(image_data)
+
+            if width > 0 and height > 0 and raw_data:
+                total_elements = width * height
+                if total_elements > 0 and (len(raw_data) % total_elements) == 0:
+                    bpe = len(raw_data) // total_elements
+                    if bpe in {1, 2, 3, 4}:
+                        processed = raw_data
+                        if swizzle_verdict == "likely_swizzled_input":
+                            try:
+                                processed = ps5_unswizzle_bytes(
+                                    raw_data,
+                                    width,
+                                    height,
+                                    bpe,
+                                    mask_x=PS5_SWIZZLE_MASK_X,
+                                    mask_y=PS5_SWIZZLE_MASK_Y,
+                                )
+                            except Exception:
+                                processed = raw_data
+                        mode_map = {1: "L", 2: "LA", 3: "RGB", 4: "RGBA"}
+                        preview_image = Image.frombytes(mode_map[bpe], (width, height), processed)
+                        if swizzle_verdict == "likely_swizzled_input" and preview_rotate % 360 != 0 and width == height:
+                            preview_image = preview_image.rotate(preview_rotate % 360, expand=False)
+                        return preview_image
+
+            image = getattr(texture, "image", None)
+            if isinstance(image, Image.Image):
+                preview_image = image
+                if swizzle_verdict == "likely_swizzled_input":
+                    try:
+                        preview_image = apply_ps5_unswizzle_to_image(preview_image, rotate=preview_rotate)
+                    except Exception:
+                        pass
+                return preview_image
+        except Exception:
+            return None
+        return None
+
+    def _save_glyph_crop_previews(
+        image: Image.Image,
+        assets_name: str,
+        atlas_path_id: int,
+        font_name: str,
+        sdf_data: JsonDict,
+    ) -> None:
+        if not (preview and ps5_swizzle and preview_root):
+            return
+        glyph_table = sdf_data.get("m_GlyphTable")
+        char_table = sdf_data.get("m_CharacterTable")
+        if not isinstance(glyph_table, list) or not isinstance(char_table, list):
+            return
+        try:
+            visible = _preview_visible_image(image)
+            file_dir = sanitize_filename_component(fn_without_path, fallback="assets_file")
+            safe_assets = sanitize_filename_component(assets_name, fallback="assets")
+            safe_font = sanitize_filename_component(font_name, fallback="font")
+            glyph_dir = os.path.join(
+                preview_root,
+                file_dir,
+                f"{safe_assets}__{atlas_path_id}__{safe_font}",
+            )
+            os.makedirs(glyph_dir, exist_ok=True)
+
+            glyph_rect_by_index: dict[int, tuple[int, int, int, int]] = {}
+            for glyph in glyph_table:
+                if not isinstance(glyph, dict):
+                    continue
+                try:
+                    glyph_index = int(glyph.get("m_Index", -1))
+                except Exception:
+                    continue
+                rect_raw = glyph.get("m_GlyphRect", {})
+                if not isinstance(rect_raw, dict):
+                    continue
+                try:
+                    gx = int(rect_raw.get("m_X", 0))
+                    gy = int(rect_raw.get("m_Y", 0))
+                    gw = int(rect_raw.get("m_Width", 0))
+                    gh = int(rect_raw.get("m_Height", 0))
+                except Exception:
+                    continue
+                if gw <= 0 or gh <= 0:
+                    continue
+                glyph_rect_by_index[glyph_index] = (gx, gy, gw, gh)
+
+            if not glyph_rect_by_index:
+                return
+
+            flip_preview_y = detect_new_glyph_y_flip(glyph_table, char_table, visible)
+            if flip_preview_y:
+                if lang == "ko":
+                    print("  Glyph preview 좌표 보정: Y-flip 적용")
+                else:
+                    print("  Glyph preview coordinate fix: applying Y-flip")
+
+            saved = 0
+            used_names: set[str] = set()
+            for ch in char_table:
+                if not isinstance(ch, dict):
+                    continue
+                try:
+                    codepoint = int(ch.get("m_Unicode", -1))
+                    glyph_index = int(ch.get("m_GlyphIndex", -1))
+                except Exception:
+                    continue
+                if codepoint < 0:
+                    continue
+                rect = glyph_rect_by_index.get(glyph_index)
+                if rect is None:
+                    continue
+
+                x, y, w, h = rect
+                if flip_preview_y:
+                    y = visible.height - y - h
+                x0 = max(0, min(visible.width, x))
+                y0 = max(0, min(visible.height, y))
+                x1 = max(0, min(visible.width, x + w))
+                y1 = max(0, min(visible.height, y + h))
+                if x1 <= x0 or y1 <= y0:
+                    continue
+
+                base = f"U+{codepoint:04X}"
+                try:
+                    ch_text = chr(codepoint)
+                    if ch_text.isprintable() and not ch_text.isspace():
+                        safe_char = sanitize_filename_component(ch_text, fallback="", max_len=8)
+                        if safe_char and safe_char != "unnamed":
+                            base = f"{base}_{safe_char}"
+                except Exception:
+                    pass
+
+                name = base
+                if name in used_names:
+                    name = f"{name}_g{glyph_index}"
+                used_names.add(name)
+                out_path = os.path.join(glyph_dir, f"{name}.png")
+                visible.crop((x0, y0, x1, y1)).save(out_path, format="PNG")
+                saved += 1
+
+            if saved > 0:
+                if lang == "ko":
+                    print(f"  Glyph preview 저장: {saved}개 -> {glyph_dir}")
+                else:
+                    print(f"  Glyph previews saved: {saved} -> {glyph_dir}")
+        except Exception as preview_error:
+            if lang == "ko":
+                print(f"  경고: glyph preview 저장 실패 ({preview_error})")
+            else:
+                print(f"  Warning: failed to save glyph previews ({preview_error})")
+
+    def _image_to_alpha8_bytes(image: Image.Image) -> tuple[bytes, int, int]:
+        """KR: Pillow 이미지를 Alpha8 raw bytes로 변환합니다.
+        EN: Convert Pillow image into Alpha8 raw bytes.
+        """
+        if image.mode in {"RGBA", "LA"}:
+            alpha = image.getchannel("A")
+        elif image.mode == "L":
+            alpha = image
+        else:
+            alpha = image.convert("L")
+        return alpha.tobytes(), alpha.width, alpha.height
 
     if replace_sdf:
         for key, value in replacement_lookup.items():
@@ -2213,6 +2505,54 @@ def replace_fonts_in_file(
                 replacement_font = replacement_lookup.get(("SDF", fn_without_path, assets_name, pathid))
                 if replacement_font is None:
                     replacement_font = target_sdf_font_by_pathid.get(pathid)
+
+                preview_target_meta = preview_target_lookup.get((fn_without_path, assets_name, int(pathid)))
+                if replacement_font is None and preview_target_meta is not None and preview and ps5_swizzle:
+                    atlas_path_id_preview = 0
+                    if is_old_tmp:
+                        atlas_ref_preview = parse_dict.get("atlas", {})
+                        if isinstance(atlas_ref_preview, dict):
+                            try:
+                                atlas_path_id_preview = int(atlas_ref_preview.get("m_PathID", 0) or 0)
+                            except Exception:
+                                atlas_path_id_preview = 0
+                    else:
+                        atlas_textures_preview = parse_dict.get("m_AtlasTextures", [])
+                        if isinstance(atlas_textures_preview, list) and atlas_textures_preview:
+                            first_preview = atlas_textures_preview[0]
+                            if isinstance(first_preview, dict):
+                                try:
+                                    atlas_path_id_preview = int(first_preview.get("m_PathID", 0) or 0)
+                                except Exception:
+                                    atlas_path_id_preview = 0
+
+                    if atlas_path_id_preview:
+                        target_swizzle_verdict, _ = _detect_target_texture_swizzle(
+                            assets_name,
+                            int(atlas_path_id_preview),
+                        )
+                        target_preview_image = _load_target_unswizzled_preview_image(
+                            assets_name,
+                            int(atlas_path_id_preview),
+                            target_swizzle_verdict,
+                            preview_rotate=PS5_SWIZZLE_ROTATE,
+                        )
+                        if isinstance(target_preview_image, Image.Image):
+                            _save_swizzle_preview(
+                                target_preview_image,
+                                assets_name,
+                                int(atlas_path_id_preview),
+                                str(objname),
+                                bool(target_swizzle_verdict == "likely_swizzled_input"),
+                            )
+                            preview_sdf_data = normalize_sdf_data(parse_dict)
+                            _save_glyph_crop_previews(
+                                target_preview_image,
+                                assets_name,
+                                int(atlas_path_id_preview),
+                                str(objname),
+                                preview_sdf_data,
+                            )
 
                 if replacement_font:
                     replacement_meta = replacement_meta_lookup.get(
@@ -2507,6 +2847,39 @@ def replace_fonts_in_file(
                                 else:
                                     print(f"  Warning: PS5 swizzle transform failed; using original atlas. ({swizzle_error})")
 
+                        if preview and ps5_swizzle:
+                            preview_image = atlas_for_write
+                            if desired_swizzle_state:
+                                try:
+                                    preview_image = apply_ps5_unswizzle_to_image(atlas_for_write)
+                                except Exception as preview_unswizzle_error:
+                                    preview_image = atlas_for_write
+                                    if lang == "ko":
+                                        print(
+                                            "  경고: preview unswizzle 실패, 저장 상태 Atlas 그대로 미리보기를 저장합니다. "
+                                            f"({preview_unswizzle_error})"
+                                        )
+                                    else:
+                                        print(
+                                            "  Warning: preview unswizzle failed; saving preview from stored atlas state. "
+                                            f"({preview_unswizzle_error})"
+                                        )
+                            _save_swizzle_preview(
+                                preview_image,
+                                assets_name,
+                                int(m_AtlasTextures_PathID),
+                                str(objname),
+                                bool(desired_swizzle_state),
+                            )
+                            if isinstance(replace_data, dict):
+                                _save_glyph_crop_previews(
+                                    preview_image,
+                                    assets_name,
+                                    int(m_AtlasTextures_PathID),
+                                    str(objname),
+                                    replace_data,
+                                )
+
                         texture_replacements[f"{assets_name}|{m_AtlasTextures_PathID}"] = atlas_for_write
                         if m_Material_FileID == 0 and m_Material_PathID != 0:
                             gradient_scale = None
@@ -2611,7 +2984,40 @@ def replace_fonts_in_file(
                     print(f"텍스처 교체: {obj.peek_name()} (PathID: {obj.path_id})")
                 else:
                     print(f"Texture replaced: {obj.peek_name()} (PathID: {obj.path_id})")
-                parse_dict.image = texture_replacements[f"{assets_name}|{obj.path_id}"]
+                replacement_image = texture_replacements[f"{assets_name}|{obj.path_id}"]
+                applied_raw_alpha8 = False
+                try:
+                    texture_format = int(getattr(parse_dict, "m_TextureFormat", -1) or -1)
+                except Exception:
+                    texture_format = -1
+                if ps5_swizzle and texture_format == 1 and isinstance(replacement_image, Image.Image):
+                    try:
+                        alpha_raw, aw, ah = _image_to_alpha8_bytes(replacement_image)
+                        parse_dict.m_Width = int(aw)
+                        parse_dict.m_Height = int(ah)
+                        if hasattr(parse_dict, "m_CompleteImageSize"):
+                            parse_dict.m_CompleteImageSize = int(len(alpha_raw))
+                        parse_dict.image_data = alpha_raw
+                        stream_data = getattr(parse_dict, "m_StreamData", None)
+                        if stream_data is not None:
+                            try:
+                                stream_data.offset = 0
+                                stream_data.size = 0
+                                stream_data.path = ""
+                            except Exception:
+                                pass
+                        applied_raw_alpha8 = True
+                        if lang == "ko":
+                            print("  Alpha8 raw 주입 적용: swizzle 바이트를 image_data에 직접 기록합니다.")
+                        else:
+                            print("  Applied Alpha8 raw injection: writing swizzled bytes directly to image_data.")
+                    except Exception as raw_inject_error:
+                        if lang == "ko":
+                            print(f"  경고: Alpha8 raw 주입 실패, 일반 image 저장으로 폴백합니다. ({raw_inject_error})")
+                        else:
+                            print(f"  Warning: Alpha8 raw injection failed; falling back to image save. ({raw_inject_error})")
+                if not applied_raw_alpha8:
+                    parse_dict.image = replacement_image
                 parse_dict.save()
                 modified = True
         if obj.type.name == "Material":
@@ -3128,10 +3534,12 @@ def main_cli(lang: Language = "ko") -> None:
         game_line_metrics_help = "SDF 교체 시 게임 원본 줄 간격 메트릭 사용 (기본: 교체 폰트 메트릭 보정 적용)"
         original_compress_help = "저장 시 원본 압축 모드를 우선 사용 (기본: 무압축 계열 우선)"
         temp_dir_help = "임시 저장 폴더 루트 경로 (가능하면 빠른 SSD/NVMe 권장)"
+        output_only_help = "원본 파일은 유지하고, 수정된 파일만 지정 폴더에 원본 상대 경로로 저장"
+        preview_help = "--ps5-swizzle와 함께 사용 시 unswizzle 미리보기 PNG를 preview 폴더에 저장"
         scan_jobs_help = "폰트 스캔 병렬 워커 수 (기본: 1, parse/일괄교체 스캔에 적용)"
         split_save_force_help = "대형 SDF 다건 교체에서 one-shot을 건너뛰고 SDF 1개씩 강제 분할 저장"
         oneshot_save_force_help = "대형 SDF 다건 교체에서도 분할 저장 폴백 없이 one-shot 저장만 시도"
-        ps5_swizzle_help = "PS5 swizzle 자동 판별/변환 모드 (mask_x=0x385F0, mask_y=0x07A0F, rotate=90)"
+        ps5_swizzle_help = "PS5 swizzle 자동 판별/변환 모드 (mask_x=0x385F0, mask_y=0x07A0F, rotate=90 보정)"
         verbose_help = "모든 로그를 verbose.txt 파일로 저장"
     else:
         description = "Replace Unity game fonts with Korean fonts."
@@ -3154,10 +3562,12 @@ Examples:
         game_line_metrics_help = "Use original in-game line metrics for SDF replacement (default: adjusted replacement font metrics)"
         original_compress_help = "Prefer original compression mode on save (default: uncompressed-family first)"
         temp_dir_help = "Root path for temporary save files (fast SSD/NVMe recommended)"
+        output_only_help = "Keep originals untouched and write modified files only to this folder (preserve relative paths)"
+        preview_help = "With --ps5-swizzle, save unswizzled preview PNGs into preview folder"
         scan_jobs_help = "Number of parallel scan workers (default: 1, used for parse/bulk scan paths)"
         split_save_force_help = "Skip one-shot and force one-by-one SDF split save for large multi-SDF replacements"
         oneshot_save_force_help = "Force one-shot save even for large multi-SDF targets (disable split-save fallback)"
-        ps5_swizzle_help = "Enable PS5 swizzle detect/transform mode (mask_x=0x385F0, mask_y=0x07A0F, rotate=90)"
+        ps5_swizzle_help = "Enable PS5 swizzle detect/transform mode (mask_x=0x385F0, mask_y=0x07A0F, rotate=90 compensation)"
         verbose_help = "Save all logs to verbose.txt"
 
     parser = argparse.ArgumentParser(
@@ -3180,6 +3590,8 @@ Examples:
     parser.add_argument("--material-scale-by-padding", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--original-compress", action="store_true", help=original_compress_help)
     parser.add_argument("--temp-dir", type=str, metavar="PATH", help=temp_dir_help)
+    parser.add_argument("--output-only", type=str, metavar="PATH", help=output_only_help)
+    parser.add_argument("--preview", action="store_true", help=preview_help)
     parser.add_argument("--scan-jobs", type=int, default=1, metavar="N", help=scan_jobs_help)
     parser.add_argument("--split-save-force", action="store_true", help=split_save_force_help)
     parser.add_argument("--oneshot-save-force", action="store_true", help=oneshot_save_force_help)
@@ -3194,6 +3606,8 @@ Examples:
         args.gamepath = strip_wrapping_quotes_repeated(args.gamepath)
     if isinstance(args.list, str):
         args.list = strip_wrapping_quotes_repeated(args.list)
+    if isinstance(args.output_only, str):
+        args.output_only = strip_wrapping_quotes_repeated(args.output_only)
 
     # KR: 이전 옵션(--use-game-mat) 호환을 위해 새 옵션에 병합합니다.
     # EN: Merge legacy flag (--use-game-mat) into the new option for compatibility.
@@ -3262,6 +3676,41 @@ Examples:
         else:
             print(f"Temp save path: {args.temp_dir}")
         register_temp_dir_for_cleanup(os.path.join(args.temp_dir, "unity_font_replacer_temp"))
+
+    output_only_root: str | None = None
+    if args.output_only:
+        output_only_root = os.path.abspath(str(args.output_only))
+        try:
+            os.makedirs(output_only_root, exist_ok=True)
+        except Exception as e:
+            if is_ko:
+                exit_with_error(f"출력 폴더를 만들 수 없습니다: {output_only_root} ({e})", lang=lang)
+            else:
+                exit_with_error(f"Failed to create output folder: {output_only_root} ({e})", lang=lang)
+        if is_ko:
+            print(f"출력 전용 모드: 수정 파일을 '{output_only_root}'에 저장합니다.")
+        else:
+            print(f"Output-only mode: writing modified files to '{output_only_root}'.")
+
+    preview_root: str | None = None
+    if args.preview:
+        preview_root = os.path.join(get_script_dir(), "preview")
+        try:
+            os.makedirs(preview_root, exist_ok=True)
+        except Exception as e:
+            if is_ko:
+                exit_with_error(f"preview 폴더를 만들 수 없습니다: {preview_root} ({e})", lang=lang)
+            else:
+                exit_with_error(f"Failed to create preview folder: {preview_root} ({e})", lang=lang)
+        if is_ko:
+            print(f"Preview 모드: '{preview_root}'에 미리보기를 저장합니다.")
+        else:
+            print(f"Preview mode: saving previews to '{preview_root}'.")
+        if not args.ps5_swizzle:
+            if is_ko:
+                print("  안내: --preview는 --ps5-swizzle와 함께 사용할 때 unswizzle 미리보기를 출력합니다.")
+            else:
+                print("  Note: --preview outputs unswizzled previews when used with --ps5-swizzle.")
 
     if args.use_game_line_metrics:
         if is_ko:
@@ -3642,16 +4091,38 @@ Examples:
     unity_version = get_unity_version(game_path, lang=lang)
     generator = _create_generator(unity_version, game_path, data_path, compile_method, lang=lang)
     replacement_lookup, files_to_process = build_replacement_lookup(replacements)
+    preview_files_to_process: set[str] = set()
+    if args.preview and args.ps5_swizzle:
+        preview_files_to_process = {
+            os.path.basename(str(value.get("File", "")))
+            for value in replacements.values()
+            if isinstance(value, dict) and str(value.get("Type", "")) == "SDF"
+        }
+        preview_files_to_process.discard("")
+    process_files = set(files_to_process) | preview_files_to_process
     assets_files = find_assets_files(
         game_path,
         lang=lang,
-        target_files=files_to_process if files_to_process else None,
+        target_files=process_files if process_files else None,
     )
 
     modified_count = 0
     for assets_file in assets_files:
         fn = os.path.basename(assets_file)
-        if fn in files_to_process:
+        if fn in process_files:
+            working_assets_file = assets_file
+            if output_only_root:
+                working_assets_file = resolve_output_only_path(assets_file, data_path, output_only_root)
+                working_dir = os.path.dirname(working_assets_file)
+                if working_dir and not os.path.exists(working_dir):
+                    os.makedirs(working_dir, exist_ok=True)
+                shutil.copy2(assets_file, working_assets_file)
+                if is_ko:
+                    rel_out = os.path.relpath(working_assets_file, output_only_root)
+                    print(f"  출력 대상 준비: {rel_out}")
+                else:
+                    rel_out = os.path.relpath(working_assets_file, output_only_root)
+                    print(f"  Prepared output target: {rel_out}")
             if is_ko:
                 print(f"\n처리 중: {fn}")
             else:
@@ -3703,7 +4174,7 @@ Examples:
                         one_shot_ok = replace_fonts_in_file(
                             unity_version,
                             game_path,
-                            assets_file,
+                            working_assets_file,
                             file_replacements,
                             replace_ttf=replace_ttf,
                             replace_sdf=replace_sdf,
@@ -3715,6 +4186,8 @@ Examples:
                             generator=generator,
                             replacement_lookup=file_lookup,
                             ps5_swizzle=args.ps5_swizzle,
+                            preview=args.preview,
+                            preview_root=preview_root,
                             lang=lang,
                         )
                     except MemoryError as e:
@@ -3742,7 +4215,7 @@ Examples:
                             if replace_fonts_in_file(
                                 unity_version,
                                 game_path,
-                                assets_file,
+                                working_assets_file,
                                 file_ttf_replacements,
                                 replace_ttf=True,
                                 replace_sdf=False,
@@ -3754,6 +4227,8 @@ Examples:
                                 generator=generator,
                                 replacement_lookup=file_ttf_lookup,
                                 ps5_swizzle=args.ps5_swizzle,
+                                preview=args.preview,
+                                preview_root=preview_root,
                                 lang=lang,
                             ):
                                 file_modified = True
@@ -3783,7 +4258,7 @@ Examples:
                                     ok = replace_fonts_in_file(
                                         unity_version,
                                         game_path,
-                                        assets_file,
+                                        working_assets_file,
                                         batch_dict,
                                         replace_ttf=False,
                                         replace_sdf=True,
@@ -3795,6 +4270,8 @@ Examples:
                                         generator=generator,
                                         replacement_lookup=batch_lookup,
                                         ps5_swizzle=args.ps5_swizzle,
+                                        preview=args.preview,
+                                        preview_root=preview_root,
                                         lang=lang,
                                     )
                                 except Exception as e:
@@ -3850,7 +4327,7 @@ Examples:
                     if replace_fonts_in_file(
                         unity_version,
                         game_path,
-                        assets_file,
+                        working_assets_file,
                         replacements,
                         replace_ttf,
                         replace_sdf,
@@ -3862,6 +4339,8 @@ Examples:
                         generator=generator,
                         replacement_lookup=replacement_lookup,
                         ps5_swizzle=args.ps5_swizzle,
+                        preview=args.preview,
+                        preview_root=preview_root,
                         lang=lang,
                     ):
                         file_modified = True

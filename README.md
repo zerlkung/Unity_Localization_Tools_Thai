@@ -57,10 +57,13 @@ unity_font_replacer.exe --gamepath "D:\Games\Muck" --mulmaru
 | `--use-game-line-metrics` | SDF 교체 시 게임 원본 줄 간격 메트릭 사용 (기본: 교체 폰트 메트릭 보정 적용, pointSize는 교체값 유지) |
 | `--original-compress` | 저장 시 원본 압축 모드를 우선 사용 (기본: 무압축 계열 우선) |
 | `--temp-dir <경로>` | 임시 저장 폴더 루트 경로 지정 (빠른 SSD/NVMe 권장) |
+| `--output-only <경로>` | 원본은 유지하고, 수정된 파일만 지정 폴더에 원본 상대 경로를 유지해 저장 |
+| `--preview` | `--ps5-swizzle`와 함께 사용 시 스크립트 위치의 `preview/`에 unswizzle Atlas + 글리프 crop PNG 저장 |
 | `--scan-jobs <N>` | 폰트 스캔 병렬 워커 수 지정 (기본: `1`, `--parse`/일괄교체 스캔에 적용) |
-| `--ps5-swizzle` | PS5 Atlas swizzle 자동 판별/변환 모드 활성화 (`swizzle` 필드 생성 및 자동 변환) |
+| `--ps5-swizzle` | PS5 Atlas swizzle 자동 판별/변환 모드 활성화 (`mask_x=0x385F0`, `mask_y=0x07A0F`, `rotate=90`) |
 | `--split-save-force` | 대형 SDF 다건 교체에서 one-shot을 건너뛰고 SDF 1개씩 강제 분할 저장 |
 | `--oneshot-save-force` | 대형 SDF 다건 교체에서도 분할 저장 폴백 없이 one-shot만 시도 |
+| `--verbose` | 전체 로그를 `verbose.txt`로 저장 |
 
 ### 사용 예시
 
@@ -85,6 +88,12 @@ unity_font_replacer.exe --gamepath "D:\Games\Muck" --nanumgothic --use-game-line
 
 :: 특정 파일만 대상으로 교체
 unity_font_replacer.exe --gamepath "D:\Games\Muck" --nanumgothic --target-file "sharedassets0.assets"
+
+:: 원본은 유지하고 수정된 파일만 별도 폴더로 출력 (상대 경로 유지)
+unity_font_replacer.exe --gamepath "D:\Games\Muck" --nanumgothic --output-only "D:\tevi"
+
+:: PS5 swizzle 미리보기 생성 (원본/수정본 동일 방식 검증용)
+unity_font_replacer.exe --gamepath "D:\Games\Muck" --list Muck.json --target-file "sharedassets0.assets" --ps5-swizzle --preview --sdfonly
 
 :: 저장 시 원본 압축 우선
 unity_font_replacer.exe --gamepath "D:\Games\Muck" --nanumgothic --original-compress
@@ -135,6 +144,7 @@ JSON 예시 (`--ps5-swizzle` 미사용):
   - `swizzle`: 원본 대상 Atlas의 자동 판별 결과 (`"True"`/`"False"`)
   - `process_swizzle`: 교체 Atlas를 swizzle 상태로 강제 변환할지 여부 (기본 `"False"`)
 - `swizzle`/`process_swizzle` 필드는 `--ps5-swizzle` 옵션이 있을 때만 JSON에 삽입됩니다.
+- JSON 로딩은 `.get("swizzle")`, `.get("process_swizzle")` 기반으로 처리하므로, 구버전 JSON(해당 키 없음)도 그대로 호환됩니다.
 
 JSON 예시 (`--ps5-swizzle` 사용, SDF):
 
@@ -160,6 +170,36 @@ JSON 예시 (`--ps5-swizzle` 사용, SDF):
   - `Mulmaru SDF` 또는 `Mulmaru SDF.json` 또는 `Mulmaru SDF Atlas.png`
   - `Mulmaru Raster` 또는 `Mulmaru Raster.json` 또는 `Mulmaru Raster Atlas.png`
   - `NGothic` 또는 `NGothic.json` 또는 `NGothic Atlas.png` 또는 `NGothic Material.json`
+
+## PS5 검증 워크플로 (--preview)
+
+원본/수정본을 같은 방법으로 비교하려면 아래 순서를 권장합니다.
+
+1. 대상 파일만 스캔 JSON 생성
+2. 원본 상태에서 `--list + --ps5-swizzle + --preview` 실행 (원본 crop 추출)
+3. `--nanumgothic --ps5-swizzle`로 교체
+4. 다시 `--list + --ps5-swizzle + --preview` 실행 (수정본 crop 추출)
+5. 두 결과를 비교
+
+예시(PS5 번들 1개만 검증):
+
+```bat
+:: 1) 대상 파일 JSON 생성
+unity_font_replacer.exe --gamepath "C:\Game\Game_Data" --parse --target-file "38871756d6e98b9e67fb2e7a61dbb88e.bundle" --ps5-swizzle
+
+:: 2) 원본 crop 추출
+unity_font_replacer.exe --gamepath "C:\Game\Game_Data" --list "Game.json" --target-file "38871756d6e98b9e67fb2e7a61dbb88e.bundle" --ps5-swizzle --preview --sdfonly
+
+:: 3) NanumGothic 교체 (원본 보호 필요 시 --output-only 사용)
+unity_font_replacer.exe --gamepath "C:\Game\Game_Data" --nanumgothic --sdfonly --target-file "38871756d6e98b9e67fb2e7a61dbb88e.bundle" --ps5-swizzle --output-only "D:\tevi"
+
+:: 4) 수정본 crop 추출
+unity_font_replacer.exe --gamepath "C:\Game\Game_Data" --list "Game.json" --target-file "38871756d6e98b9e67fb2e7a61dbb88e.bundle" --ps5-swizzle --preview --sdfonly
+```
+
+출력 경로:
+- Atlas preview: `preview\<파일명>\<assets_name>__<atlas_pathid>__<font>__unswizzled__*.png`
+- Glyph crop: `preview\<파일명>\<assets_name>__<atlas_pathid>__<font>\U+XXXX*.png`
 
 ## 폰트 추출 (export_fonts.exe)
 
@@ -246,11 +286,15 @@ python export_fonts.py "D:\MyGame"
 - 저장 시 원본 압축 우선이 필요하면 `--original-compress`를 사용하세요.
 - 저장 속도가 느리면 `--temp-dir`로 임시 저장 폴더를 빠른 SSD/NVMe 경로로 지정해 보세요.
 - 프로그램 종료 시 임시 폴더는 자동 정리됩니다.
+- 대화형 입력에서 경로 앞뒤 따옴표가 중복되어도 자동으로 정리해 처리합니다.
 - `--parse`는 파일 단위 워커 프로세스로 스캔해 단일 파일 크래시가 전체 작업 중단으로 이어지지 않도록 격리합니다.
 - 스캔 속도를 높이려면 `--scan-jobs`로 워커 수를 늘릴 수 있습니다.
 - 스캔은 블랙리스트 기반 제외를 사용합니다 (`*.bak`, `.info`, `.config` 등 제외).
-- `--ps5-swizzle`를 사용하면 SDF Atlas의 swizzle 상태를 자동 판별하고, 필요 시 교체 Atlas를 swizzle/unswizzle 변환합니다.
+- `--output-only`를 사용하면 원본 파일은 수정하지 않고, 수정된 파일만 지정 폴더로 저장합니다(원본 상대 경로 유지).
+- `--preview`는 `--ps5-swizzle`와 함께 사용할 때 `preview/`에 unswizzle Atlas/글리프 crop을 저장합니다.
+- `--ps5-swizzle`는 메타데이터 기반 판정(우선) + raw-data 판정을 이용해 SDF Atlas swizzle 상태를 자동 판별하고 필요 시 교체 Atlas를 swizzle/unswizzle 변환합니다.
 - `swizzle`/`process_swizzle` 필드는 `--ps5-swizzle` 모드에서만 `--parse` JSON에 추가됩니다.
+- `process_swizzle: "True"`를 JSON에 지정하면 자동 판정과 무관하게 교체 Atlas를 swizzle 상태로 변환합니다.
 - 대형 SDF 다건 교체에서는 기본적으로 one-shot 실패 시 적응형 분할 저장(배치 크기 자동 조절)으로 폴백합니다.
   - `--split-save-force`: one-shot을 건너뛰고 SDF 1개씩 강제 분할 저장
   - `--oneshot-save-force`: 분할 저장 폴백 비활성화(one-shot만 시도)

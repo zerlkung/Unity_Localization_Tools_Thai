@@ -1,26 +1,56 @@
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
 
+PS5_SWIZZLE_MASK_X = 0x385F0
+PS5_SWIZZLE_MASK_Y = 0x07A0F
+PS5_SWIZZLE_ROTATE = 90
 
-def _bit_positions(mask: int) -> list[int]:
-    return [i for i in range(mask.bit_length()) if (mask >> i) & 1]
+
+@lru_cache(maxsize=128)
+def _bit_positions(mask: int) -> tuple[int, ...]:
+    return tuple(i for i in range(max(mask.bit_length(), 0)) if (mask >> i) & 1)
 
 
-def _deposit_table(size: int, mask: int) -> np.ndarray:
-    """Build a small lookup table for pdep-like bit deposit."""
+@lru_cache(maxsize=128)
+def _axis_tile_size(mask: int) -> int:
     positions = _bit_positions(mask)
-    bit_count = len(positions)
-    values = np.arange(size, dtype=np.uint32)
-    bits = ((values[:, None] >> np.arange(bit_count, dtype=np.uint32)) & 1).astype(
-        np.uint32
-    )
-    weights = np.left_shift(np.uint32(1), np.array(positions, dtype=np.uint32))
-    return (bits @ weights).astype(np.uint32)
+    return 1 << len(positions) if positions else 1
+
+
+@lru_cache(maxsize=128)
+def _deposit_table(mask: int) -> tuple[int, ...]:
+    """Build a lookup table for pdep-like bit deposit (tile-local axis)."""
+    positions = _bit_positions(mask)
+    axis_size = _axis_tile_size(mask)
+    table: list[int] = [0] * axis_size
+    for value in range(axis_size):
+        deposited = 0
+        for bit_index, dst_bit in enumerate(positions):
+            if (value >> bit_index) & 1:
+                deposited |= (1 << dst_bit)
+        table[value] = deposited
+    return tuple(table)
+
+
+def _validate_shape(data: bytes, width: int, height: int, bytes_per_element: int) -> int:
+    if width <= 0 or height <= 0 or bytes_per_element <= 0:
+        raise ValueError(
+            f"Invalid texture shape: w={width}, h={height}, bpe={bytes_per_element}"
+        )
+    total_elements = width * height
+    expected_size = total_elements * bytes_per_element
+    if len(data) != expected_size:
+        raise ValueError(
+            f"Size mismatch: expected {expected_size}, got {len(data)} "
+            f"(w={width}, h={height}, bpe={bytes_per_element})"
+        )
+    return total_elements
 
 
 def _bytes_to_image(data: bytes, width: int, height: int, bytes_per_element: int) -> Image.Image:
@@ -76,22 +106,27 @@ def unswizzle(
     mask_x: int,
     mask_y: int,
 ) -> bytes:
-    total_elements = width * height
-    expected_size = total_elements * bytes_per_element
-    if len(data) != expected_size:
-        raise ValueError(
-            f"Size mismatch: expected {expected_size}, got {len(data)} "
-            f"(w={width}, h={height}, bpe={bytes_per_element})"
-        )
+    total_elements = _validate_shape(data, width, height, bytes_per_element)
 
     src = np.frombuffer(data, dtype=np.uint8).reshape(total_elements, bytes_per_element)
     dst = np.empty_like(src)
 
-    xdep = _deposit_table(width, mask_x)
-    ydep = _deposit_table(height, mask_y)
+    tile_w = _axis_tile_size(mask_x)
+    tile_h = _axis_tile_size(mask_y)
+    xdep = np.array(_deposit_table(mask_x), dtype=np.int64)
+    ydep = np.array(_deposit_table(mask_y), dtype=np.int64)
+    macro_cols = (width + tile_w - 1) // tile_w
+    tile_elements = tile_w * tile_h
+    x = np.arange(width, dtype=np.int64)
+    local_x = x % tile_w
+    macro_x = x // tile_w
 
     for y in range(height):
-        src_idx = ydep[y] + xdep
+        macro_y = y // tile_h
+        local_y = y % tile_h
+        row_offset = int(ydep[local_y])
+        tile_base = ((macro_y * macro_cols) + macro_x) * tile_elements
+        src_idx = tile_base + row_offset + xdep[local_x]
         row_start = y * width
         dst[row_start : row_start + width] = src[src_idx]
 
@@ -106,42 +141,69 @@ def swizzle(
     mask_x: int,
     mask_y: int,
 ) -> bytes:
-    total_elements = width * height
-    expected_size = total_elements * bytes_per_element
-    if len(data) != expected_size:
-        raise ValueError(
-            f"Size mismatch: expected {expected_size}, got {len(data)} "
-            f"(w={width}, h={height}, bpe={bytes_per_element})"
-        )
+    total_elements = _validate_shape(data, width, height, bytes_per_element)
 
     src = np.frombuffer(data, dtype=np.uint8).reshape(total_elements, bytes_per_element)
     dst = np.empty_like(src)
 
-    xdep = _deposit_table(width, mask_x)
-    ydep = _deposit_table(height, mask_y)
+    tile_w = _axis_tile_size(mask_x)
+    tile_h = _axis_tile_size(mask_y)
+    xdep = np.array(_deposit_table(mask_x), dtype=np.int64)
+    ydep = np.array(_deposit_table(mask_y), dtype=np.int64)
+    macro_cols = (width + tile_w - 1) // tile_w
+    tile_elements = tile_w * tile_h
+    x = np.arange(width, dtype=np.int64)
+    local_x = x % tile_w
+    macro_x = x // tile_w
 
     for y in range(height):
-        dst_idx = ydep[y] + xdep
+        macro_y = y // tile_h
+        local_y = y % tile_h
+        row_offset = int(ydep[local_y])
+        tile_base = ((macro_y * macro_cols) + macro_x) * tile_elements
+        dst_idx = tile_base + row_offset + xdep[local_x]
         row_start = y * width
         dst[dst_idx] = src[row_start : row_start + width]
 
     return dst.reshape(-1).tobytes()
 
 
-def roughness_score(data: bytes, width: int, height: int, bytes_per_element: int) -> float:
+def roughness_score(
+    data: bytes,
+    width: int,
+    height: int,
+    bytes_per_element: int,
+    max_axis_samples: int = 256,
+) -> float:
+    _validate_shape(data, width, height, bytes_per_element)
     arr = np.frombuffer(data, dtype=np.uint8).reshape(height, width, bytes_per_element)
-    if bytes_per_element >= 3:
-        # Luma-like score for RGB/RGBA.
-        y = (
-            arr[:, :, 0].astype(np.float32) * 0.2126
-            + arr[:, :, 1].astype(np.float32) * 0.7152
-            + arr[:, :, 2].astype(np.float32) * 0.0722
-        )
-    else:
-        y = arr[:, :, 0].astype(np.float32)
 
-    dx = np.abs(y[:, 1:] - y[:, :-1]).mean() if width > 1 else 0.0
-    dy = np.abs(y[1:, :] - y[:-1, :]).mean() if height > 1 else 0.0
+    step_x = max(1, width // max_axis_samples)
+    step_y = max(1, height // max_axis_samples)
+
+    if bytes_per_element == 1:
+        channel_index = 0
+    else:
+        best_score = -1.0
+        channel_index = 0
+        for ch in range(bytes_per_element):
+            y = arr[:, :, ch].astype(np.float32)
+            dx = np.abs(y[:, 1:] - y[:, :-1]).mean() if width > 1 else 0.0
+            dy = np.abs(y[1:, :] - y[:-1, :]).mean() if height > 1 else 0.0
+            score = float(dx + dy)
+            if score > best_score:
+                best_score = score
+                channel_index = ch
+
+    y = arr[:, :, channel_index].astype(np.float32)
+    if width > step_x:
+        dx = np.abs(y[:, step_x:] - y[:, :-step_x]).mean()
+    else:
+        dx = 0.0
+    if height > step_y:
+        dy = np.abs(y[step_y:, :] - y[:-step_y, :]).mean()
+    else:
+        dy = 0.0
     return float(dx + dy)
 
 
@@ -173,7 +235,7 @@ def detect_swizzle_state(
 def apply_transforms(img: Image.Image, rotate: int, hflip: bool, vflip: bool) -> Image.Image:
     out = img
     if rotate:
-        out = out.rotate(rotate, expand=True)
+        out = out.rotate(rotate, expand=False)
     if hflip:
         out = out.transpose(Image.FLIP_LEFT_RIGHT)
     if vflip:
@@ -189,8 +251,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--width", type=int, default=None)
     p.add_argument("--height", type=int, default=None)
     p.add_argument("--bytes-per-element", type=int, default=None)
-    p.add_argument("--mask-x", type=lambda s: int(s, 0), default=0x385F0)
-    p.add_argument("--mask-y", type=lambda s: int(s, 0), default=0x07A0F)
+    p.add_argument("--mask-x", type=lambda s: int(s, 0), default=PS5_SWIZZLE_MASK_X)
+    p.add_argument("--mask-y", type=lambda s: int(s, 0), default=PS5_SWIZZLE_MASK_Y)
     p.add_argument("--output-bin", default=None)
     p.add_argument("--output-png", default=None)
     p.add_argument("--skip-bin", action="store_true")
@@ -213,7 +275,7 @@ def main() -> None:
     input_format = _resolve_input_format(input_path, args.input_format)
 
     if args.rotate is None:
-        args.rotate = 90 if args.mode == "unswizzle" else 0
+        args.rotate = PS5_SWIZZLE_ROTATE if args.mode == "unswizzle" else 0
     if args.rotate not in (0, 90, 180, 270):
         raise ValueError("--rotate must be one of 0/90/180/270")
 
