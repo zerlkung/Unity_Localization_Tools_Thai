@@ -6836,6 +6836,22 @@ Examples:
             exit_with_error(
                 "--scan-jobs must be an integer greater than or equal to 1.", lang=lang
             )
+    interactive_mode_requested = not any(
+        [
+            bool(args.parse),
+            bool(args.mulmaru),
+            bool(args.nanumgothic),
+            bool(args.list),
+            bool(args.preview_export),
+        ]
+    )
+    scan_jobs_explicit = any(
+        arg == "--scan-jobs"
+        or arg == "--max-workers"
+        or arg.startswith("--scan-jobs=")
+        or arg.startswith("--max-workers=")
+        for arg in sys.argv[1:]
+    )
 
     if args._scan_file_worker:
         if not args.gamepath:
@@ -7041,6 +7057,35 @@ Examples:
             game_path, data_path = resolve_game_path(input_path, lang=lang)
         except FileNotFoundError as e:
             exit_with_error(str(e), lang=lang)
+
+    if interactive_mode_requested and not scan_jobs_explicit:
+        while True:
+            if is_ko:
+                entered_workers = input(
+                    f"스캔 워커 수를 입력하세요 (기본 {args.scan_jobs}): "
+                ).strip()
+            else:
+                entered_workers = input(
+                    f"Enter scan worker count (default {args.scan_jobs}): "
+                ).strip()
+            if not entered_workers:
+                break
+            try:
+                parsed_workers = int(entered_workers)
+            except (TypeError, ValueError):
+                if is_ko:
+                    _log_console("숫자를 입력해주세요. (1 이상의 정수)")
+                else:
+                    _log_console("Please enter a number. (integer >= 1)")
+                continue
+            if parsed_workers < 1:
+                if is_ko:
+                    _log_console("스캔 워커 수는 1 이상이어야 합니다.")
+                else:
+                    _log_console("Scan worker count must be >= 1.")
+                continue
+            args.scan_jobs = parsed_workers
+            break
 
     compile_method = get_compile_method(data_path)
     if is_ko:
