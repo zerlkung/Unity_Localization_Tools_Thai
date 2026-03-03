@@ -5052,6 +5052,7 @@ def replace_fonts_in_file(
     texture_replacement_metadata_size: dict[str, tuple[int, int]] = {}
     material_replacements: dict[str, JsonDict] = {}
     material_replacements_by_pathid: dict[int, JsonDict] = {}
+    material_replacements_by_atlas: dict[str, JsonDict] = {}
     ambiguous_material_fallback_warned: set[int] = set()
     modified = False
 
@@ -5804,6 +5805,19 @@ def replace_fonts_in_file(
                         atlas_metadata_width,
                         atlas_metadata_height,
                     )
+                    material_replacements_by_atlas[texture_key] = {
+                        "w": atlas_metadata_width,
+                        "h": atlas_metadata_height,
+                        "gs": None,
+                        "float_overrides": {},
+                        "color_overrides": {},
+                        "reset_keywords": False,
+                        "prune_raster_material": False,
+                        "preserve_gradient_floor": False,
+                    }
+                    material_replacements_by_atlas[texture_key.lower()] = (
+                        material_replacements_by_atlas[texture_key]
+                    )
                     if m_Material_PathID != 0:
                         gradient_scale = None
                         apply_replacement_material = not use_game_mat
@@ -6025,6 +6039,7 @@ def replace_fonts_in_file(
                 parse_dict.save()
                 modified = True
         if obj.type.name == "Material":
+            parse_dict = None
             material_key = f"{assets_name}|{obj.path_id}"
             mat_info = material_replacements.get(material_key)
             if mat_info is None:
@@ -6040,8 +6055,42 @@ def replace_fonts_in_file(
                             f"[replace_material] file={fn_without_path} path_id={fallback_path_id} "
                             "fallback_pathid_only_match_ambiguous=True; skipped"
                         )
+            if mat_info is None:
+                if parse_dict is None:
+                    parse_dict = obj.parse_as_object()
+                saved_props = getattr(parse_dict, "m_SavedProperties", None)
+                tex_envs = getattr(saved_props, "m_TexEnvs", None)
+                main_tex_path_id = 0
+                if isinstance(tex_envs, list):
+                    for entry in tex_envs:
+                        if (
+                            isinstance(entry, (list, tuple))
+                            and len(entry) >= 2
+                            and str(entry[0]) == "_MainTex"
+                        ):
+                            tex_env_val = entry[1]
+                            tex_ref = (
+                                tex_env_val.get("m_Texture")
+                                if isinstance(tex_env_val, dict)
+                                else getattr(tex_env_val, "m_Texture", None)
+                            )
+                            if isinstance(tex_ref, dict):
+                                main_tex_path_id = int(tex_ref.get("m_PathID", 0) or 0)
+                            else:
+                                main_tex_path_id = int(
+                                    getattr(tex_ref, "m_PathID", 0) or 0
+                                )
+                            break
+                if main_tex_path_id > 0:
+                    atlas_key = f"{assets_name}|{main_tex_path_id}"
+                    mat_info = material_replacements_by_atlas.get(atlas_key)
+                    if mat_info is None:
+                        mat_info = material_replacements_by_atlas.get(
+                            atlas_key.lower()
+                        )
             if mat_info is not None:
-                parse_dict = obj.parse_as_object()
+                if parse_dict is None:
+                    parse_dict = obj.parse_as_object()
                 if _apply_material_replacement_to_object(parse_dict, mat_info):
                     parse_dict.save()
 
