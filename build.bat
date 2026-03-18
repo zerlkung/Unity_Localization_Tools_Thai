@@ -3,6 +3,7 @@ setlocal
 
 set "VENV_DIR=venv"
 set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
+set "LOCAL_UNITYPY=%~dp0..\UnityPy"
 
 if not exist "%VENV_PY%" (
   echo [build] Creating virtual environment: %VENV_DIR%
@@ -22,8 +23,21 @@ echo [build] Using venv python: %VENV_PY%
 
 "%VENV_PY%" -m pip install --upgrade pip
 "%VENV_PY%" -m pip install pyinstaller TypeTreeGeneratorAPI Pillow fmod_toolkit archspec numpy scipy fonttools
-"%VENV_PY%" -m pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git
-"%VENV_PY%" -c "import UnityPy,sys; print(sys.version); print(UnityPy.__file__)"
+if exist "%LOCAL_UNITYPY%\pyproject.toml" (
+  echo [build] Installing local custom UnityPy: %LOCAL_UNITYPY%
+  "%VENV_PY%" -m pip install --upgrade --force-reinstall "%LOCAL_UNITYPY%"
+) else if exist "%LOCAL_UNITYPY%\setup.py" (
+  echo [build] Installing local custom UnityPy: %LOCAL_UNITYPY%
+  "%VENV_PY%" -m pip install --upgrade --force-reinstall "%LOCAL_UNITYPY%"
+) else (
+  echo [build] Local custom UnityPy not found. Falling back to remote repository.
+  "%VENV_PY%" -m pip install --upgrade git+https://github.com/snowyegret23/UnityPy.git
+)
+"%VENV_PY%" -c "import UnityPy,sys; from UnityPy.files.BundleFile import BundleFile; from UnityPy.files.SerializedFile import SerializedFile; print(sys.version); print(UnityPy.__file__); assert callable(getattr(BundleFile,'save_to',None)) and callable(getattr(SerializedFile,'save_to',None)), 'Custom UnityPy save_to() APIs are missing'"
+if errorlevel 1 (
+  echo [build] ERROR: Installed UnityPy does not expose BundleFile.save_to / SerializedFile.save_to
+  exit /b 1
+)
 
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist

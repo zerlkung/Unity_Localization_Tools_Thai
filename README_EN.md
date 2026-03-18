@@ -48,6 +48,9 @@ unity_font_replacer_en.exe
 unity_font_replacer_en.exe --gamepath "C:/path/to/game" --mulmaru
 ```
 
+- Primary mode arguments (`--parse`, `--mulmaru`, `--nanumgothic`, `--list`, `--preview-export`) are **mutually exclusive**.
+- Interactive EXE runs wait for Enter before exit; explicit CLI invocations exit immediately when the job finishes.
+
 ### Command Line Options
 
 #### General
@@ -78,6 +81,7 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --mulmaru
 | `--use-game-material` | Keep original in-game Material parameters (default: apply replacement Material) |
 | `--force-raster` | Force SDF replacement into Raster behavior (render mode + material effect neutralization) |
 | `--use-game-line-metrics` | Keep in-game line metrics (pointSize still follows replacement font) |
+| `--outline-ratio <float>` | Apply a multiplier to `_OutlineWidth` and `_OutlineSoftness` on the currently selected Material baseline (default `1.0`) |
 
 #### Save / Output
 
@@ -89,6 +93,8 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --mulmaru
 | `--split-save-force` | Skip one-shot and force one-by-one SDF split save |
 | `--oneshot-save-force` | Force one-shot only (disable split-save fallback) |
 
+- `--output-only` cannot be combined with `--preview-export`.
+
 #### PS5 / Scan
 
 | Option | Description |
@@ -96,6 +102,7 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --mulmaru
 | `--ps5-swizzle` | PS5 atlas swizzle detect/transform (masks auto-computed per texture size, `rotate=90`) |
 | `--preview-export` | Save SDF atlas + glyph crop PNGs into `preview/` (unswizzled view when used with `--ps5-swizzle`) |
 | `--scan-jobs <N>`, `--max-workers <N>` | Number of parallel scan workers (default: `1`) |
+| `--exclude-ext <list>` | Additional scan-excluded extensions (comma-separated, e.g. `"resS,.resource,.split0"`) |
 
 ### Examples
 
@@ -120,6 +127,9 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --parse
 
 :: Parallel workers + PS5 swizzle detection fields (alias: --max-workers)
 unity_font_replacer_en.exe --gamepath "C:/path/to/game" --parse --max-workers 10 --ps5-swizzle
+
+:: Exclude additional extensions (comma-separated, with or without leading dot)
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --parse --exclude-ext "resS,.resource,.split0"
 ```
 
 **SDF options:**
@@ -133,6 +143,12 @@ unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --use-game
 
 :: Force Raster behavior for SDF replacement
 unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --force-raster
+
+:: Make outlines 25% thicker on the current material baseline
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --outline-ratio 1.25
+
+:: Make outlines thinner using the original in-game material as baseline
+unity_font_replacer_en.exe --gamepath "C:/path/to/game" --nanumgothic --use-game-material --outline-ratio 0.6
 ```
 
 **Save / Output:**
@@ -390,8 +406,10 @@ python export_fonts_en.py "D:\MyGame"
 ### Scan
 
 - `--parse` scans via per-file worker processes so a crash in one file does not terminate the whole scan.
+- Files that fail in parallel scan (empty result + worker error) are retried once more sequentially at the end.
 - You can increase scan throughput with `--scan-jobs` (alias: `--max-workers`).
 - Scanning uses blacklist-based exclusion (`*.bak`, `.info`, `.config`, etc.).
+- Add extra exclusion extensions with `--exclude-ext "resS,.resource,.split0"` when needed.
 - Use `--target-file` to restrict replacements to specific files.
 
 ### SDF Replacement
@@ -400,6 +418,9 @@ python export_fonts_en.py "D:\MyGame"
 - Use `--use-game-line-metrics` to keep original in-game line metrics. (pointSize still follows replacement font.)
 - Default behavior applies material floats from `KR_ASSETS/* SDF Material.json` with padding-ratio correction.
   Use `--use-game-material` to preserve original in-game material style.
+- `--outline-ratio` treats the current Material baseline as `1.0` and multiplies `_OutlineWidth` / `_OutlineSoftness` after the baseline is chosen.
+- `--outline-ratio 1.25` makes outlines 25% thicker, while `--outline-ratio 0.6` makes them thinner.
+- With `--use-game-material --outline-ratio 1.25`, the baseline is the original in-game Material. Without `--use-game-material`, the baseline is the adjusted replacement Material.
 - You can set per-entry Raster forcing with JSON `force_raster: "True"` (default from `--parse`: `"False"`).
 - Use `--force-raster` to force Raster behavior for all SDF replacement entries.
 - For Raster-mode SDF replacement (per-entry `force_raster` or global `--force-raster`), SDF material effect floats (outline/underlay/glow) are neutralized to `0`, and the SDF flag (0x1000) is cleared from `m_AtlasRenderMode` so rendering follows the Raster path.
@@ -409,6 +430,8 @@ python export_fonts_en.py "D:\MyGame"
 
 - `--preview-export` writes SDF atlas previews and glyph crops into `preview/`.
 - `--preview-export --ps5-swizzle` writes previews in unswizzled view.
+- `--preview-export` cannot be combined with any other primary mode argument.
+- `--preview-export` cannot be combined with `--output-only`.
 
 ### PS5 Swizzle
 
@@ -419,6 +442,7 @@ python export_fonts_en.py "D:\MyGame"
 
 ### General
 
+- Primary mode arguments (`--parse`, `--mulmaru`, `--nanumgothic`, `--list`, `--preview-export`) are mutually exclusive.
 - `TypeTreeGeneratorAPI` is required for TMP(FontAsset) parsing/replacement.
 - Interactive path input strips repeated wrapping quotes automatically.
 - Back up game files before modification.

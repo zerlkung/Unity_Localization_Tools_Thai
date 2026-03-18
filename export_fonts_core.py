@@ -309,6 +309,328 @@ def _atlas_ref_ids(ref: Any) -> tuple[int, int]:
     return file_id, path_id
 
 
+def _normalize_assets_basename(value: Any) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+    normalized = text.replace("\\", "/")
+    name = os.path.basename(normalized)
+    return name or None
+
+
+def _normalize_asset_lookup_path(value: Any) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+    normalized = text.replace("\\", "/")
+    lowered = normalized.lower()
+    for prefix in ("archive://", "archive:/", "file://"):
+        if lowered.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            lowered = normalized.lower()
+            break
+    while normalized.startswith("/"):
+        normalized = normalized[1:]
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    normalized = re.sub(r"/{2,}", "/", normalized).strip()
+    return normalized.lower() if normalized else None
+
+
+def _normalize_asset_file_key(path: Any) -> str | None:
+    text = str(path).strip() if path is not None else ""
+    if not text:
+        return None
+    return os.path.normcase(os.path.abspath(text))
+
+
+def _normalize_assets_key(value: Any) -> str | None:
+    name = _normalize_assets_basename(value)
+    return name.lower() if name else None
+
+
+def _build_asset_file_index(
+    assets_files: list[str],
+    data_path: str,
+) -> dict[str, Any]:
+    data_root = os.path.abspath(data_path)
+    path_by_key: dict[str, str] = {}
+    relpath_to_keys: dict[str, list[str]] = {}
+    basename_to_keys: dict[str, list[str]] = {}
+    relpath_by_key: dict[str, str] = {}
+    basename_by_key: dict[str, str] = {}
+
+    for candidate_path in sorted(assets_files):
+        asset_key = _normalize_asset_file_key(candidate_path)
+        if not asset_key:
+            continue
+        abs_path = os.path.abspath(candidate_path)
+        rel_path = os.path.relpath(abs_path, data_root).replace("\\", "/").lower()
+        basename = os.path.basename(abs_path).lower()
+        path_by_key[asset_key] = abs_path
+        relpath_by_key[asset_key] = rel_path
+        basename_by_key[asset_key] = basename
+        relpath_to_keys.setdefault(rel_path, []).append(asset_key)
+        basename_to_keys.setdefault(basename, []).append(asset_key)
+
+    return {
+        "data_root": data_root,
+        "path_by_key": path_by_key,
+        "relpath_to_keys": relpath_to_keys,
+        "basename_to_keys": basename_to_keys,
+        "relpath_by_key": relpath_by_key,
+        "basename_by_key": basename_by_key,
+    }
+
+
+def _extract_external_assets_name(external_ref: Any) -> str | None:
+    if external_ref is None:
+        return None
+
+    candidates: list[Any] = []
+    if isinstance(external_ref, dict):
+        candidates.extend(
+            [
+                external_ref.get("path"),
+                external_ref.get("pathName"),
+                external_ref.get("name"),
+                external_ref.get("fileName"),
+                external_ref.get("asset_name"),
+                external_ref.get("assetPath"),
+            ]
+        )
+    else:
+        for attr in (
+            "path",
+            "pathName",
+            "name",
+            "fileName",
+            "asset_name",
+            "assetPath",
+        ):
+            candidates.append(getattr(external_ref, attr, None))
+
+    for candidate in candidates:
+        name = _normalize_assets_basename(candidate)
+        if name:
+            return name
+    return None
+
+
+def _extract_external_assets_candidates(external_ref: Any) -> list[str]:
+    if external_ref is None:
+        return []
+
+    raw_candidates: list[Any] = []
+    if isinstance(external_ref, dict):
+        raw_candidates.extend(
+            [
+                external_ref.get("path"),
+                external_ref.get("pathName"),
+                external_ref.get("name"),
+                external_ref.get("fileName"),
+                external_ref.get("asset_name"),
+                external_ref.get("assetPath"),
+            ]
+        )
+    else:
+        for attr in (
+            "path",
+            "pathName",
+            "name",
+            "fileName",
+            "asset_name",
+            "assetPath",
+        ):
+            raw_candidates.append(getattr(external_ref, attr, None))
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for candidate in raw_candidates:
+        normalized_path = _normalize_asset_lookup_path(candidate)
+        if normalized_path and normalized_path not in seen:
+            seen.add(normalized_path)
+            resolved.append(normalized_path)
+        normalized_name = _normalize_assets_basename(candidate)
+        if normalized_name:
+            lowered_name = normalized_name.lower()
+            if lowered_name not in seen:
+                seen.add(lowered_name)
+                resolved.append(lowered_name)
+    return resolved
+
+
+def _resolve_external_ref(source_assets_file: Any, file_id: int) -> Any:
+    try:
+        resolved_file_id = int(file_id or 0)
+    except Exception:
+        resolved_file_id = 0
+
+    if resolved_file_id == 0:
+        return None
+
+    externals = getattr(source_assets_file, "externals", None)
+    if externals is None:
+        externals = getattr(source_assets_file, "m_Externals", None)
+
+    if isinstance(externals, dict):
+        external_ref = externals.get(resolved_file_id)
+        if external_ref is None:
+            external_ref = externals.get(resolved_file_id - 1)
+        return external_ref
+
+    if isinstance(externals, (list, tuple)):
+        ext_index = resolved_file_id - 1
+        if 0 <= ext_index < len(externals):
+            return externals[ext_index]
+    return None
+
+
+def _resolve_assets_name_from_file_id(source_assets_file: Any, file_id: int) -> str | None:
+    try:
+        resolved_file_id = int(file_id or 0)
+    except Exception:
+        resolved_file_id = 0
+
+    if resolved_file_id == 0:
+        return _normalize_assets_basename(getattr(source_assets_file, "name", ""))
+
+    externals = getattr(source_assets_file, "externals", None)
+    if externals is None:
+        externals = getattr(source_assets_file, "m_Externals", None)
+
+    external_ref = _resolve_external_ref(source_assets_file, resolved_file_id)
+    if externals is None:
+        return None
+    return _extract_external_assets_name(external_ref)
+
+
+def _collect_asset_file_index_matches(
+    asset_file_index: dict[str, Any] | None,
+    reference: Any,
+) -> list[str]:
+    if not isinstance(asset_file_index, dict):
+        return []
+
+    normalized_reference = _normalize_asset_lookup_path(reference)
+    if not normalized_reference:
+        normalized_reference = _normalize_assets_basename(reference)
+        if normalized_reference:
+            normalized_reference = normalized_reference.lower()
+    if not normalized_reference:
+        return []
+
+    relpath_to_keys = cast(
+        dict[str, list[str]],
+        asset_file_index.get("relpath_to_keys", {}),
+    )
+    basename_to_keys = cast(
+        dict[str, list[str]],
+        asset_file_index.get("basename_to_keys", {}),
+    )
+    relpath_by_key = cast(dict[str, str], asset_file_index.get("relpath_by_key", {}))
+
+    matches: list[str] = []
+    seen: set[str] = set()
+
+    def _append_match(match_key: str) -> None:
+        if match_key and match_key not in seen:
+            seen.add(match_key)
+            matches.append(match_key)
+
+    for match_key in relpath_to_keys.get(normalized_reference, []):
+        _append_match(match_key)
+
+    if not matches and "/" in normalized_reference:
+        suffix = "/" + normalized_reference
+        for match_key, rel_path in relpath_by_key.items():
+            if rel_path == normalized_reference or rel_path.endswith(suffix):
+                _append_match(match_key)
+
+    basename = os.path.basename(normalized_reference)
+    for match_key in basename_to_keys.get(basename, []):
+        _append_match(match_key)
+
+    return matches
+
+
+def _choose_asset_file_match(
+    asset_file_index: dict[str, Any] | None,
+    matches: list[str],
+    *,
+    current_file_key: str | None,
+    reference_desc: str,
+) -> str | None:
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    if current_file_key and isinstance(asset_file_index, dict):
+        path_by_key = cast(dict[str, str], asset_file_index.get("path_by_key", {}))
+        current_path = path_by_key.get(current_file_key)
+        if current_path:
+            current_dir = os.path.dirname(current_path)
+            sibling_matches = [
+                match_key
+                for match_key in matches
+                if os.path.dirname(path_by_key.get(match_key, "")) == current_dir
+            ]
+            if len(sibling_matches) == 1:
+                return sibling_matches[0]
+    chosen = sorted(matches)[0]
+    _log_console(
+        f"Warning: ambiguous asset reference '{reference_desc}' matched {len(matches)} files; using first: {chosen}"
+    )
+    return chosen
+
+
+def _resolve_target_outer_key(
+    current_outer_key: str,
+    source_assets_file: Any,
+    file_id: int,
+    target_assets_name: str | None,
+    *,
+    local_assets_keys: set[str] | None = None,
+    asset_file_index: dict[str, Any] | None,
+) -> str | None:
+    try:
+        resolved_file_id = int(file_id or 0)
+    except Exception:
+        resolved_file_id = 0
+    if resolved_file_id == 0:
+        return current_outer_key
+    target_assets_key = _normalize_assets_key(target_assets_name)
+    if target_assets_key and isinstance(local_assets_keys, set):
+        if target_assets_key in local_assets_keys:
+            return current_outer_key
+
+    external_ref = _resolve_external_ref(source_assets_file, resolved_file_id)
+    candidates = _extract_external_assets_candidates(external_ref)
+    if target_assets_name:
+        normalized_assets_name = _normalize_assets_basename(target_assets_name)
+        if normalized_assets_name:
+            candidates.append(normalized_assets_name.lower())
+
+    for candidate in candidates:
+        matches = _collect_asset_file_index_matches(asset_file_index, candidate)
+        chosen = _choose_asset_file_match(
+            asset_file_index,
+            matches,
+            current_file_key=current_outer_key,
+            reference_desc=str(candidate),
+        )
+        if chosen:
+            return chosen
+    return None
+
+
+def _make_assets_object_key(assets_name: str, path_id: int) -> str:
+    normalized_assets = _normalize_assets_key(assets_name)
+    if not normalized_assets:
+        normalized_assets = ""
+    return f"{normalized_assets}|{int(path_id)}"
+
+
 def _has_real_atlas_path(ref: Any) -> bool:
     _, path_id = _atlas_ref_ids(ref)
     return path_id > 0
@@ -461,8 +783,8 @@ def is_tmp_font_asset(obj: Any) -> bool:
 
 
 def extract_tmp_refs(parse_dict: JsonDict) -> dict[str, int] | None:
-    """KR: TMP 폰트 데이터에서 atlas/material PathID를 추출합니다.
-    EN: Extract atlas/material PathIDs from TMP font data.
+    """KR: TMP 폰트 데이터에서 atlas/material FileID/PathID를 추출합니다.
+    EN: Extract atlas/material FileID/PathID pairs from TMP font data.
     """
     info = inspect_tmp_font_schema(parse_dict)
     glyph_count = int(info.get("glyph_count", 0) or 0)
@@ -487,7 +809,7 @@ def extract_tmp_refs(parse_dict: JsonDict) -> dict[str, int] | None:
     if not isinstance(material_ref, dict):
         alt_material = parse_dict.get("material")
         material_ref = alt_material if isinstance(alt_material, dict) else {}
-    material_path_id = int(material_ref.get("m_PathID", 0) or 0)
+    material_file_id, material_path_id = _atlas_ref_ids(material_ref)
 
     creation_settings = parse_dict.get("m_CreationSettings")
     if isinstance(creation_settings, dict):
@@ -496,7 +818,9 @@ def extract_tmp_refs(parse_dict: JsonDict) -> dict[str, int] | None:
         creation_settings["characterSequence"] = ""
 
     return {
+        "atlas_file_id": file_id,
         "atlas_path_id": path_id,
+        "material_file_id": material_file_id,
         "material_path_id": material_path_id,
     }
 
@@ -512,6 +836,7 @@ def export_fonts(
     """
     if output_dir is None:
         output_dir = os.getcwd()
+    os.makedirs(output_dir, exist_ok=True)
 
     unity_version = get_unity_version(data_path)
     assets_files = find_assets_files(data_path)
@@ -535,8 +860,40 @@ def export_fonts(
     _log_console()
 
     exported_count = 0
+    asset_file_index = _build_asset_file_index(assets_files, data_path)
+    asset_path_by_key = cast(dict[str, str], asset_file_index.get("path_by_key", {}))
+    basename_to_keys = cast(
+        dict[str, list[str]],
+        asset_file_index.get("basename_to_keys", {}),
+    )
+    texture_targets_by_outer: dict[str, dict[str, str]] = {}
+    material_targets_by_outer: dict[str, dict[str, str]] = {}
+    outer_display_by_key: dict[str, str] = {}
+    duplicate_asset_names: dict[str, list[str]] = {
+        basename: [asset_path_by_key[key] for key in keys if key in asset_path_by_key]
+        for basename, keys in basename_to_keys.items()
+        if len(keys) > 1
+    }
 
-    for assets_file in assets_files:
+    if duplicate_asset_names:
+        for duplicate_name, duplicate_paths in sorted(duplicate_asset_names.items()):
+            if lang == "ko":
+                _log_console(
+                    f"경고: 동일 basename 에셋이 여러 개 있습니다: '{duplicate_name}'. "
+                    f"가능하면 외부 참조 path를 이용해 해석하지만, 모호하면 첫 경로를 사용합니다. "
+                    f"경로 목록: {duplicate_paths}"
+                )
+            else:
+                _log_console(
+                    f"Warning: duplicate asset basename '{duplicate_name}' detected; "
+                    f"the exporter will try external ref paths first, but falls back to the first match when ambiguous. "
+                    f"Paths: {duplicate_paths}"
+                )
+
+    for outer_key, outer_path in asset_path_by_key.items():
+        assets_file = outer_path
+        outer_name = os.path.basename(assets_file)
+        outer_display_by_key.setdefault(outer_key, outer_name)
         try:
             env = UnityPy.load(assets_file)
             env.typetree_generator = generator
@@ -551,8 +908,13 @@ def export_fonts(
                 )
             continue
 
-        texture_pointers: dict[int, str] = {}
-        material_pointers: set[int] = set()
+        local_assets_keys: set[str] = {outer_key}
+        for env_obj in env.objects:
+            asset_key = _normalize_assets_key(
+                getattr(getattr(env_obj, "assets_file", None), "name", None)
+            )
+            if asset_key:
+                local_assets_keys.add(asset_key)
 
         for obj in env.objects:
             if obj.type.name != "MonoBehaviour":
@@ -566,20 +928,85 @@ def export_fonts(
                     continue
 
                 objname = obj.peek_name() or f"TMP_FontAsset_{obj.path_id}"
+                source_assets_file = getattr(obj, "assets_file", None)
+                atlas_target_assets_name = _resolve_assets_name_from_file_id(
+                    source_assets_file, refs["atlas_file_id"]
+                ) or _resolve_assets_name_from_file_id(
+                    source_assets_file, 0
+                )
+                atlas_target_outer_key = _resolve_target_outer_key(
+                    outer_key,
+                    source_assets_file,
+                    refs["atlas_file_id"],
+                    atlas_target_assets_name,
+                    local_assets_keys=local_assets_keys,
+                    asset_file_index=asset_file_index,
+                )
+                material_target_assets_name = _resolve_assets_name_from_file_id(
+                    source_assets_file, refs["material_file_id"]
+                ) or _resolve_assets_name_from_file_id(
+                    source_assets_file, 0
+                )
+                material_target_outer_key = _resolve_target_outer_key(
+                    outer_key,
+                    source_assets_file,
+                    refs["material_file_id"],
+                    material_target_assets_name,
+                    local_assets_keys=local_assets_keys,
+                    asset_file_index=asset_file_index,
+                )
                 if lang == "ko":
                     _log_console(f"SDF 폰트 발견: {objname} (PathID: {obj.path_id})")
-                    _log_console(f"  Atlas 텍스처 PathID: {refs['atlas_path_id']}")
-                    _log_console(f"  머티리얼 PathID: {refs['material_path_id']}")
+                    _log_console(
+                        f"  Atlas 텍스처: FileID {refs['atlas_file_id']} / "
+                        f"PathID {refs['atlas_path_id']} -> {atlas_target_assets_name}"
+                    )
+                    _log_console(
+                        f"  머티리얼: FileID {refs['material_file_id']} / "
+                        f"PathID {refs['material_path_id']} -> {material_target_assets_name}"
+                    )
                 else:
                     _log_console(f"SDF font found: {objname} (PathID: {obj.path_id})")
-                    _log_console(f"  Atlas texture PathID: {refs['atlas_path_id']}")
-                    _log_console(f"  Material PathID: {refs['material_path_id']}")
+                    _log_console(
+                        f"  Atlas texture: FileID {refs['atlas_file_id']} / "
+                        f"PathID {refs['atlas_path_id']} -> {atlas_target_assets_name}"
+                    )
+                    _log_console(
+                        f"  Material: FileID {refs['material_file_id']} / "
+                        f"PathID {refs['material_path_id']} -> {material_target_assets_name}"
+                    )
 
-                texture_pointers[refs["atlas_path_id"]] = objname.replace(
-                    " SDF", " SDF Atlas"
-                )
-                if refs["material_path_id"]:
-                    material_pointers.add(refs["material_path_id"])
+                if atlas_target_assets_name and atlas_target_outer_key:
+                    outer_display_by_key.setdefault(
+                        atlas_target_outer_key,
+                        os.path.basename(
+                            asset_path_by_key.get(atlas_target_outer_key, assets_file)
+                        ),
+                    )
+                    texture_targets_by_outer.setdefault(atlas_target_outer_key, {})[
+                        _make_assets_object_key(
+                            atlas_target_assets_name,
+                            refs["atlas_path_id"],
+                        )
+                    ] = objname.replace(" SDF", " SDF Atlas")
+
+                if (
+                    refs["material_path_id"] > 0
+                    and material_target_assets_name
+                    and material_target_outer_key
+                ):
+                    outer_display_by_key.setdefault(
+                        material_target_outer_key,
+                        os.path.basename(
+                            asset_path_by_key.get(material_target_outer_key, assets_file)
+                        ),
+                    )
+                    material_targets_by_outer.setdefault(material_target_outer_key, {})[
+                        _make_assets_object_key(
+                            material_target_assets_name,
+                            refs["material_path_id"],
+                        )
+                    ] = objname
 
                 json_path = os.path.join(output_dir, f"{objname}.json")
                 with open(json_path, "w", encoding="utf-8") as f:
@@ -599,32 +1026,86 @@ def export_fonts(
                         f"Warning: TMP parse failed (file: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}"
                     )
 
+    unresolved_texture_targets = {
+        outer_key: dict(bucket)
+        for outer_key, bucket in texture_targets_by_outer.items()
+        if bucket
+    }
+    unresolved_material_targets = {
+        outer_key: dict(bucket)
+        for outer_key, bucket in material_targets_by_outer.items()
+        if bucket
+    }
+
+    for outer_key, assets_file in asset_path_by_key.items():
+        outer_name = os.path.basename(assets_file)
+        texture_bucket = unresolved_texture_targets.get(outer_key)
+        material_bucket = unresolved_material_targets.get(outer_key)
+        if not texture_bucket and not material_bucket:
+            continue
+
+        try:
+            env = UnityPy.load(assets_file)
+            env.typetree_generator = generator
+        except Exception as e:  # pragma: no cover
+            if lang == "ko":
+                _log_console(
+                    f"경고: 추출 대상 파일 로드 실패 '{os.path.basename(assets_file)}': {e}"
+                )
+            else:
+                _log_console(
+                    f"Warning: failed to load export target '{os.path.basename(assets_file)}': {e}"
+                )
+            continue
+
         for obj in env.objects:
             try:
-                if obj.type.name == "Texture2D" and obj.path_id in texture_pointers:
+                object_assets_name = _resolve_assets_name_from_file_id(
+                    getattr(obj, "assets_file", None), 0
+                ) or outer_name
+                object_key = _make_assets_object_key(object_assets_name, obj.path_id)
+
+                if obj.type.name == "Texture2D" and texture_bucket:
+                    export_name = texture_bucket.pop(object_key, None)
+                    if export_name is None:
+                        continue
                     tex = obj.parse_as_object()
                     image = tex.image
-                    objname = texture_pointers.get(
-                        obj.path_id, obj.peek_name() or str(obj.path_id)
-                    )
                     if lang == "ko":
-                        _log_console(f"텍스처 추출: {objname} (PathID: {obj.path_id})")
+                        _log_console(
+                            f"텍스처 추출: {export_name} "
+                            f"({object_assets_name}, PathID: {obj.path_id})"
+                        )
                     else:
                         _log_console(
-                            f"Extracting texture: {objname} (PathID: {obj.path_id})"
+                            f"Extracting texture: {export_name} "
+                            f"({object_assets_name}, PathID: {obj.path_id})"
                         )
-                    png_path = os.path.join(output_dir, f"{objname}.png")
+                    png_path = os.path.join(output_dir, f"{export_name}.png")
                     image.save(png_path)
                     if lang == "ko":
-                        _log_console(f"  -> {objname}.png 저장됨")
+                        _log_console(f"  -> {export_name}.png 저장됨")
                     else:
-                        _log_console(f"  -> {objname}.png saved")
-                elif obj.type.name == "Material" and obj.path_id in material_pointers:
+                        _log_console(f"  -> {export_name}.png saved")
+                elif obj.type.name == "Material" and material_bucket:
+                    source_font_name = material_bucket.pop(object_key, None)
+                    if source_font_name is None:
+                        continue
                     mat = obj.parse_as_dict()
                     mat_name = obj.peek_name() or f"Material_{obj.path_id}"
                     mat_path = os.path.join(output_dir, f"{mat_name}.json")
                     with open(mat_path, "w", encoding="utf-8") as f:
                         json.dump(mat, f, indent=4, ensure_ascii=False)
+                    if lang == "ko":
+                        _log_console(
+                            f"머티리얼 추출: {mat_name} "
+                            f"({object_assets_name}, PathID: {obj.path_id}, source: {source_font_name})"
+                        )
+                    else:
+                        _log_console(
+                            f"Extracting material: {mat_name} "
+                            f"({object_assets_name}, PathID: {obj.path_id}, source: {source_font_name})"
+                        )
             except Exception as e:  # pragma: no cover
                 if lang == "ko":
                     _log_console(
@@ -634,6 +1115,37 @@ def export_fonts(
                     _log_console(
                         f"Warning: export error (file: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}"
                     )
+
+        if texture_bucket is not None and not texture_bucket:
+            unresolved_texture_targets.pop(outer_key, None)
+        if material_bucket is not None and not material_bucket:
+            unresolved_material_targets.pop(outer_key, None)
+
+    for outer_key, bucket in sorted(unresolved_texture_targets.items()):
+        if not bucket:
+            continue
+        display_name = outer_display_by_key.get(outer_key, outer_key)
+        if lang == "ko":
+            _log_console(
+                f"경고: 텍스처 참조 {len(bucket)}개를 찾지 못했습니다 ({display_name})"
+            )
+        else:
+            _log_console(
+                f"Warning: {len(bucket)} texture reference(s) could not be resolved ({display_name})"
+            )
+
+    for outer_key, bucket in sorted(unresolved_material_targets.items()):
+        if not bucket:
+            continue
+        display_name = outer_display_by_key.get(outer_key, outer_key)
+        if lang == "ko":
+            _log_console(
+                f"경고: 머티리얼 참조 {len(bucket)}개를 찾지 못했습니다 ({display_name})"
+            )
+        else:
+            _log_console(
+                f"Warning: {len(bucket)} material reference(s) could not be resolved ({display_name})"
+            )
 
     return exported_count
 

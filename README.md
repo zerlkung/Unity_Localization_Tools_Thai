@@ -48,6 +48,9 @@ unity_font_replacer_ko.exe
 unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --mulmaru
 ```
 
+- 기본 작업 모드 인자(`--parse`, `--mulmaru`, `--nanumgothic`, `--list`, `--preview-export`)는 **하나만** 사용할 수 있습니다.
+- EXE를 대화형으로 실행하면 종료 전 엔터 입력을 기다리고, 명령줄 인자를 준 CLI 실행은 작업 완료 후 바로 종료됩니다.
+
 ### 명령줄 옵션
 
 #### 기본
@@ -78,6 +81,7 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --mulmaru
 | `--use-game-material` | 게임 원본 Material 파라미터 유지 (기본: 교체 Material 보정 적용) |
 | `--force-raster` | SDF 교체를 Raster 기준으로 강제 (렌더 모드 + Material 효과값 Raster 보정) |
 | `--use-game-line-metrics` | 게임 원본 줄 간격 메트릭 사용 (pointSize는 교체값 유지) |
+| `--outline-ratio <float>` | 현재 선택된 Material 기준 `_OutlineWidth`, `_OutlineSoftness`에 배율 적용 (기본 `1.0`) |
 
 #### 저장
 
@@ -89,6 +93,8 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --mulmaru
 | `--split-save-force` | one-shot을 건너뛰고 SDF 1개씩 강제 분할 저장 |
 | `--oneshot-save-force` | 분할 저장 폴백 없이 one-shot만 시도 |
 
+- `--output-only`는 `--preview-export`와 함께 사용할 수 없습니다.
+
 #### PS5 / 스캔
 
 | 옵션 | 설명 |
@@ -96,6 +102,7 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --mulmaru
 | `--ps5-swizzle` | PS5 Atlas swizzle 자동 판별/변환 (텍스쳐 크기별 mask 자동 계산, `rotate=90`) |
 | `--preview-export` | `preview/`에 SDF Atlas + 글리프 crop PNG 저장 (`--ps5-swizzle`와 함께 사용 시 unswizzle 기준) |
 | `--scan-jobs <N>`, `--max-workers <N>` | 폰트 스캔 병렬 워커 수 (기본: `1`) |
+| `--exclude-ext <목록>` | 추가 스캔 제외 확장자(콤마 구분, 예: `"resS,.resource,.split0"`) |
 
 ### 사용 예시
 
@@ -120,6 +127,9 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --parse
 
 :: 병렬 워커 + PS5 swizzle 판별 필드 포함 (alias: --max-workers)
 unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --parse --max-workers 10 --ps5-swizzle
+
+:: 추가 확장자 제외 (쉼표 구분, 점 유무 모두 허용)
+unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --parse --exclude-ext "resS,.resource,.split0"
 ```
 
 **SDF 옵션:**
@@ -133,6 +143,12 @@ unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --nanumgothic --use-game
 
 :: SDF 교체를 Raster 기준으로 강제
 unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --nanumgothic --force-raster
+
+:: 현재 선택된 Material 기준 외곽선 1.25배
+unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --nanumgothic --outline-ratio 1.25
+
+:: 게임 원본 Material 기준 외곽선 0.6배
+unity_font_replacer_ko.exe --gamepath "C:/path/to/game" --nanumgothic --use-game-material --outline-ratio 0.6
 ```
 
 **저장 / 출력:**
@@ -391,8 +407,10 @@ python export_fonts_ko.py "D:\MyGame"
 ### 스캔
 
 - `--parse`는 파일 단위 워커 프로세스로 스캔해 단일 파일 크래시가 전체 작업 중단으로 이어지지 않도록 격리합니다.
+- 병렬 스캔에서 실패(빈 결과 + 워커 오류)한 파일은 마지막에 1개씩 순차 재시도합니다.
 - 스캔 속도를 높이려면 `--scan-jobs`(별칭: `--max-workers`)로 워커 수를 늘릴 수 있습니다.
 - 스캔은 블랙리스트 기반 제외를 사용합니다 (`*.bak`, `.info`, `.config` 등 제외).
+- 추가 제외 확장자가 필요하면 `--exclude-ext "resS,.resource,.split0"`처럼 지정하세요.
 - 파일 단위로 제한하려면 `--target-file`을 사용하세요.
 
 ### SDF 교체
@@ -401,6 +419,9 @@ python export_fonts_ko.py "D:\MyGame"
 - 게임 원본 줄 간격 메트릭을 그대로 쓰려면 `--use-game-line-metrics`를 사용하세요. (pointSize는 항상 교체 폰트 값)
 - SDF 교체 시 기본은 `KR_ASSETS/* SDF Material.json` 머티리얼 float를 적용하며, padding 비율 기준 보정도 함께 적용합니다.
 - 원본 게임 머티리얼 스타일을 유지하려면 `--use-game-material`을 사용하세요.
+- `--outline-ratio`는 현재 선택된 Material 기준값을 1.0으로 보고 `_OutlineWidth`, `_OutlineSoftness`에 추가 배율을 곱합니다.
+- `--outline-ratio 1.25`는 외곽선을 25% 두껍게, `--outline-ratio 0.6`은 더 얇게 만듭니다.
+- `--use-game-material --outline-ratio 1.25`면 게임 원본 Material 기준으로, 기본 모드에서 `--outline-ratio 1.25`면 보정된 replacement Material 기준으로 배율이 적용됩니다.
 - JSON 항목별 `force_raster: "True"`로 개별 Raster 강제를 지정할 수 있습니다. (`--parse` 기본값: `"False"`)
 - 전체 SDF 교체 항목을 Raster 방식으로 강제하려면 `--force-raster`를 사용하세요.
 - Raster 방식으로 처리되는 SDF 교체(개별 `force_raster` 또는 `--force-raster`)에서는 SDF 머티리얼 효과값(Outline/Underlay/Glow 등)을 0으로 보정하고 `m_AtlasRenderMode`의 SDF 플래그(0x1000)를 해제해 Raster 경로로 처리합니다.
@@ -410,6 +431,8 @@ python export_fonts_ko.py "D:\MyGame"
 
 - `--preview-export`는 SDF Atlas/글리프 crop 미리보기를 `preview/`에 저장합니다.
 - `--preview-export --ps5-swizzle` 조합이면 unswizzle 기준으로 preview를 저장합니다.
+- `--preview-export`는 다른 기본 작업 모드 인자와 함께 사용할 수 없습니다.
+- `--preview-export`와 `--output-only`는 함께 사용할 수 없습니다.
 
 ### PS5 Swizzle
 
@@ -420,6 +443,7 @@ python export_fonts_ko.py "D:\MyGame"
 
 ### 일반
 
+- 기본 작업 모드 인자(`--parse`, `--mulmaru`, `--nanumgothic`, `--list`, `--preview-export`)는 하나만 사용할 수 있습니다.
 - `TypeTreeGeneratorAPI`가 TMP(FontAsset) 파싱/교체에 필요합니다.
 - 대화형 입력에서 경로 앞뒤 따옴표가 중복되어도 자동으로 정리해 처리합니다.
 - 게임 파일 수정 전 백업을 권장합니다.

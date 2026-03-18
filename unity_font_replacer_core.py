@@ -20,15 +20,21 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import traceback as tb_module
 import copy
+import struct as struct_module
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Literal, NoReturn, cast
 
 import UnityPy
 from PIL import Image, ImageOps
+from UnityPy.enums.BundleFile import CompressionFlags
+from UnityPy.files.SerializedFile import SerializedType
+from UnityPy.helpers import CompressionHelper
 from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 try:
     from UnityPy.enums import TextureFormat as _UnityTextureFormatEnum
@@ -46,14 +52,16 @@ logger = logging.getLogger(__name__)
 Language = Literal["ko", "en"]
 JsonDict = dict[str, Any]
 _REGISTERED_TEMP_DIRS: set[str] = set()
+_AUTO_SPLIT_ONESHOT_TEXTURE_BYTES = 1536 * 1024 * 1024
+_AUTO_SPLIT_TEXTURE_BATCH_TARGET_BYTES = 768 * 1024 * 1024
 PS5_SWIZZLE_MASK_X = 0x385F0
 PS5_SWIZZLE_MASK_Y = 0x07A0F
 PS5_SWIZZLE_ROTATE = 90
 
-# Ghidra-grounded format metadata from FUN_0091cd90 runtime table init.
+# PS5 texture layout metadata.
 # word0 is the first qword field (e.g. 0x1d0000000a for DXT1/BC1).
-# block_pack is packed as: bpb | (block_w << 8) | (block_h << 16) | (depth << 24)
-_PS5_GHIDRA_FORMAT_META: dict[int, dict[str, Any]] = {
+# block_pack packs bytes-per-block, width, height, and depth.
+_PS5_LAYOUT_FORMAT_META: dict[int, dict[str, Any]] = {
     4: {"label": "R8B8G8A8", "word0": 0x00000004, "block_pack": 0x1010104},
     10: {"label": "DXT1|BC1", "word0": 0x1D0000000A, "block_pack": 0x1040408},
     12: {"label": "DXT5|BC3", "word0": 0x1D0000000C, "block_pack": 0x1040410},
@@ -63,9 +71,9 @@ _PS5_GHIDRA_FORMAT_META: dict[int, dict[str, Any]] = {
     27: {"label": "BC5", "word0": 0x1D0000001B, "block_pack": 0x1040410},
 }
 
-# Ghidra DAT_01b37a60 format flags (index = GPU format id / TextureFormat value in this title)
-# Used to derive iVar15 in FUN_003bbdd0: ((flags & 0x6) * 2) + 8.
-_PS5_GHIDRA_FORMAT_FLAGS: dict[int, int] = {
+# Extra format flags used by the runtime layout selection logic.
+# `layout_shift` is derived as: ((flags & 0x6) * 2) + 8.
+_PS5_LAYOUT_FORMAT_FLAGS: dict[int, int] = {
     10: 0x0024,  # DXT1|BC1
     12: 0x0000,  # DXT5|BC3
     24: 0x008C,  # BC6H
@@ -92,10 +100,10 @@ def _ps5_unpack_block_pack(block_pack: int) -> tuple[int, int, int, int]:
     return bytes_per_block, block_w, block_h, depth
 
 
-def _ps5_build_bc_formats_from_ghidra() -> dict[int, tuple[int, int, int, str]]:
+def _ps5_build_bc_formats_from_layout_meta() -> dict[int, tuple[int, int, int, str]]:
     out: dict[int, tuple[int, int, int, str]] = {}
     for texture_format, decoder_name in _PS5_BC_DECODER_BY_FORMAT.items():
-        meta = _PS5_GHIDRA_FORMAT_META.get(int(texture_format))
+        meta = _PS5_LAYOUT_FORMAT_META.get(int(texture_format))
         if not meta:
             continue
         bpb, bw, bh, depth = _ps5_unpack_block_pack(int(meta["block_pack"]))
@@ -105,7 +113,7 @@ def _ps5_build_bc_formats_from_ghidra() -> dict[int, tuple[int, int, int, str]]:
     return out
 
 
-_PS5_BC_FORMATS: dict[int, tuple[int, int, int, str]] = _ps5_build_bc_formats_from_ghidra()
+_PS5_BC_FORMATS: dict[int, tuple[int, int, int, str]] = _ps5_build_bc_formats_from_layout_meta()
 
 # Swizzle modes for Addrlib v2 (GFX10+) used by PS5.
 _PS5_ADDR_SW_256B_S = 1
@@ -133,23 +141,22 @@ _PS5_BC_MODE_INFO: dict[str, tuple[int, str, int, bool]] = {
 }
 _PS5_BC_FAST_MODE_NAMES = ["4KB_S", "64KB_S", "4KB_D", "256B_S", "64KB_D", "256B_D"]
 
-# Ghidra-verified thin 2D tile dimensions from FUN_003bbdd0 table selection:
-#   DAT_01b37a20 (256B), DAT_01b37920 (4KB), DAT_01b379a0 (64KB)
-_PS5_GHIDRA_BLOCK256_2D_BITS: dict[int, tuple[int, int]] = {
+# Thin 2D tile dimensions by page class.
+_PS5_LAYOUT_BLOCK256_2D_BITS: dict[int, tuple[int, int]] = {
     1: (4, 4),
     2: (4, 3),
     4: (3, 3),
     8: (3, 2),
     16: (2, 2),
 }
-_PS5_GHIDRA_BLOCK4K_2D_BITS: dict[int, tuple[int, int]] = {
+_PS5_LAYOUT_BLOCK4K_2D_BITS: dict[int, tuple[int, int]] = {
     1: (6, 6),
     2: (6, 5),
     4: (5, 5),
     8: (5, 4),
     16: (4, 4),
 }
-_PS5_GHIDRA_BLOCK64K_2D_BITS: dict[int, tuple[int, int]] = {
+_PS5_LAYOUT_BLOCK64K_2D_BITS: dict[int, tuple[int, int]] = {
     1: (8, 8),
     2: (8, 7),
     4: (7, 7),
@@ -157,9 +164,8 @@ _PS5_GHIDRA_BLOCK64K_2D_BITS: dict[int, tuple[int, int]] = {
     16: (6, 6),
 }
 
-# DAT_01b377f0 mode=5 (4KB_S) triplets by elem index (log2(bytes_per_block)).
-# Raw triplet order is preserved as observed in Ghidra/file probe.
-_PS5_GHIDRA_MODE5_TRIPLETS_BY_BPB: dict[int, tuple[int, int, int]] = {
+# 4KB_S triplets indexed by log2(bytes_per_block).
+_PS5_4KB_S_TRIPLETS_BY_BLOCK_BYTES: dict[int, tuple[int, int, int]] = {
     1: (0, 6, 6),
     2: (0, 6, 5),
     4: (0, 5, 5),
@@ -167,27 +173,21 @@ _PS5_GHIDRA_MODE5_TRIPLETS_BY_BPB: dict[int, tuple[int, int, int]] = {
     16: (0, 4, 4),
 }
 
-# Per-bpe micro-tile dimensions (x_bits, y_bits) determined by brute-force analysis.
-# AMD GCN/RDNA thin micro-tile:
-#   bpe=1 (Alpha8):  32x16 pixels (512 bytes) – axes transposed (HxW)
-#   bpe=4 (RGBA32):   8x4  pixels (128 bytes) – axes NOT transposed (WxH)
-#   bpe=2/3: most textures are linear (not swizzled); use conservative defaults.
+# Per-format micro-tile dimensions.
 _PS5_MICRO_TILE_BITS: dict[int, tuple[int, int]] = {
     1: (5, 4),  # 32x16
-    2: (4, 3),  # 16x8  (conservative fallback)
-    3: (4, 3),  # 16x8  (conservative fallback)
+    2: (4, 3),  # 16x8
+    3: (4, 3),  # 16x8
     4: (3, 2),  #  8x4
 }
-_PS5_MICRO_X_BITS_DEFAULT = 5  # legacy default (8bpp)
+_PS5_MICRO_X_BITS_DEFAULT = 5  # 8bpp default
 _PS5_MICRO_Y_BITS_DEFAULT = 4
 
-# Per-bpe axis transposition rule for non-square textures.
-# True = physical layout stores axes transposed (unswizzle at HxW, then rotate 90°).
-# False = physical layout preserves metadata axes (unswizzle at WxH, no swap needed).
+# Axis handling for non-square textures.
 _PS5_AXIS_TRANSPOSE: dict[int, bool] = {
     1: True,   # Alpha8: always transposed
-    2: False,  # conservative – most are linear anyway
-    3: False,  # conservative – most are linear anyway
+    2: False,
+    3: False,
     4: False,  # RGBA32: never transposed
 }
 
@@ -198,6 +198,19 @@ def _ps5_get_micro_tile_bits(bytes_per_element: int = 1) -> tuple[int, int]:
         bytes_per_element,
         (_PS5_MICRO_X_BITS_DEFAULT, _PS5_MICRO_Y_BITS_DEFAULT),
     )
+
+
+def _emit_phase_callback(
+    phase_callback: Callable[[str, JsonDict], None] | None,
+    phase: str,
+    **payload: Any,
+) -> None:
+    if phase_callback is None:
+        return
+    try:
+        phase_callback(phase, cast(JsonDict, payload))
+    except Exception:
+        logger.debug("phase callback failed for %s", phase, exc_info=True)
 # KR: Unity-Runtime-Libraries reports/sdf_font 분석 기준 경계 버전입니다.
 # EN: Boundary versions derived from Unity-Runtime-Libraries reports/sdf_font.
 _TMP_OLD_ONLY_LAST = (2018, 3, 14)
@@ -293,6 +306,10 @@ _MATERIAL_PADDING_SCALE_KEYS = (
     "_GlowOffset",
     "_GlowInner",
     "_GlowOuter",
+)
+_MATERIAL_OUTLINE_RATIO_KEYS = (
+    "_OutlineWidth",
+    "_OutlineSoftness",
 )
 LOG_CONSOLE_FORMAT = "%(message)s"
 LOG_FILE_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -568,9 +585,9 @@ def _ps5_physical_grid_candidates_for_mode(
     """Return ordered physical-grid candidates for a given BC swizzle mode.
 
     Order:
-    1) Ghidra tile-table aligned candidate (when available),
-    2) generic divisor-based inference fallback,
-    3) raw logical grid fallback.
+    1) layout-aligned candidate,
+    2) divisor-based inference,
+    3) logical grid.
     """
     out: list[tuple[int, int]] = []
 
@@ -584,7 +601,7 @@ def _ps5_physical_grid_candidates_for_mode(
         if pair not in out:
             out.append(pair)
 
-    bits = _ps5_ghidra_mode_tile_bits(mode_name, bytes_per_block)
+    bits = _ps5_tile_bit_dimensions_for_mode(mode_name, bytes_per_block)
     if bits is not None:
         tile_w = 1 << bits[0]
         tile_h = 1 << bits[1]
@@ -755,31 +772,28 @@ def _ps5_parity(value: int) -> int:
     return value.bit_count() & 1
 
 
-def _ps5_ghidra_mode_tile_bits(mode_name: str, bytes_per_block: int) -> tuple[int, int] | None:
-    """Resolve thin-2D tile bit dimensions from Ghidra-derived tables."""
+def _ps5_tile_bit_dimensions_for_mode(
+    mode_name: str,
+    bytes_per_block: int,
+) -> tuple[int, int] | None:
+    """Resolve thin-2D tile bit dimensions from the layout tables."""
     if mode_name.endswith("_X"):
         # XOR swizzle variants require additional equation bits not reconstructed here.
         return None
     table: dict[int, tuple[int, int]] | None = None
     if mode_name.startswith("256B_"):
-        table = _PS5_GHIDRA_BLOCK256_2D_BITS
+        table = _PS5_LAYOUT_BLOCK256_2D_BITS
     elif mode_name.startswith("4KB_"):
-        table = _PS5_GHIDRA_BLOCK4K_2D_BITS
+        table = _PS5_LAYOUT_BLOCK4K_2D_BITS
     elif mode_name.startswith("64KB_"):
-        table = _PS5_GHIDRA_BLOCK64K_2D_BITS
+        table = _PS5_LAYOUT_BLOCK64K_2D_BITS
     if table is None:
         return None
     return table.get(int(bytes_per_block))
 
 
-def _ps5_ghidra_local_order(mode_name: str, bytes_per_block: int) -> str:
-    """Select tile-local bit order for fallback BC unswizzle.
-
-    Notes:
-    - 256B BC (e.g. DXT1 warning texture) matches simple y-then-x packing.
-    - 4KB BC16 benefits from y/x interleaving.
-    - 4KB BC8 benefits from one low X bit followed by y/x interleaving.
-    """
+def _ps5_tile_bit_order_for_mode(mode_name: str, bytes_per_block: int) -> str:
+    """Select tile-local bit order for the BC layout fallback."""
     if mode_name.startswith("4KB_") or mode_name.startswith("64KB_"):
         if int(bytes_per_block) >= 16:
             return "yxyx"
@@ -824,44 +838,44 @@ def _ps5_local_swizzle_index(
     return local_y + (local_x << y_bits)
 
 
-def _ps5_mode5_scalar_helper_3c0890(value: int) -> int:
-    """Scalar helper at 0x003c0890 (mode=5, bpb=1 path)."""
+def _ps5_4kb_s_scalar_mix_bytes1(value: int) -> int:
+    """Scalar mix helper for the 4KB_S path with 1-byte blocks."""
     v = int(value)
     return ((v << 4) & 0x1F0) ^ ((v << 5) & 0x400)
 
 
-def _ps5_mode5_scalar_helper_3c08f0(value: int) -> int:
-    """Scalar helper at 0x003c08f0 (mode=5, bpb=2/4 paths)."""
+def _ps5_4kb_s_scalar_mix_bytes2_4(value: int) -> int:
+    """Scalar mix helper for the 4KB_S path with 2- or 4-byte blocks."""
     v = int(value)
     return ((v << 4) & 0x70) ^ ((v << 5) & 0x100) ^ ((v << 6) & 0x400)
 
 
-def _ps5_mode5_scalar_helper_3c09d0(value: int) -> int:
-    """Scalar helper at 0x003c09d0 (mode=5 dispatch entries)."""
+def _ps5_4kb_s_scalar_mix_bytes8_16(value: int) -> int:
+    """Scalar mix helper for the 4KB_S path with 8- or 16-byte blocks."""
     v = int(value)
     return ((v << 4) & 0x30) ^ ((v << 6) & 0x100) ^ ((v << 7) & 0x400)
 
 
-def _ps5_mode5_vector_helper_3c08b0(value: int) -> int:
-    """Vector helper at 0x003c08b0 (mode=5, bpb=1 path)."""
+def _ps5_4kb_s_vector_mix_bytes1(value: int) -> int:
+    """Vector mix helper for the 4KB_S path with 1-byte blocks."""
     v = int(value)
     return (v & 0x0F) ^ ((v << 5) & 0x200) ^ ((v << 6) & 0x800)
 
 
-def _ps5_mode5_vector_helper_3c0910(value: int) -> int:
-    """Vector helper at 0x003c0910 (mode=5, bpb=2 path)."""
+def _ps5_4kb_s_vector_mix_bytes2(value: int) -> int:
+    """Vector mix helper for the 4KB_S path with 2-byte blocks."""
     v = int(value)
     return ((v << 1) & 0x0E) ^ ((v << 4) & 0x80) ^ ((v << 5) & 0x200) ^ ((v << 6) & 0x800)
 
 
-def _ps5_mode5_vector_helper_3c0970(value: int) -> int:
-    """Vector helper at 0x003c0970 (mode=5, bpb=4 path)."""
+def _ps5_4kb_s_vector_mix_bytes4(value: int) -> int:
+    """Vector mix helper for the 4KB_S path with 4-byte blocks."""
     v = int(value)
     return ((v << 2) & 0x0C) ^ ((v << 5) & 0x80) ^ ((v << 6) & 0x200) ^ ((v << 7) & 0x800)
 
 
-def _ps5_mode5_vector_helper_3c09f0(value: int) -> int:
-    """Vector helper at 0x003c09f0 (mode=5, bpb=8 path)."""
+def _ps5_4kb_s_vector_mix_bytes8(value: int) -> int:
+    """Vector mix helper for the 4KB_S path with 8-byte blocks."""
     v = int(value)
     return (
         ((v << 3) & 0x08)
@@ -871,55 +885,50 @@ def _ps5_mode5_vector_helper_3c09f0(value: int) -> int:
     )
 
 
-def _ps5_mode5_vector_helper_3c0a50(value: int) -> int:
-    """Vector helper at 0x003c0a50 (mode=5, bpb=16 path)."""
+def _ps5_4kb_s_vector_mix_bytes16(value: int) -> int:
+    """Vector mix helper for the 4KB_S path with 16-byte blocks."""
     v = int(value)
     return ((v << 6) & 0xC0) ^ ((v << 7) & 0x200) ^ ((v << 8) & 0x800)
 
 
-def _ps5_mode5_local_swizzle_index(
+def _ps5_4kb_s_tile_index(
     local_x: int,
     local_y: int,
     bytes_per_block: int,
 ) -> int | None:
-    """Tile-local index for mode=5 derived from Ghidra helper formulas."""
+    """Tile-local index for the 4KB_S path."""
     bpb = int(bytes_per_block)
     if bpb == 1:
-        base = _ps5_mode5_scalar_helper_3c0890(local_y)
-        mixed = base ^ _ps5_mode5_vector_helper_3c08b0(local_x)
+        base = _ps5_4kb_s_scalar_mix_bytes1(local_y)
+        mixed = base ^ _ps5_4kb_s_vector_mix_bytes1(local_x)
     elif bpb == 2:
-        base = _ps5_mode5_scalar_helper_3c08f0(local_y)
-        mixed = base ^ _ps5_mode5_vector_helper_3c0910(local_x)
+        base = _ps5_4kb_s_scalar_mix_bytes2_4(local_y)
+        mixed = base ^ _ps5_4kb_s_vector_mix_bytes2(local_x)
     elif bpb == 4:
-        base = _ps5_mode5_scalar_helper_3c08f0(local_y)
-        mixed = base ^ _ps5_mode5_vector_helper_3c0970(local_x)
+        base = _ps5_4kb_s_scalar_mix_bytes2_4(local_y)
+        mixed = base ^ _ps5_4kb_s_vector_mix_bytes4(local_x)
     elif bpb == 8:
-        base = _ps5_mode5_scalar_helper_3c09d0(local_y)
-        mixed = base ^ _ps5_mode5_vector_helper_3c09f0(local_x)
+        base = _ps5_4kb_s_scalar_mix_bytes8_16(local_y)
+        mixed = base ^ _ps5_4kb_s_vector_mix_bytes8(local_x)
     elif bpb == 16:
-        base = _ps5_mode5_scalar_helper_3c09d0(local_y)
-        mixed = base ^ _ps5_mode5_vector_helper_3c0a50(local_x)
+        base = _ps5_4kb_s_scalar_mix_bytes8_16(local_y)
+        mixed = base ^ _ps5_4kb_s_vector_mix_bytes16(local_x)
     else:
         return None
     return mixed >> int(math.log2(bpb))
 
 
-def _ps5_build_bc_lut_ghidra_fallback(
+def _ps5_build_bc_lut_from_layout_rules(
     block_w: int,
     block_h: int,
     bytes_per_block: int,
     mode_name: str,
     pipe_bank_xor: int,
 ) -> tuple[int, ...] | None:
-    """Build a BC LUT without external pattern header.
-
-    This fallback is grounded on FUN_003bbdd0 page-class tile dimensions
-    (DAT_01b37a20 / DAT_01b37920 / DAT_01b379a0) and uses deterministic
-    tile-local bit deposition for non-XOR swizzle variants.
-    """
+    """Build a BC LUT without the external pattern header."""
     if pipe_bank_xor != 0:
         return None
-    bits = _ps5_ghidra_mode_tile_bits(mode_name, bytes_per_block)
+    bits = _ps5_tile_bit_dimensions_for_mode(mode_name, bytes_per_block)
     if bits is None:
         return None
     x_bits, y_bits = bits
@@ -931,8 +940,8 @@ def _ps5_build_bc_lut_ghidra_fallback(
     if tile_w <= 0 or tile_h <= 0 or block_w <= 0 or block_h <= 0:
         return None
 
-    local_order = _ps5_ghidra_local_order(mode_name, bytes_per_block)
-    use_mode5_helper_formula = mode_name == "4KB_S"
+    local_order = _ps5_tile_bit_order_for_mode(mode_name, bytes_per_block)
+    use_4kb_s_helper_formula = mode_name == "4KB_S"
     macro_cols = (block_w + tile_w - 1) // tile_w
     tile_elements = tile_w * tile_h
     total = block_w * block_h
@@ -946,8 +955,8 @@ def _ps5_build_bc_lut_ghidra_fallback(
         for x in range(block_w):
             macro_x = x // tile_w
             local_x = x & (tile_w - 1)
-            if use_mode5_helper_formula:
-                local_off = _ps5_mode5_local_swizzle_index(
+            if use_4kb_s_helper_formula:
+                local_off = _ps5_4kb_s_tile_index(
                     local_x,
                     local_y,
                     bytes_per_block,
@@ -1027,7 +1036,7 @@ def _ps5_build_bc_lut_cached(
 ) -> tuple[int, ...] | None:
     tables = _ps5_load_bc_pattern_tables()
     if tables is None:
-        return _ps5_build_bc_lut_ghidra_fallback(
+        return _ps5_build_bc_lut_from_layout_rules(
             block_w,
             block_h,
             bytes_per_block,
@@ -1041,7 +1050,7 @@ def _ps5_build_bc_lut_cached(
     patinfo_rows = tables["patinfo_tables"].get(mode_name, [])
     pat_index = int(math.log2(bytes_per_block))
     if pat_index < 0 or pat_index >= len(patinfo_rows):
-        return _ps5_build_bc_lut_ghidra_fallback(
+        return _ps5_build_bc_lut_from_layout_rules(
             block_w,
             block_h,
             bytes_per_block,
@@ -1427,18 +1436,14 @@ def _ps5_unswizzle_bc_best_candidate(
     )
 
 
-def _ps5_try_mode4k_end_aligned_base_candidate(
+def _ps5_try_end_aligned_4kb_s_candidate(
     usable: bytes,
     logical_block_w: int,
     logical_block_h: int,
     bytes_per_block: int,
 ) -> tuple[bytes, str, tuple[int, int]] | None:
-    """Try 4KB_S candidate using end-anchored tile-aligned base window.
-
-    This path is for non-square mip layouts where the simple mip-tail model
-    can fall back to 256B mode in decompiler-derived reconstruction.
-    """
-    bits = _ps5_ghidra_mode_tile_bits("4KB_S", bytes_per_block)
+    """Try a 4KB_S candidate using an end-aligned base window."""
+    bits = _ps5_tile_bit_dimensions_for_mode("4KB_S", bytes_per_block)
     if bits is None:
         return None
     tile_w = 1 << bits[0]
@@ -1485,7 +1490,7 @@ def _ps5_try_mode4k_end_aligned_base_candidate(
     )
 
 
-def _ps5_unswizzle_bc_best_candidate_ghidra(
+def _ps5_unswizzle_bc_best_layout_match(
     raw: bytes,
     pixel_width: int,
     pixel_height: int,
@@ -1493,10 +1498,7 @@ def _ps5_unswizzle_bc_best_candidate_ghidra(
     *,
     mip_count: int | None = None,
 ) -> tuple[bytes, str | None, float | None, tuple[int, int], tuple[int, int]] | None:
-    """Deterministically choose the first valid BC variant in fixed order.
-
-    This path intentionally avoids image-quality heuristics (e.g. roughness).
-    """
+    """Choose the first valid BC layout variant in fixed order."""
     bc_info = _PS5_BC_FORMATS.get(texture_format)
     if bc_info is None:
         return None
@@ -1512,10 +1514,8 @@ def _ps5_unswizzle_bc_best_candidate_ghidra(
     source_window = usable
     mip0_offset_bytes = 0
     if mip_count is not None and int(mip_count) > 1:
-        # KR: FUN_003bbdd0는 level offset을 높은 mip -> 낮은 mip 순으로 누적 저장합니다.
-        # KR: 따라서 mip0는 "lower mip tail" 뒤쪽 오프셋에서 시작할 수 있습니다.
-        # EN: FUN_003bbdd0 accumulates level offsets from highest mip down.
-        # EN: mip0 can therefore begin after a lower-mip tail region.
+        # KR: 높은 mip부터 offset이 누적되므로 mip0가 tail 뒤에서 시작할 수 있습니다.
+        # EN: Offsets accumulate from higher mips, so mip0 can start after the tail.
         lower_tail_sum = 0
         w = max(1, int(pixel_width))
         h = max(1, int(pixel_height))
@@ -1528,18 +1528,16 @@ def _ps5_unswizzle_bc_best_candidate_ghidra(
             w = max(1, w >> 1)
             h = max(1, h >> 1)
         if len(levels) > 1:
-            # KR: Ghidra 경로에서 확인된 tail packing 단위(관측치): mip별 256B 정렬, tail 2KB 정렬.
-            # EN: Ghidra-grounded packing observed in this title: per-mip 256B align, tail 2KB align.
+            # KR: tail packing은 mip별 256B, tail 2KB 정렬을 사용합니다.
+            # EN: Tail packing uses per-mip 256B alignment and 2KB tail alignment.
             for level_bytes in levels[1:]:
                 lower_tail_sum += _ps5_align_up(level_bytes, 0x100)
             mip0_offset_bytes = _ps5_align_up(lower_tail_sum, 0x800)
             base_alloc = _ps5_align_up(levels[0], 0x800)
             modeled_total = mip0_offset_bytes + base_alloc
             if modeled_total < len(usable):
-                # KR: 비정방/특수 분기(local_a0 경로)에서 lower-tail 모델이 과소추정될 수 있습니다.
-                # KR: FUN_003bbdd0의 tail-first 배치 성질을 보존하면서 stream 끝 기준으로 mip0를 재고정합니다.
-                # EN: Non-square/special branches (local_a0 path) can exceed the simple lower-tail model.
-                # EN: Keep tail-first layout and re-anchor mip0 against stream end.
+                # KR: 비정방 케이스에서는 stream 끝 기준으로 mip0를 다시 맞춥니다.
+                # EN: Re-anchor mip0 against the end of the stream for some non-square cases.
                 mip0_offset_bytes += len(usable) - modeled_total
             if mip0_offset_bytes + base_alloc <= len(usable):
                 base_end = mip0_offset_bytes + base_alloc
@@ -1558,7 +1556,7 @@ def _ps5_unswizzle_bc_best_candidate_ghidra(
     physical_total_blocks = len(source_window) // bytes_per_block
     align = 16 if bytes_per_block >= 16 else 8
 
-    # Ghidra-verified BC path lands on mode=5 (4KB_S) first.
+    # Try 4KB_S first.
     mode_order: list[str] = ["4KB_S"]
     for mode_name in _PS5_BC_FAST_MODE_NAMES:
         if mode_name not in mode_order:
@@ -1619,11 +1617,9 @@ def _ps5_unswizzle_bc_best_candidate_ghidra(
                         and int(mip_count) > 1
                         and mode_name.startswith("256B_")
                     ):
-                        # KR: 비정방 일부에서 FUN_003bbdd0 local_a0 분기 영향으로
-                        # KR: 4KB_S tile-aligned base-at-end 레이아웃이 맞는 케이스가 존재합니다.
-                        # EN: Some non-square cases follow a 4KB_S tile-aligned
-                        # EN: base-at-end layout in FUN_003bbdd0 local_a0 branch.
-                        alt = _ps5_try_mode4k_end_aligned_base_candidate(
+                        # KR: 일부 비정방 케이스는 end-aligned 4KB_S 레이아웃으로 다시 확인합니다.
+                        # EN: Re-check some non-square cases with an end-aligned 4KB_S layout.
+                        alt = _ps5_try_end_aligned_4kb_s_candidate(
                             usable,
                             logical_block_w,
                             logical_block_h,
@@ -1812,6 +1808,70 @@ def parse_target_files_arg(target_file_args: list[str] | None) -> set[str]:
     return selected_files
 
 
+def parse_exclude_exts_arg(exclude_ext_args: list[str] | None) -> set[str]:
+    """KR: --exclude-ext 인자(반복/콤마 구분)를 확장자 집합으로 정규화합니다.
+    EN: Normalize --exclude-ext args (repeatable/comma-separated) into extension set.
+    """
+    normalized_exts: set[str] = set()
+    if not exclude_ext_args:
+        return normalized_exts
+    for entry in exclude_ext_args:
+        for token in str(entry).split(","):
+            raw = token.strip().lower()
+            if not raw:
+                continue
+            if raw.startswith("*"):
+                raw = raw.lstrip("*")
+            if not raw:
+                continue
+            if not raw.startswith("."):
+                raw = f".{raw}"
+            normalized_exts.add(raw)
+    return normalized_exts
+
+
+_PRIMARY_MODE_ARGS: tuple[tuple[str, str], ...] = (
+    ("parse", "--parse"),
+    ("mulmaru", "--mulmaru"),
+    ("nanumgothic", "--nanumgothic"),
+    ("list", "--list"),
+    ("preview_export", "--preview-export"),
+)
+
+
+def _selected_primary_modes(args: Any) -> list[str]:
+    selected: list[str] = []
+    for attr_name, cli_name in _PRIMARY_MODE_ARGS:
+        value = getattr(args, attr_name, None)
+        if isinstance(value, str):
+            if value.strip():
+                selected.append(cli_name)
+        elif value:
+            selected.append(cli_name)
+    return selected
+
+
+def _mode_uses_scan_jobs(mode: str | None) -> bool:
+    return mode in {"parse", "mulmaru", "nanumgothic", "preview_export"}
+
+
+def _should_pause_before_exit(*, interactive_session: bool = False) -> bool:
+    return bool(interactive_session or getattr(sys, "frozen", False))
+
+
+def _pause_before_exit(
+    lang: Language = "ko",
+    *,
+    interactive_session: bool = False,
+) -> None:
+    if not _should_pause_before_exit(interactive_session=interactive_session):
+        return
+    if lang == "ko":
+        input("\n엔터를 눌러 종료...")
+    else:
+        input("\nPress Enter to exit...")
+
+
 def strip_wrapping_quotes_repeated(value: str) -> str:
     """KR: 앞뒤 따옴표(' 또는 ")를 반복 제거합니다.
     EN: Repeatedly strip wrapping quotes (' or ") from both ends.
@@ -1855,6 +1915,46 @@ def resolve_output_only_path(source_file: str, data_path: str, output_root: str)
     if rel_path.startswith("..") or os.path.isabs(rel_path):
         rel_path = os.path.basename(source_abs)
     return os.path.join(output_abs, rel_path)
+
+
+def prepare_output_only_dependencies(
+    data_path: str,
+    output_root: str,
+    lang: Language = "ko",
+) -> None:
+    """KR: output-only 모드에서 핵심 의존 파일을 출력 루트에 미리 복사합니다.
+    EN: Pre-stage core dependency files into output root for output-only mode.
+    """
+    candidate_rel_paths = [
+        "globalgamemanagers",
+        "globalgamemanagers.assets",
+        "data.unity3d",
+        os.path.join("Resources", "unity default resources"),
+        os.path.join("Resources", "unity_builtin_extra"),
+    ]
+    copied: list[str] = []
+    for rel_path in candidate_rel_paths:
+        source_path = os.path.join(data_path, rel_path)
+        if not os.path.isfile(source_path):
+            continue
+        output_path = os.path.join(output_root, rel_path)
+        if os.path.exists(output_path):
+            continue
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+        shutil.copy2(source_path, output_path)
+        copied.append(rel_path)
+
+    if copied:
+        if lang == "ko":
+            _log_console(
+                f"출력 전용 의존 파일 준비: {len(copied)}개 ({', '.join(copied)})"
+            )
+        else:
+            _log_console(
+                f"Prepared output-only dependencies: {len(copied)} ({', '.join(copied)})"
+            )
 
 
 def register_temp_dir_for_cleanup(path: str) -> str:
@@ -2092,7 +2192,7 @@ def _load_target_unswizzled_preview_image(
                     best = None
                     if swizzle_verdict != "likely_linear_input":
                         mip_count = int(getattr(texture, "m_MipCount", 1) or 1)
-                        best = _ps5_unswizzle_bc_best_candidate_ghidra(
+                        best = _ps5_unswizzle_bc_best_layout_match(
                             raw_data,
                             width,
                             height,
@@ -2342,6 +2442,232 @@ def _save_glyph_crop_previews(
             _log_console(f"  Warning: failed to save glyph previews ({preview_error})")
 
 
+def _prepare_texture_replacement_for_target(
+    texture_plan: JsonDict,
+    *,
+    assets_file_name: str,
+    target_assets_name: str,
+    target_path_id: int,
+    texture_object_lookup: dict[tuple[str, int], Any],
+    texture_swizzle_state_cache: dict[str, tuple[str | None, str | None]],
+    ps5_swizzle: bool,
+    preview_export: bool,
+    preview_root: str | None,
+    lang: Language,
+) -> JsonDict | None:
+    source_atlas = _load_spilled_plan_image(
+        texture_plan,
+        image_key="source_atlas",
+        path_key="source_atlas_path",
+    )
+    if not isinstance(source_atlas, Image.Image):
+        return None
+
+    alpha8_linear_source = _load_spilled_plan_image(
+        texture_plan,
+        image_key="alpha8_linear_source",
+        path_key="alpha8_linear_source_path",
+    )
+    atlas_linear_for_alpha8 = (
+        alpha8_linear_source
+        if isinstance(alpha8_linear_source, Image.Image)
+        else source_atlas
+    )
+    source_swizzled = parse_bool_flag(texture_plan.get("source_swizzled"))
+    replacement_swizzle_hint = parse_bool_flag(
+        texture_plan.get("replacement_swizzle_hint")
+    )
+    replacement_process_swizzle = parse_bool_flag(
+        texture_plan.get("replacement_process_swizzle")
+    )
+    asset_process_swizzle = parse_bool_flag(texture_plan.get("asset_process_swizzle"))
+    font_name = str(
+        texture_plan.get("font_name")
+        or texture_plan.get("replacement_font")
+        or f"Texture_{target_path_id}"
+    )
+    try:
+        atlas_metadata_width = int(
+            texture_plan.get("metadata_width", source_atlas.width) or source_atlas.width
+        )
+    except Exception:
+        atlas_metadata_width = int(source_atlas.width)
+    try:
+        atlas_metadata_height = int(
+            texture_plan.get("metadata_height", source_atlas.height)
+            or source_atlas.height
+        )
+    except Exception:
+        atlas_metadata_height = int(source_atlas.height)
+
+    target_swizzle_verdict: str | None = None
+    target_swizzle_source: str | None = None
+    target_is_swizzled: bool | None = None
+    desired_swizzle_state = source_swizzled
+
+    if ps5_swizzle:
+        target_swizzle_verdict, target_swizzle_source = _detect_target_texture_swizzle(
+            texture_object_lookup,
+            texture_swizzle_state_cache,
+            target_assets_name,
+            int(target_path_id),
+        )
+        if target_swizzle_verdict == "likely_swizzled_input":
+            target_is_swizzled = True
+        elif target_swizzle_verdict == "likely_linear_input":
+            target_is_swizzled = False
+        elif replacement_swizzle_hint:
+            target_is_swizzled = True
+
+        if target_is_swizzled is not None:
+            desired_swizzle_state = target_is_swizzled
+
+    if replacement_process_swizzle or asset_process_swizzle:
+        desired_swizzle_state = True
+
+    if ps5_swizzle:
+        if target_swizzle_verdict == "likely_swizzled_input":
+            reason = (
+                f" (근거: {target_swizzle_source})"
+                if lang == "ko" and target_swizzle_source
+                else (
+                    f" (source: {target_swizzle_source})"
+                    if target_swizzle_source
+                    else ""
+                )
+            )
+            if lang == "ko":
+                _log_console(
+                    f"  PS5 swizzle 감지: 대상 Atlas가 swizzled 상태로 판별되었습니다.{reason}"
+                )
+            else:
+                _log_console(
+                    f"  PS5 swizzle detect: target atlas is likely swizzled.{reason}"
+                )
+        elif target_swizzle_verdict == "likely_linear_input":
+            reason = (
+                f" (근거: {target_swizzle_source})"
+                if lang == "ko" and target_swizzle_source
+                else (
+                    f" (source: {target_swizzle_source})"
+                    if target_swizzle_source
+                    else ""
+                )
+            )
+            if lang == "ko":
+                _log_console(
+                    f"  PS5 swizzle 감지: 대상 Atlas가 선형(linear) 상태로 판별되었습니다.{reason}"
+                )
+            else:
+                _log_console(
+                    f"  PS5 swizzle detect: target atlas is likely linear.{reason}"
+                )
+        elif replacement_swizzle_hint:
+            if lang == "ko":
+                _log_console(
+                    "  PS5 swizzle 힌트: JSON swizzle=yes 값을 기준으로 swizzle 적용합니다."
+                )
+            else:
+                _log_console(
+                    "  PS5 swizzle hint: applying swizzle based on JSON swizzle=yes."
+                )
+        elif lang == "ko":
+            _log_console(
+                "  PS5 swizzle 감지: inconclusive, 교체 Atlas 원본 상태를 유지합니다."
+            )
+        else:
+            _log_console(
+                "  PS5 swizzle detect: inconclusive, keeping replacement atlas state."
+            )
+    elif replacement_process_swizzle:
+        if lang == "ko":
+            _log_console(
+                "  process_swizzle=True: 교체 Atlas를 swizzle 상태로 변환합니다."
+            )
+        else:
+            _log_console(
+                "  process_swizzle=True: converting replacement atlas to swizzled state."
+            )
+
+    _log_debug(
+        f"[replace_texture_plan] file={assets_file_name} assets={target_assets_name} "
+        f"path_id={target_path_id} source_swizzled={source_swizzled} "
+        f"target_swizzle_verdict={target_swizzle_verdict} "
+        f"target_swizzle_source={target_swizzle_source} "
+        f"desired_swizzle={desired_swizzle_state}"
+    )
+
+    atlas_for_write = source_atlas
+    if desired_swizzle_state != source_swizzled:
+        try:
+            if desired_swizzle_state:
+                atlas_for_write = apply_ps5_swizzle_to_image(source_atlas)
+            else:
+                atlas_for_write = apply_ps5_unswizzle_to_image(source_atlas)
+        except Exception as swizzle_error:
+            atlas_for_write = source_atlas
+            if lang == "ko":
+                _log_console(
+                    f"  경고: PS5 swizzle 변환 실패, 원본 Atlas를 사용합니다. ({swizzle_error})"
+                )
+            else:
+                _log_console(
+                    f"  Warning: PS5 swizzle transform failed; using original atlas. ({swizzle_error})"
+                )
+
+    if preview_export:
+        preview_image = atlas_for_write
+        if ps5_swizzle and desired_swizzle_state:
+            try:
+                preview_image = apply_ps5_unswizzle_to_image(atlas_for_write)
+            except Exception as preview_unswizzle_error:
+                preview_image = atlas_for_write
+                if lang == "ko":
+                    _log_console(
+                        "  경고: preview unswizzle 실패, 저장 상태 Atlas 그대로 미리보기를 저장합니다. "
+                        f"({preview_unswizzle_error})"
+                    )
+                else:
+                    _log_console(
+                        "  Warning: preview unswizzle failed; saving preview from stored atlas state. "
+                        f"({preview_unswizzle_error})"
+                    )
+        _save_swizzle_preview(
+            preview_image,
+            preview_enabled=preview_export,
+            preview_root=preview_root,
+            assets_file_name=assets_file_name,
+            assets_name=target_assets_name,
+            atlas_path_id=int(target_path_id),
+            font_name=font_name,
+            target_swizzled=bool(desired_swizzle_state),
+            lang=lang,
+        )
+        preview_sdf_data = texture_plan.get("preview_sdf_data")
+        if isinstance(preview_sdf_data, dict):
+            _save_glyph_crop_previews(
+                preview_image,
+                preview_enabled=preview_export,
+                preview_root=preview_root,
+                assets_file_name=assets_file_name,
+                assets_name=target_assets_name,
+                atlas_path_id=int(target_path_id),
+                font_name=font_name,
+                sdf_data=preview_sdf_data,
+                lang=lang,
+            )
+
+    return {
+        "replacement_image": atlas_for_write,
+        "target_swizzled_state": target_is_swizzled,
+        "replacement_linear_source": atlas_linear_for_alpha8,
+        "metadata_size": (
+            int(atlas_metadata_width),
+            int(atlas_metadata_height),
+        ),
+    }
+
+
 def _image_to_alpha8_bytes(image: Image.Image) -> tuple[bytes, int, int]:
     """KR: Pillow 이미지를 Alpha8 raw bytes로 변환합니다.
     EN: Convert Pillow image into Alpha8 raw bytes.
@@ -2353,6 +2679,27 @@ def _image_to_alpha8_bytes(image: Image.Image) -> tuple[bytes, int, int]:
     else:
         alpha = image.convert("L")
     return alpha.tobytes(), alpha.width, alpha.height
+
+
+def _encode_alpha8_replacement_bytes(
+    alpha_source: Image.Image,
+    *,
+    ps5_swizzle: bool,
+    target_swizzled_state: bool | None,
+) -> tuple[bytes, int, int, str]:
+    if ps5_swizzle and target_swizzled_state is True:
+        alpha_linear, aw, ah = _image_to_alpha8_bytes(alpha_source)
+        alpha_linear_img = Image.frombytes("L", (int(aw), int(ah)), alpha_linear)
+        alpha_swizzled_img = apply_ps5_swizzle_to_image(alpha_linear_img)
+        alpha_raw, aw, ah = _image_to_alpha8_bytes(alpha_swizzled_img)
+        return alpha_raw, aw, ah, "swizzled"
+
+    if (not ps5_swizzle) or target_swizzled_state is False:
+        alpha_raw, aw, ah = _image_to_alpha8_bytes(ImageOps.flip(alpha_source))
+        return alpha_raw, aw, ah, "linear_flipped"
+
+    alpha_raw, aw, ah = _image_to_alpha8_bytes(alpha_source)
+    return alpha_raw, aw, ah, "direct"
 
 
 @lru_cache(maxsize=128)
@@ -2423,16 +2770,16 @@ def _texture_format_enum_name(texture_format: int) -> str:
     return f"TextureFormat_{value}"
 
 
-def _texture_format_ghidra_meta(texture_format: int) -> dict[str, Any] | None:
+def _texture_format_layout_details(texture_format: int) -> dict[str, Any] | None:
     value = int(texture_format)
-    meta = _PS5_GHIDRA_FORMAT_META.get(value)
+    meta = _PS5_LAYOUT_FORMAT_META.get(value)
     if meta is None:
         return None
     block_pack = int(meta["block_pack"])
     bytes_per_block, block_w, block_h, depth = _ps5_unpack_block_pack(block_pack)
-    flags_word = _PS5_GHIDRA_FORMAT_FLAGS.get(value)
-    ivar15 = ((flags_word & 0x6) * 2 + 8) if flags_word is not None else None
-    mode5_triplet = _PS5_GHIDRA_MODE5_TRIPLETS_BY_BPB.get(bytes_per_block)
+    flags_word = _PS5_LAYOUT_FORMAT_FLAGS.get(value)
+    layout_shift = ((flags_word & 0x6) * 2 + 8) if flags_word is not None else None
+    mode_4kb_s_triplet = _PS5_4KB_S_TRIPLETS_BY_BLOCK_BYTES.get(bytes_per_block)
     return {
         "label": str(meta["label"]),
         "word0": int(meta["word0"]),
@@ -2443,8 +2790,10 @@ def _texture_format_ghidra_meta(texture_format: int) -> dict[str, Any] | None:
         "block_depth": depth,
         "decoder": _PS5_BC_DECODER_BY_FORMAT.get(value),
         "flags_word": int(flags_word) if flags_word is not None else None,
-        "ivar15_shift": int(ivar15) if ivar15 is not None else None,
-        "mode5_triplet": list(mode5_triplet) if mode5_triplet is not None else None,
+        "layout_shift": int(layout_shift) if layout_shift is not None else None,
+        "mode_4kb_s_triplet": list(mode_4kb_s_triplet)
+        if mode_4kb_s_triplet is not None
+        else None,
     }
 
 
@@ -3202,6 +3551,25 @@ def _log_scan_result_details(
         )
 
 
+def _is_scan_retry_candidate(
+    scanned: dict[str, list[JsonDict]],
+    worker_error: str | None,
+) -> bool:
+    """KR: 최종 순차 재시도 대상(실패/빈 결과)을 판정합니다.
+    EN: Decide whether this scan result should be retried sequentially at the end.
+    """
+    if not isinstance(worker_error, str) or not worker_error.strip():
+        return False
+    if list(scanned.get("ttf", [])) or list(scanned.get("sdf", [])):
+        return False
+    lowered = worker_error.lower()
+    if "scan worker" not in lowered:
+        return False
+    if "failed" in lowered or "실패" in worker_error or "exit=" in lowered:
+        return True
+    return False
+
+
 def _log_replacement_plan_details(
     file_name: str,
     replacement_mapping: dict[str, JsonDict],
@@ -3425,6 +3793,66 @@ def _normalize_assets_basename(value: Any) -> str | None:
     return name or None
 
 
+def _normalize_asset_lookup_path(value: Any) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+    normalized = text.replace("\\", "/")
+    lowered = normalized.lower()
+    for prefix in ("archive://", "archive:/", "file://"):
+        if lowered.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            lowered = normalized.lower()
+            break
+    while normalized.startswith("/"):
+        normalized = normalized[1:]
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    normalized = re.sub(r"/{2,}", "/", normalized).strip()
+    return normalized.lower() if normalized else None
+
+
+def _normalize_asset_file_key(path: Any) -> str | None:
+    text = str(path).strip() if path is not None else ""
+    if not text:
+        return None
+    return os.path.normcase(os.path.abspath(text))
+
+
+def _build_asset_file_index(
+    all_assets_files: list[str],
+    data_path: str,
+) -> dict[str, Any]:
+    data_root = os.path.abspath(data_path)
+    path_by_key: dict[str, str] = {}
+    relpath_to_keys: dict[str, list[str]] = {}
+    basename_to_keys: dict[str, list[str]] = {}
+    relpath_by_key: dict[str, str] = {}
+    basename_by_key: dict[str, str] = {}
+
+    for candidate_path in sorted(all_assets_files):
+        key = _normalize_asset_file_key(candidate_path)
+        if not key:
+            continue
+        abs_path = os.path.abspath(candidate_path)
+        rel_path = os.path.relpath(abs_path, data_root).replace("\\", "/").lower()
+        basename = os.path.basename(abs_path).lower()
+        path_by_key[key] = abs_path
+        relpath_by_key[key] = rel_path
+        basename_by_key[key] = basename
+        relpath_to_keys.setdefault(rel_path, []).append(key)
+        basename_to_keys.setdefault(basename, []).append(key)
+
+    return {
+        "data_root": data_root,
+        "path_by_key": path_by_key,
+        "relpath_to_keys": relpath_to_keys,
+        "basename_to_keys": basename_to_keys,
+        "relpath_by_key": relpath_by_key,
+        "basename_by_key": basename_by_key,
+    }
+
+
 def _extract_external_assets_name(external_ref: Any) -> str | None:
     if external_ref is None:
         return None
@@ -3459,6 +3887,75 @@ def _extract_external_assets_name(external_ref: Any) -> str | None:
     return None
 
 
+def _extract_external_assets_candidates(external_ref: Any) -> list[str]:
+    if external_ref is None:
+        return []
+
+    raw_candidates: list[Any] = []
+    if isinstance(external_ref, dict):
+        raw_candidates.extend(
+            [
+                external_ref.get("path"),
+                external_ref.get("pathName"),
+                external_ref.get("name"),
+                external_ref.get("fileName"),
+                external_ref.get("asset_name"),
+                external_ref.get("assetPath"),
+            ]
+        )
+    else:
+        for attr in (
+            "path",
+            "pathName",
+            "name",
+            "fileName",
+            "asset_name",
+            "assetPath",
+        ):
+            raw_candidates.append(getattr(external_ref, attr, None))
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for candidate in raw_candidates:
+        normalized_path = _normalize_asset_lookup_path(candidate)
+        if normalized_path and normalized_path not in seen:
+            seen.add(normalized_path)
+            resolved.append(normalized_path)
+        normalized_name = _normalize_assets_basename(candidate)
+        if normalized_name:
+            lowered_name = normalized_name.lower()
+            if lowered_name not in seen:
+                seen.add(lowered_name)
+                resolved.append(lowered_name)
+    return resolved
+
+
+def _resolve_external_ref(source_assets_file: Any, file_id: int) -> Any:
+    try:
+        resolved_file_id = int(file_id or 0)
+    except Exception:
+        resolved_file_id = 0
+
+    if resolved_file_id == 0:
+        return None
+
+    externals = getattr(source_assets_file, "externals", None)
+    if externals is None:
+        externals = getattr(source_assets_file, "m_Externals", None)
+
+    if isinstance(externals, dict):
+        external_ref = externals.get(resolved_file_id)
+        if external_ref is None:
+            external_ref = externals.get(resolved_file_id - 1)
+        return external_ref
+
+    if isinstance(externals, (list, tuple)):
+        ext_index = resolved_file_id - 1
+        if 0 <= ext_index < len(externals):
+            return externals[ext_index]
+    return None
+
+
 def _resolve_assets_name_from_file_id(source_assets_file: Any, file_id: int) -> str | None:
     try:
         resolved_file_id = int(file_id or 0)
@@ -3472,19 +3969,345 @@ def _resolve_assets_name_from_file_id(source_assets_file: Any, file_id: int) -> 
     if externals is None:
         externals = getattr(source_assets_file, "m_Externals", None)
 
-    external_ref: Any = None
-    if isinstance(externals, dict):
-        external_ref = externals.get(resolved_file_id)
-        if external_ref is None:
-            external_ref = externals.get(resolved_file_id - 1)
-    elif isinstance(externals, (list, tuple)):
-        ext_index = resolved_file_id - 1
-        if 0 <= ext_index < len(externals):
-            external_ref = externals[ext_index]
-    else:
+    external_ref = _resolve_external_ref(source_assets_file, resolved_file_id)
+    if externals is None:
         return None
-
     return _extract_external_assets_name(external_ref)
+
+
+def _resolve_target_assets_name(
+    source_assets_file: Any,
+    current_assets_name: str,
+    file_id: int,
+) -> str | None:
+    try:
+        resolved_file_id = int(file_id or 0)
+    except Exception:
+        resolved_file_id = 0
+    if resolved_file_id == 0:
+        return str(current_assets_name)
+    return _resolve_assets_name_from_file_id(source_assets_file, resolved_file_id)
+
+
+def _collect_asset_file_index_matches(
+    asset_file_index: dict[str, Any] | None,
+    reference: Any,
+) -> list[str]:
+    if not isinstance(asset_file_index, dict):
+        return []
+
+    normalized_reference = _normalize_asset_lookup_path(reference)
+    if not normalized_reference:
+        normalized_reference = _normalize_assets_basename(reference)
+        if normalized_reference:
+            normalized_reference = normalized_reference.lower()
+    if not normalized_reference:
+        return []
+
+    relpath_to_keys = cast(
+        dict[str, list[str]],
+        asset_file_index.get("relpath_to_keys", {}),
+    )
+    basename_to_keys = cast(
+        dict[str, list[str]],
+        asset_file_index.get("basename_to_keys", {}),
+    )
+    relpath_by_key = cast(dict[str, str], asset_file_index.get("relpath_by_key", {}))
+
+    matches: list[str] = []
+    seen: set[str] = set()
+
+    def _append_match(match_key: str) -> None:
+        if match_key and match_key not in seen:
+            seen.add(match_key)
+            matches.append(match_key)
+
+    for match_key in relpath_to_keys.get(normalized_reference, []):
+        _append_match(match_key)
+
+    if not matches and "/" in normalized_reference:
+        suffix = "/" + normalized_reference
+        for match_key, rel_path in relpath_by_key.items():
+            if rel_path == normalized_reference or rel_path.endswith(suffix):
+                _append_match(match_key)
+
+    basename = os.path.basename(normalized_reference)
+    for match_key in basename_to_keys.get(basename, []):
+        _append_match(match_key)
+
+    return matches
+
+
+def _choose_asset_file_match(
+    asset_file_index: dict[str, Any] | None,
+    matches: list[str],
+    *,
+    current_file_key: str | None,
+    reference_desc: str,
+) -> str | None:
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    if current_file_key and isinstance(asset_file_index, dict):
+        path_by_key = cast(dict[str, str], asset_file_index.get("path_by_key", {}))
+        current_path = path_by_key.get(current_file_key)
+        if current_path:
+            current_dir = os.path.dirname(current_path)
+            sibling_matches = [
+                match_key
+                for match_key in matches
+                if os.path.dirname(path_by_key.get(match_key, "")) == current_dir
+            ]
+            if len(sibling_matches) == 1:
+                return sibling_matches[0]
+    chosen = sorted(matches)[0]
+    _log_warning(
+        f"[asset_path_ambiguous] reference={reference_desc} match_count={len(matches)} "
+        f"using_first={chosen}"
+    )
+    return chosen
+
+
+def _resolve_target_outer_file_key(
+    current_file_key: str,
+    source_assets_file: Any,
+    file_id: int,
+    target_assets_name: str | None,
+    *,
+    source_bundle_signature: str | None,
+    asset_file_index: dict[str, Any] | None,
+) -> str | None:
+    if source_bundle_signature in BUNDLE_SIGNATURES:
+        return str(current_file_key)
+    try:
+        resolved_file_id = int(file_id or 0)
+    except Exception:
+        resolved_file_id = 0
+    if resolved_file_id == 0:
+        return str(current_file_key)
+
+    external_ref = _resolve_external_ref(source_assets_file, resolved_file_id)
+    candidates = _extract_external_assets_candidates(external_ref)
+    if target_assets_name:
+        normalized_assets_name = _normalize_assets_basename(target_assets_name)
+        if normalized_assets_name:
+            candidates.append(normalized_assets_name.lower())
+
+    for candidate in candidates:
+        matches = _collect_asset_file_index_matches(asset_file_index, candidate)
+        chosen = _choose_asset_file_match(
+            asset_file_index,
+            matches,
+            current_file_key=current_file_key,
+            reference_desc=str(candidate),
+        )
+        if chosen:
+            return chosen
+    return None
+
+
+def _make_assets_object_key(assets_name: str, path_id: int) -> str:
+    return f"{str(assets_name)}|{int(path_id)}"
+
+
+def _lookup_patch_value(mapping: dict[str, Any], key: str) -> Any | None:
+    if key in mapping:
+        return mapping[key]
+    lowered = key.lower()
+    if lowered in mapping:
+        return mapping[lowered]
+    return None
+
+
+def _store_patch_value(mapping: dict[str, Any], key: str, value: Any) -> None:
+    mapping[key] = value
+    lowered = key.lower()
+    if lowered != key:
+        mapping[lowered] = value
+
+
+def _copy_patch_bucket(
+    patch_map: dict[str, dict[str, Any]] | None,
+    file_key: str,
+) -> dict[str, Any]:
+    if not isinstance(patch_map, dict):
+        return {}
+    bucket = patch_map.get(str(file_key), {})
+    return dict(bucket) if isinstance(bucket, dict) else {}
+
+
+def _spill_image_to_temp_file(
+    image: Image.Image,
+    deferred_dir: str,
+    *,
+    prefix: str,
+) -> str:
+    os.makedirs(deferred_dir, exist_ok=True)
+    fd, spill_path = tempfile.mkstemp(
+        prefix=prefix,
+        suffix=".png",
+        dir=deferred_dir,
+    )
+    os.close(fd)
+    image.save(spill_path, format="PNG")
+    return spill_path
+
+
+def _spill_deferred_texture_plan_to_disk(
+    texture_plan: JsonDict,
+    deferred_dir: str,
+) -> JsonDict:
+    source_atlas = texture_plan.get("source_atlas")
+    if not isinstance(source_atlas, Image.Image):
+        return texture_plan
+
+    spilled_plan = dict(texture_plan)
+    atlas_path = str(spilled_plan.get("source_atlas_path", "")).strip()
+    if not atlas_path:
+        atlas_path = _spill_image_to_temp_file(
+            source_atlas,
+            deferred_dir,
+            prefix="atlas_",
+        )
+    spilled_plan.pop("source_atlas", None)
+    spilled_plan["source_atlas_path"] = atlas_path
+
+    alpha_image = spilled_plan.get("alpha8_linear_source")
+    if isinstance(alpha_image, Image.Image):
+        alpha_path = str(spilled_plan.get("alpha8_linear_source_path", "")).strip()
+        if not alpha_path:
+            if alpha_image is source_atlas:
+                alpha_path = atlas_path
+            else:
+                alpha_path = _spill_image_to_temp_file(
+                    alpha_image,
+                    deferred_dir,
+                    prefix="alpha8_",
+                )
+        spilled_plan.pop("alpha8_linear_source", None)
+        spilled_plan["alpha8_linear_source_path"] = alpha_path
+    return spilled_plan
+
+
+def _load_spilled_plan_image(
+    payload: JsonDict,
+    *,
+    image_key: str,
+    path_key: str,
+) -> Image.Image | None:
+    image = payload.get(image_key)
+    if isinstance(image, Image.Image):
+        return image
+    image_path = str(payload.get(path_key, "")).strip()
+    if not image_path or not os.path.exists(image_path):
+        return None
+    with Image.open(image_path) as loaded_image:
+        return loaded_image.copy()
+
+
+def _cleanup_deferred_patch_bucket(bucket: dict[str, Any] | None) -> None:
+    if not isinstance(bucket, dict):
+        return
+    seen_payloads: set[int] = set()
+    seen_paths: set[str] = set()
+    for payload in bucket.values():
+        if not isinstance(payload, dict):
+            continue
+        payload_id = id(payload)
+        if payload_id in seen_payloads:
+            continue
+        seen_payloads.add(payload_id)
+        for path_key in ("source_atlas_path", "alpha8_linear_source_path"):
+            candidate_path = str(payload.get(path_key, "")).strip()
+            if candidate_path:
+                seen_paths.add(candidate_path)
+
+    for candidate_path in sorted(seen_paths):
+        try:
+            if os.path.isfile(candidate_path):
+                os.remove(candidate_path)
+        except Exception:
+            pass
+
+
+def _register_deferred_patch(
+    patch_map: dict[str, dict[str, Any]] | None,
+    target_file_key: str | None,
+    object_key: str,
+    payload: Any,
+    *,
+    pending_files: set[str] | None,
+    patch_kind: str,
+) -> None:
+    normalized_file = _normalize_asset_file_key(target_file_key)
+    if not (isinstance(patch_map, dict) and normalized_file and object_key):
+        return
+    bucket = patch_map.setdefault(normalized_file, {})
+    existing = _lookup_patch_value(bucket, object_key)
+    existing_font = (
+        str(existing.get("replacement_font", ""))
+        if isinstance(existing, dict)
+        else ""
+    )
+    existing_source = (
+        str(existing.get("source_entry", ""))
+        if isinstance(existing, dict)
+        else ""
+    )
+    new_font = (
+        str(payload.get("replacement_font", ""))
+        if isinstance(payload, dict)
+        else ""
+    )
+    new_source = (
+        str(payload.get("source_entry", ""))
+        if isinstance(payload, dict)
+        else ""
+    )
+    if existing is not None and existing_font and new_font and (
+        existing_font != new_font or existing_source != new_source
+    ):
+        _log_warning(
+            f"[patch_plan_conflict] kind={patch_kind} file={normalized_file} "
+            f"key={object_key} existing={existing_font}@{existing_source} "
+            f"new={new_font}@{new_source}"
+        )
+    _store_patch_value(bucket, object_key, payload)
+    if isinstance(pending_files, set) and (
+        existing is None
+        or existing_font != new_font
+        or existing_source != new_source
+    ):
+        pending_files.add(normalized_file)
+
+
+def _unitypy_supports_streaming_save() -> bool:
+    try:
+        from UnityPy.files.BundleFile import BundleFile as _BundleFile
+        from UnityPy.files.SerializedFile import SerializedFile as _SerializedFile
+    except Exception:
+        return False
+    return callable(getattr(_BundleFile, "save_to", None)) and callable(
+        getattr(_SerializedFile, "save_to", None)
+    )
+
+
+def _ensure_custom_unitypy_streaming_save(lang: Language = "ko") -> None:
+    if _unitypy_supports_streaming_save():
+        return
+    unitypy_path = getattr(UnityPy, "__file__", "")
+    if lang == "ko":
+        raise RuntimeError(
+            "현재 UnityPy에는 메모리 절감용 save_to() 구현이 없습니다.\n"
+            "커스텀 UnityPy를 다시 설치해 주세요.\n"
+            f"현재 로드 경로: {unitypy_path}"
+        )
+    raise RuntimeError(
+        "The currently loaded UnityPy does not provide the memory-saving save_to() APIs.\n"
+        "Reinstall the custom UnityPy build.\n"
+        f"Loaded from: {unitypy_path}"
+    )
 
 
 def _has_real_atlas_path(ref: Any) -> bool:
@@ -3677,6 +4500,12 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
     color_overrides = (
         color_overrides_raw if isinstance(color_overrides_raw, dict) else {}
     )
+    try:
+        outline_ratio = float(mat_info.get("outline_ratio", 1.0))
+    except Exception:
+        outline_ratio = 1.0
+    if outline_ratio <= 0:
+        outline_ratio = 1.0
     prune_raster_material = bool(mat_info.get("prune_raster_material", False))
     preserve_gradient_floor = bool(mat_info.get("preserve_gradient_floor", False))
     gradient_scale = mat_info.get("gs")
@@ -3731,6 +4560,21 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                                 pass
                         float_props[i] = ("_GradientScale", candidate)
                         has_gradient_scale = True
+                        changed = True
+                elif prop_name in _MATERIAL_OUTLINE_RATIO_KEYS:
+                    candidate: float | None = None
+                    if prop_name in float_overrides:
+                        try:
+                            candidate = float(float_overrides[prop_name])
+                        except Exception:
+                            candidate = None
+                    elif outline_ratio != 1.0:
+                        try:
+                            candidate = float(entry[1])
+                        except Exception:
+                            candidate = None
+                    if candidate is not None:
+                        float_props[i] = (prop_name, float(candidate * outline_ratio))
                         changed = True
                 elif prop_name in float_overrides:
                     float_props[i] = (prop_name, float(float_overrides[prop_name]))
@@ -4193,11 +5037,14 @@ def find_assets_files(
     game_path: str,
     lang: Language = "ko",
     target_files: set[str] | None = None,
+    exclude_exts: set[str] | None = None,
 ) -> list[str]:
     """KR: 게임에서 처리 대상 에셋 파일 목록을 수집합니다.
     KR: target_files가 있으면 해당 파일명으로 스캔 대상을 제한합니다.
+    KR: exclude_exts가 있으면 해당 확장자를 추가 제외합니다.
     EN: Collect candidate asset files from the game.
     EN: If target_files is provided, limit candidates to those basenames.
+    EN: If exclude_exts is provided, skip files with those extensions.
     """
     data_path = get_data_path(game_path, lang=lang)
     assets_files: list[str] = []
@@ -4229,6 +5076,8 @@ def find_assets_files(
         ".info",
         ".config",
     }
+    if exclude_exts:
+        blacklist_exts.update({str(ext).lower() for ext in exclude_exts if ext})
 
     for root, _, files in os.walk(data_path):
         for fn in files:
@@ -4464,74 +5313,135 @@ def _scan_fonts_via_worker(
         -1073741819: "ACCESS_VIOLATION(0xC0000005)",
         3221225477: "ACCESS_VIOLATION(0xC0000005)",
     }
+    access_violation_codes = set(worker_exit_hints.keys())
+
+    def _run_worker(
+    ) -> tuple[dict[str, list[JsonDict]], str | None, str | None, int | None]:
+        try:
+            try:
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+            except Exception:
+                pass
+
+            if getattr(sys, "frozen", False):
+                cmd = [
+                    sys.executable,
+                    "--gamepath",
+                    game_path,
+                    "--_scan-file-worker",
+                    assets_file,
+                    "--_scan-file-worker-output",
+                    output_path,
+                ]
+            else:
+                cmd = [
+                    sys.executable,
+                    os.path.abspath(__file__),
+                    "--gamepath",
+                    game_path,
+                    "--_scan-file-worker",
+                    assets_file,
+                    "--_scan-file-worker-output",
+                    output_path,
+                ]
+            if detect_ps5_swizzle:
+                cmd.append("--ps5-swizzle")
+
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1800,
+            )
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()
+                hint = worker_exit_hints.get(int(proc.returncode))
+                hint_text = f" [{hint}]" if hint else ""
+                if lang == "ko":
+                    return (
+                        {"ttf": [], "sdf": []},
+                        None,
+                        f"scan worker 실패 (exit={proc.returncode}{hint_text}): {detail}",
+                        int(proc.returncode),
+                    )
+                return (
+                    {"ttf": [], "sdf": []},
+                    None,
+                    f"scan worker failed (exit={proc.returncode}{hint_text}): {detail}",
+                    int(proc.returncode),
+                )
+
+            if not os.path.exists(output_path):
+                if lang == "ko":
+                    return (
+                        {"ttf": [], "sdf": []},
+                        None,
+                        "scan worker 결과 파일이 없습니다.",
+                        None,
+                    )
+                return (
+                    {"ttf": [], "sdf": []},
+                    None,
+                    "scan worker output file is missing.",
+                    None,
+                )
+
+            with open(output_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            scanned = {
+                "ttf": list(payload.get("ttf", []))
+                if isinstance(payload, dict)
+                else [],
+                "sdf": list(payload.get("sdf", []))
+                if isinstance(payload, dict)
+                else [],
+            }
+            worker_error = None
+            if isinstance(payload, dict):
+                worker_error = payload.get("error")
+                if not isinstance(worker_error, str):
+                    worker_error = None
+            return scanned, worker_error, None, int(proc.returncode)
+        except Exception as e:
+            if lang == "ko":
+                return (
+                    {"ttf": [], "sdf": []},
+                    None,
+                    f"scan worker 실행 실패: {e!r}",
+                    None,
+                )
+            return (
+                {"ttf": [], "sdf": []},
+                None,
+                f"failed to run scan worker: {e!r}",
+                None,
+            )
+
     try:
-        if getattr(sys, "frozen", False):
-            cmd = [
-                sys.executable,
-                "--gamepath",
-                game_path,
-                "--_scan-file-worker",
-                assets_file,
-                "--_scan-file-worker-output",
-                output_path,
-            ]
-        else:
-            cmd = [
-                sys.executable,
-                os.path.abspath(__file__),
-                "--gamepath",
-                game_path,
-                "--_scan-file-worker",
-                assets_file,
-                "--_scan-file-worker-output",
-                output_path,
-            ]
-        if detect_ps5_swizzle:
-            cmd.append("--ps5-swizzle")
+        scanned, worker_error, full_error, full_returncode = _run_worker()
+        if full_error is None:
+            return scanned, worker_error
 
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=1800,
-        )
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()
-            hint = worker_exit_hints.get(int(proc.returncode))
-            hint_text = f" [{hint}]" if hint else ""
+        # KR: ACCESS_VIOLATION은 일시적인 경우가 있어 full 모드 1회 재시도합니다.
+        # EN: ACCESS_VIOLATION can be transient, so retry full mode once.
+        if full_returncode in access_violation_codes:
+            retry_scanned, retry_worker_error, retry_error, _ = _run_worker()
+            if retry_error is None:
+                if lang == "ko":
+                    recovered = "scan worker 재시도로 크래시를 복구했습니다."
+                else:
+                    recovered = "Recovered scan worker crash by retry."
+                if retry_worker_error:
+                    return retry_scanned, f"{recovered} {retry_worker_error}"
+                return retry_scanned, recovered
             if lang == "ko":
-                return {
-                    "ttf": [],
-                    "sdf": [],
-                }, f"scan worker 실패 (exit={proc.returncode}{hint_text}): {detail}"
-            return {
-                "ttf": [],
-                "sdf": [],
-            }, f"scan worker failed (exit={proc.returncode}{hint_text}): {detail}"
+                return {"ttf": [], "sdf": []}, f"{full_error} | 재시도 실패: {retry_error}"
+            return {"ttf": [], "sdf": []}, f"{full_error} | retry failed: {retry_error}"
 
-        if not os.path.exists(output_path):
-            if lang == "ko":
-                return {"ttf": [], "sdf": []}, "scan worker 결과 파일이 없습니다."
-            return {"ttf": [], "sdf": []}, "scan worker output file is missing."
-
-        with open(output_path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        scanned = {
-            "ttf": list(payload.get("ttf", [])) if isinstance(payload, dict) else [],
-            "sdf": list(payload.get("sdf", [])) if isinstance(payload, dict) else [],
-        }
-        worker_error = None
-        if isinstance(payload, dict):
-            worker_error = payload.get("error")
-            if not isinstance(worker_error, str):
-                worker_error = None
-        return scanned, worker_error
-    except Exception as e:
-        if lang == "ko":
-            return {"ttf": [], "sdf": []}, f"scan worker 실행 실패: {e!r}"
-        return {"ttf": [], "sdf": []}, f"failed to run scan worker: {e!r}"
+        return {"ttf": [], "sdf": []}, full_error
     finally:
         try:
             if os.path.exists(output_path):
@@ -4544,22 +5454,30 @@ def scan_fonts(
     game_path: str,
     lang: Language = "ko",
     target_files: set[str] | None = None,
+    exclude_exts: set[str] | None = None,
     isolate_files: bool = True,
     scan_jobs: int = 1,
     ps5_swizzle: bool = False,
 ) -> dict[str, list[JsonDict]]:
     """KR: 게임 에셋을 스캔해 TTF/SDF 폰트 목록을 반환합니다.
     KR: target_files가 있으면 해당 파일만 스캔합니다.
+    KR: exclude_exts가 있으면 해당 확장자는 스캔에서 제외합니다.
     KR: isolate_files=True면 파일 단위 워커 프로세스로 스캔해 크래시를 격리합니다.
     KR: scan_jobs>1이면 isolate_files 경로에서 워커를 병렬 실행합니다.
     EN: Scan game assets and return TTF/SDF font entries.
     EN: If target_files is provided, only scan those files.
+    EN: If exclude_exts is provided, skip files with those extensions.
     EN: If isolate_files=True, scan each file via worker subprocess to isolate hard crashes.
     EN: If scan_jobs>1, worker subprocesses are executed in parallel for isolate_files mode.
     """
     data_path = get_data_path(game_path, lang=lang)
     unity_version = get_unity_version(game_path, lang=lang)
-    assets_files = find_assets_files(game_path, lang=lang, target_files=target_files)
+    assets_files = find_assets_files(
+        game_path,
+        lang=lang,
+        target_files=target_files,
+        exclude_exts=exclude_exts,
+    )
     compile_method = get_compile_method(data_path)
     generator = _create_generator(
         unity_version, game_path, data_path, compile_method, lang=lang
@@ -4602,6 +5520,7 @@ def scan_fonts(
         indexed_results: dict[
             int, tuple[dict[str, list[JsonDict]], str | None, str]
         ] = {}
+        retry_candidates: list[tuple[int, str, str]] = []
         completed = 0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_meta = {
@@ -4611,11 +5530,11 @@ def scan_fonts(
                     assets_file,
                     lang,
                     ps5_swizzle,
-                ): (idx, os.path.basename(assets_file))
+                ): (idx, os.path.basename(assets_file), assets_file)
                 for idx, assets_file in enumerate(assets_files)
             }
             for future in as_completed(future_to_meta):
-                idx, fn = future_to_meta[future]
+                idx, fn, assets_file = future_to_meta[future]
                 try:
                     scanned, worker_error = future.result()
                 except Exception as e:
@@ -4626,6 +5545,8 @@ def scan_fonts(
                         else f"failed to run scan worker: {e!r}"
                     )
                 indexed_results[idx] = (scanned, worker_error, fn)
+                if _is_scan_retry_candidate(scanned, worker_error):
+                    retry_candidates.append((idx, assets_file, fn))
                 completed += 1
                 if lang == "ko":
                     _log_console(f"[scan_fonts] 진행 {completed}/{total_files}: {fn}")
@@ -4634,15 +5555,65 @@ def scan_fonts(
                         f"[scan_fonts] Progress {completed}/{total_files}: {fn}"
                     )
 
+        if retry_candidates:
+            if lang == "ko":
+                _log_console(
+                    f"[scan_fonts] 최종 순차 재시도 시작: {len(retry_candidates)}개 파일"
+                )
+            else:
+                _log_console(
+                    f"[scan_fonts] Starting final sequential retries: {len(retry_candidates)} file(s)"
+                )
+            retry_total = len(retry_candidates)
+            for retry_idx, (idx, assets_file, fn) in enumerate(
+                retry_candidates, start=1
+            ):
+                if lang == "ko":
+                    _log_console(f"[scan_fonts] 재시도 {retry_idx}/{retry_total}: {fn}")
+                else:
+                    _log_console(f"[scan_fonts] Retry {retry_idx}/{retry_total}: {fn}")
+                retry_scanned, retry_worker_error = _scan_fonts_via_worker(
+                    game_path,
+                    assets_file,
+                    lang=lang,
+                    detect_ps5_swizzle=ps5_swizzle,
+                )
+                previous_scanned, previous_error, _ = indexed_results.get(
+                    idx, ({"ttf": [], "sdf": []}, None, fn)
+                )
+                if (
+                    retry_worker_error
+                    and not list(retry_scanned.get("ttf", []))
+                    and not list(retry_scanned.get("sdf", []))
+                    and isinstance(previous_error, str)
+                    and previous_error.strip()
+                ):
+                    if lang == "ko":
+                        merged_error = (
+                            f"{previous_error} | 최종 순차 재시도 실패: {retry_worker_error}"
+                        )
+                    else:
+                        merged_error = (
+                            f"{previous_error} | final sequential retry failed: {retry_worker_error}"
+                        )
+                    indexed_results[idx] = (previous_scanned, merged_error, fn)
+                else:
+                    indexed_results[idx] = (retry_scanned, retry_worker_error, fn)
+                gc.collect()
+
         for idx in range(total_files):
             scanned, worker_error, processed_file_name = indexed_results.get(
                 idx, ({"ttf": [], "sdf": []}, None, "")
             )
             if worker_error:
                 if lang == "ko":
-                    _log_console(f"[scan_fonts] 워커 경고: {worker_error}")
+                    _log_console(
+                        f"[scan_fonts] 워커 경고: {processed_file_name} | {worker_error}"
+                    )
                 else:
-                    _log_console(f"[scan_fonts] Worker warning: {worker_error}")
+                    _log_console(
+                        f"[scan_fonts] Worker warning: {processed_file_name} | {worker_error}"
+                    )
             _log_scan_result_details(processed_file_name or f"index_{idx}", scanned)
             fonts["ttf"].extend(scanned.get("ttf", []))
             fonts["sdf"].extend(scanned.get("sdf", []))
@@ -4663,9 +5634,11 @@ def scan_fonts(
                 )
                 if worker_error:
                     if lang == "ko":
-                        _log_console(f"[scan_fonts] 워커 경고: {worker_error}")
+                        _log_console(f"[scan_fonts] 워커 경고: {fn} | {worker_error}")
                     else:
-                        _log_console(f"[scan_fonts] Worker warning: {worker_error}")
+                        _log_console(
+                            f"[scan_fonts] Worker warning: {fn} | {worker_error}"
+                        )
                 _log_scan_result_details(fn, scanned)
                 fonts["ttf"].extend(scanned.get("ttf", []))
                 fonts["sdf"].extend(scanned.get("sdf", []))
@@ -4691,13 +5664,16 @@ def parse_fonts(
     game_path: str,
     lang: Language = "ko",
     target_files: set[str] | None = None,
+    exclude_exts: set[str] | None = None,
     scan_jobs: int = 1,
     ps5_swizzle: bool = False,
 ) -> str:
     """KR: 스캔한 폰트를 JSON으로 저장하고 결과 파일 경로를 반환합니다.
     KR: target_files가 있으면 해당 파일만 파싱합니다.
+    KR: exclude_exts가 있으면 해당 확장자는 스캔에서 제외합니다.
     EN: Save scanned fonts to JSON and return output file path.
     EN: If target_files is provided, parse only those files.
+    EN: If exclude_exts is provided, skip files with those extensions.
     """
     # KR: parse 모드는 파일 단위 워커로 스캔해 UnityPy 하드 크래시를 격리합니다.
     # EN: Parse mode scans via per-file workers to isolate hard UnityPy crashes.
@@ -4705,6 +5681,7 @@ def parse_fonts(
         game_path,
         lang=lang,
         target_files=target_files,
+        exclude_exts=exclude_exts,
         isolate_files=True,
         scan_jobs=scan_jobs,
         ps5_swizzle=ps5_swizzle,
@@ -4773,29 +5750,37 @@ def parse_fonts(
     return output_file
 
 
-@lru_cache(maxsize=64)
-def _load_font_assets_cached(
-    script_dir: str, normalized: str, prefer_raster: bool = False
-) -> JsonDict:
-    """KR: KR_ASSETS에서 폰트 리소스를 읽어 캐시에 저장합니다.
-    EN: Load and cache font resources from KR_ASSETS.
-    """
-    kr_assets = os.path.join(script_dir, "KR_ASSETS")
-    raw_name = str(normalized).strip()
+def _format_byte_size(num_bytes: int) -> str:
+    size = float(max(0, int(num_bytes or 0)))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024.0 or unit == "TiB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{int(num_bytes or 0)} B"
 
-    def _dedupe_preserve_order(names: list[str]) -> list[str]:
-        seen: set[str] = set()
-        ordered: list[str] = []
-        for item in names:
-            key = item.strip()
-            if not key:
-                continue
-            lowered = key.lower()
-            if lowered in seen:
-                continue
-            seen.add(lowered)
-            ordered.append(key)
-        return ordered
+
+def _dedupe_preserve_order_str(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in values:
+        key = str(item).strip()
+        if not key:
+            continue
+        lowered = key.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        ordered.append(key)
+    return ordered
+
+
+def _build_font_asset_name_candidates(
+    normalized: str,
+    prefer_raster: bool = False,
+) -> tuple[list[str], list[str]]:
+    raw_name = str(normalized).strip()
 
     def _strip_render_suffix(name: str) -> str:
         if name.endswith(" SDF"):
@@ -4806,16 +5791,122 @@ def _load_font_assets_cached(
 
     base_name = _strip_render_suffix(raw_name)
     if prefer_raster:
-        name_candidates = _dedupe_preserve_order(
+        name_candidates = _dedupe_preserve_order_str(
             [raw_name, f"{base_name} Raster", f"{base_name} SDF"]
         )
     else:
-        name_candidates = _dedupe_preserve_order(
+        name_candidates = _dedupe_preserve_order_str(
             [raw_name, f"{base_name} SDF", f"{base_name} Raster"]
         )
 
-    font_name_candidates = _dedupe_preserve_order(
+    font_name_candidates = _dedupe_preserve_order_str(
         [raw_name, base_name] + name_candidates
+    )
+    return font_name_candidates, name_candidates
+
+
+def _find_replacement_sdf_atlas_path(
+    script_dir: str,
+    normalized: str,
+    prefer_raster: bool = False,
+) -> str | None:
+    kr_assets = os.path.join(script_dir, "KR_ASSETS")
+    _, name_candidates = _build_font_asset_name_candidates(
+        normalized, bool(prefer_raster)
+    )
+    for name_candidate in name_candidates:
+        atlas_path = os.path.join(kr_assets, f"{name_candidate} Atlas.png")
+        if os.path.exists(atlas_path):
+            return atlas_path
+    return None
+
+
+@lru_cache(maxsize=128)
+def _estimate_replacement_sdf_texture_bytes(
+    script_dir: str,
+    normalized: str,
+    prefer_raster: bool = False,
+) -> int:
+    atlas_path = _find_replacement_sdf_atlas_path(
+        script_dir,
+        normalized,
+        bool(prefer_raster),
+    )
+    if not atlas_path:
+        return 0
+
+    try:
+        with Image.open(atlas_path) as atlas_image:
+            width = int(atlas_image.width)
+            height = int(atlas_image.height)
+            try:
+                channel_count = max(1, len(atlas_image.getbands()))
+            except Exception:
+                channel_count = 4
+        if width <= 0 or height <= 0:
+            return 0
+        return width * height * channel_count
+    except Exception:
+        return 0
+
+
+def _estimate_sdf_texture_batch_profile(
+    file_sdf_replacements: dict[str, JsonDict],
+    *,
+    force_raster: bool = False,
+    script_dir: str | None = None,
+    batch_target_bytes: int = _AUTO_SPLIT_TEXTURE_BATCH_TARGET_BYTES,
+) -> JsonDict:
+    if script_dir is None:
+        script_dir = get_script_dir()
+
+    estimated_total_bytes = 0
+    estimated_target_count = 0
+    max_target_bytes = 0
+
+    for info in file_sdf_replacements.values():
+        if not isinstance(info, dict):
+            continue
+        replacement_font = str(info.get("Replace_to") or "").strip()
+        if not replacement_font:
+            continue
+        prefer_raster = bool(force_raster) or parse_bool_flag(info.get("force_raster"))
+        estimated_bytes = _estimate_replacement_sdf_texture_bytes(
+            script_dir,
+            normalize_font_name(replacement_font),
+            prefer_raster,
+        )
+        if estimated_bytes <= 0:
+            continue
+        estimated_target_count += 1
+        estimated_total_bytes += estimated_bytes
+        max_target_bytes = max(max_target_bytes, estimated_bytes)
+
+    suggested_batch_size = 0
+    if estimated_target_count > 0 and max_target_bytes > 0:
+        safe_target = max(1, int(batch_target_bytes or 0))
+        suggested_batch_size = max(1, safe_target // max_target_bytes)
+        suggested_batch_size = min(estimated_target_count, suggested_batch_size)
+
+    return {
+        "estimated_target_count": estimated_target_count,
+        "estimated_total_bytes": estimated_total_bytes,
+        "max_target_bytes": max_target_bytes,
+        "suggested_batch_size": suggested_batch_size,
+    }
+
+
+@lru_cache(maxsize=64)
+def _load_font_assets_cached(
+    script_dir: str, normalized: str, prefer_raster: bool = False
+) -> JsonDict:
+    """KR: KR_ASSETS에서 폰트 리소스를 읽어 캐시에 저장합니다.
+    EN: Load and cache font resources from KR_ASSETS.
+    """
+    kr_assets = os.path.join(script_dir, "KR_ASSETS")
+    font_name_candidates, name_candidates = _build_font_asset_name_candidates(
+        normalized,
+        bool(prefer_raster),
     )
 
     ttf_data = None
@@ -4907,6 +5998,7 @@ def replace_fonts_in_file(
     use_game_line_metrics: bool = False,
     force_raster: bool = False,
     material_scale_by_padding: bool = True,
+    outline_ratio: float = 1.0,
     prefer_original_compress: bool = False,
     temp_root_dir: str | None = None,
     generator: TypeTreeGenerator | None = None,
@@ -4914,6 +6006,12 @@ def replace_fonts_in_file(
     ps5_swizzle: bool = False,
     preview_export: bool = False,
     preview_root: str | None = None,
+    asset_file_index: dict[str, Any] | None = None,
+    deferred_texture_plans: dict[str, dict[str, Any]] | None = None,
+    deferred_material_plans: dict[str, dict[str, Any]] | None = None,
+    deferred_material_atlas_plans: dict[str, dict[str, Any]] | None = None,
+    pending_external_patch_files: set[str] | None = None,
+    phase_callback: Callable[[str, JsonDict], None] | None = None,
     lang: Language = "ko",
 ) -> bool:
     """KR: 단일 assets 파일의 TTF/SDF 폰트를 교체하고 저장합니다.
@@ -4922,6 +6020,7 @@ def replace_fonts_in_file(
     KR: use_game_line_metrics=True면 게임 원본 줄 간격 메트릭을 그대로 사용합니다.
     KR: pointSize는 옵션과 무관하게 교체 폰트 값을 유지합니다.
     KR: material_scale_by_padding=True면 SDF 머티리얼 float를 (게임 padding / 교체 padding) 비율로 보정합니다.
+    KR: outline_ratio는 현재 선택된 Material 기준(_OutlineWidth/_OutlineSoftness)에 배율로 적용합니다.
     KR: prefer_original_compress=True면 원본 압축 우선, False면 무압축 계열 우선 저장 전략을 사용합니다.
     KR: ps5_swizzle=True면 대상 Atlas의 swizzle 상태를 판별해 교체 Atlas를 자동 swizzle/unswizzle합니다.
     KR: preview_export=True면 preview 폴더에 Atlas/Glyph crop 미리보기를 저장합니다.
@@ -4933,6 +6032,7 @@ def replace_fonts_in_file(
     EN: With use_game_line_metrics=True, original in-game line metrics are used directly.
     EN: pointSize still follows replacement font data regardless of this option.
     EN: If material_scale_by_padding=True, SDF material floats are adjusted by (game padding / replacement padding).
+    EN: outline_ratio multiplies the selected Material baseline for _OutlineWidth/_OutlineSoftness.
     EN: When prefer_original_compress=True, original compression is tried first; otherwise uncompressed-family is preferred.
     EN: If ps5_swizzle=True, auto-detect target atlas swizzle state and swizzle/unswizzle replacement atlas.
     EN: If preview_export=True, save Atlas/Glyph crop previews into preview folder.
@@ -4940,6 +6040,9 @@ def replace_fonts_in_file(
     EN: If temp_root_dir is set, it is used as the root directory for temporary save files.
     """
     fn_without_path = os.path.basename(assets_file)
+    current_file_key = _normalize_asset_file_key(assets_file) or os.path.abspath(
+        assets_file
+    )
     data_path = get_data_path(game_path, lang=lang)
     using_custom_temp_root = temp_root_dir is not None
     tmp_root = (
@@ -4961,8 +6064,23 @@ def replace_fonts_in_file(
     if os.path.exists(tmp_path):
         shutil.rmtree(tmp_path)
     os.makedirs(tmp_path, exist_ok=True)
+    deferred_payload_dir = os.path.join(tmp_root, "deferred_patch_payloads")
+    os.makedirs(deferred_payload_dir, exist_ok=True)
 
+    phase_started_at = time.perf_counter()
+    _emit_phase_callback(
+        phase_callback,
+        "load_begin",
+        file=fn_without_path,
+        path=assets_file,
+    )
     env = UnityPy.load(assets_file)
+    _emit_phase_callback(
+        phase_callback,
+        "load_end",
+        file=fn_without_path,
+        elapsed_sec=(time.perf_counter() - phase_started_at),
+    )
     env_file = getattr(env, "file", None)
     if env_file is None:
         files = getattr(env, "files", None)
@@ -4972,6 +6090,8 @@ def replace_fonts_in_file(
         raise RuntimeError(
             "Could not determine primary UnityPy file object for saving."
         )
+    if not preview_export:
+        _ensure_custom_unitypy_streaming_save(lang=lang)
     if generator is None:
         compile_method = get_compile_method(data_path)
         generator = _create_generator(
@@ -5048,13 +6168,18 @@ def replace_fonts_in_file(
     patched_sdf_targets = 0
     sdf_parse_failure_reasons: list[str] = []
 
-    texture_replacements: dict[str, Any] = {}
-    texture_replacement_target_swizzle: dict[str, bool] = {}
-    texture_replacement_metadata_size: dict[str, tuple[int, int]] = {}
-    texture_replacement_linear_source: dict[str, Image.Image] = {}
-    material_replacements: dict[str, JsonDict] = {}
+    texture_patch_plans: dict[str, Any] = _copy_patch_bucket(
+        deferred_texture_plans, current_file_key
+    )
+    material_replacements: dict[str, JsonDict] = cast(
+        dict[str, JsonDict],
+        _copy_patch_bucket(deferred_material_plans, current_file_key),
+    )
     material_replacements_by_pathid: dict[int, JsonDict] = {}
-    material_replacements_by_atlas: dict[str, JsonDict] = {}
+    material_replacements_by_atlas: dict[str, JsonDict] = cast(
+        dict[str, JsonDict],
+        _copy_patch_bucket(deferred_material_atlas_plans, current_file_key),
+    )
     ambiguous_material_fallback_warned: set[int] = set()
     modified = False
 
@@ -5651,191 +6776,104 @@ def replace_fonts_in_file(
                         parse_dict["atlas"]["m_FileID"] = m_AtlasTextures_FileID
                         parse_dict["atlas"]["m_PathID"] = m_AtlasTextures_PathID
 
-                    desired_swizzle_state = source_swizzled
-                    if ps5_swizzle:
-                        target_swizzle_verdict, target_swizzle_source = (
-                            _detect_target_texture_swizzle(
-                                texture_object_lookup,
-                                texture_swizzle_state_cache,
-                                assets_name,
-                                int(m_AtlasTextures_PathID),
-                            )
-                        )
-                        if target_swizzle_verdict == "likely_swizzled_input":
-                            target_is_swizzled = True
-                        elif target_swizzle_verdict == "likely_linear_input":
-                            target_is_swizzled = False
-                        elif replacement_swizzle_hint:
-                            target_is_swizzled = True
-
-                        if target_is_swizzled is not None:
-                            desired_swizzle_state = target_is_swizzled
-                    if replacement_process_swizzle or asset_process_swizzle:
-                        desired_swizzle_state = True
-
-                    if ps5_swizzle:
-                        if target_swizzle_verdict == "likely_swizzled_input":
-                            if lang == "ko":
-                                reason = (
-                                    f" (근거: {target_swizzle_source})"
-                                    if target_swizzle_source
-                                    else ""
-                                )
-                                _log_console(
-                                    f"  PS5 swizzle 감지: 대상 Atlas가 swizzled 상태로 판별되었습니다.{reason}"
-                                )
-                            else:
-                                reason = (
-                                    f" (source: {target_swizzle_source})"
-                                    if target_swizzle_source
-                                    else ""
-                                )
-                                _log_console(
-                                    f"  PS5 swizzle detect: target atlas is likely swizzled.{reason}"
-                                )
-                        elif target_swizzle_verdict == "likely_linear_input":
-                            if lang == "ko":
-                                reason = (
-                                    f" (근거: {target_swizzle_source})"
-                                    if target_swizzle_source
-                                    else ""
-                                )
-                                _log_console(
-                                    f"  PS5 swizzle 감지: 대상 Atlas가 선형(linear) 상태로 판별되었습니다.{reason}"
-                                )
-                            else:
-                                reason = (
-                                    f" (source: {target_swizzle_source})"
-                                    if target_swizzle_source
-                                    else ""
-                                )
-                                _log_console(
-                                    f"  PS5 swizzle detect: target atlas is likely linear.{reason}"
-                                )
-                        elif replacement_swizzle_hint:
-                            if lang == "ko":
-                                _log_console(
-                                    "  PS5 swizzle 힌트: JSON swizzle=yes 값을 기준으로 swizzle 적용합니다."
-                                )
-                            else:
-                                _log_console(
-                                    "  PS5 swizzle hint: applying swizzle based on JSON swizzle=yes."
-                                )
-                        elif lang == "ko":
-                            _log_console(
-                                "  PS5 swizzle 감지: inconclusive, 교체 Atlas 원본 상태를 유지합니다."
-                            )
-                        else:
-                            _log_console(
-                                "  PS5 swizzle detect: inconclusive, keeping replacement atlas state."
-                            )
-                    elif replacement_process_swizzle:
-                        if lang == "ko":
-                            _log_console(
-                                "  process_swizzle=True: 교체 Atlas를 swizzle 상태로 변환합니다."
-                            )
-                        else:
-                            _log_console(
-                                "  process_swizzle=True: converting replacement atlas to swizzled state."
-                            )
-                    _log_debug(
-                        f"[replace_sdf] file={fn_without_path} assets={assets_name} path_id={pathid} "
-                        f"source_swizzled={source_swizzled} target_swizzle_verdict={target_swizzle_verdict} "
-                        f"target_swizzle_source={target_swizzle_source} desired_swizzle={desired_swizzle_state}"
-                    )
-
                     atlas_metadata_width = int(source_atlas.width)
                     atlas_metadata_height = int(source_atlas.height)
-                    atlas_for_write = source_atlas
-                    if desired_swizzle_state != source_swizzled:
-                        try:
-                            if desired_swizzle_state:
-                                atlas_for_write = apply_ps5_swizzle_to_image(
-                                    source_atlas
-                                )
-                            else:
-                                atlas_for_write = apply_ps5_unswizzle_to_image(
-                                    source_atlas
-                                )
-                        except Exception as swizzle_error:
-                            atlas_for_write = source_atlas
-                            if lang == "ko":
-                                _log_console(
-                                    f"  경고: PS5 swizzle 변환 실패, 원본 Atlas를 사용합니다. ({swizzle_error})"
-                                )
-                            else:
-                                _log_console(
-                                    f"  Warning: PS5 swizzle transform failed; using original atlas. ({swizzle_error})"
-                                )
-
-                    if preview_export:
-                        preview_image = atlas_for_write
-                        if ps5_swizzle and desired_swizzle_state:
-                            try:
-                                preview_image = apply_ps5_unswizzle_to_image(
-                                    atlas_for_write
-                                )
-                            except Exception as preview_unswizzle_error:
-                                preview_image = atlas_for_write
-                                if lang == "ko":
-                                    _log_console(
-                                        "  경고: preview unswizzle 실패, 저장 상태 Atlas 그대로 미리보기를 저장합니다. "
-                                        f"({preview_unswizzle_error})"
-                                    )
-                                else:
-                                    _log_console(
-                                        "  Warning: preview unswizzle failed; saving preview from stored atlas state. "
-                                        f"({preview_unswizzle_error})"
-                                    )
-                        _save_swizzle_preview(
-                            preview_image,
-                            preview_enabled=preview_export,
-                            preview_root=preview_root,
-                            assets_file_name=fn_without_path,
-                            assets_name=assets_name,
-                            atlas_path_id=int(m_AtlasTextures_PathID),
-                            font_name=str(objname),
-                            target_swizzled=bool(desired_swizzle_state),
-                            lang=lang,
+                    texture_target_assets_name = _resolve_target_assets_name(
+                        obj.assets_file,
+                        assets_name,
+                        int(m_AtlasTextures_FileID),
+                    )
+                    texture_target_file_key = _resolve_target_outer_file_key(
+                        current_file_key,
+                        obj.assets_file,
+                        int(m_AtlasTextures_FileID),
+                        texture_target_assets_name,
+                        source_bundle_signature=source_bundle_signature,
+                        asset_file_index=asset_file_index,
+                    )
+                    texture_key = ""
+                    if (
+                        int(m_AtlasTextures_PathID) != 0
+                        and texture_target_assets_name
+                        and texture_target_file_key
+                    ):
+                        texture_key = _make_assets_object_key(
+                            texture_target_assets_name,
+                            int(m_AtlasTextures_PathID),
                         )
-                        if isinstance(replace_data, dict):
-                            _save_glyph_crop_previews(
-                                preview_image,
-                                preview_enabled=preview_export,
-                                preview_root=preview_root,
-                                assets_file_name=fn_without_path,
-                                assets_name=assets_name,
-                                atlas_path_id=int(m_AtlasTextures_PathID),
-                                font_name=str(objname),
-                                sdf_data=replace_data,
-                                lang=lang,
+                        texture_plan: JsonDict = {
+                            "replacement_font": replacement_font,
+                            "source_entry": f"{fn_without_path}|{assets_name}|{pathid}",
+                            "font_name": str(objname),
+                            "source_atlas": source_atlas,
+                            "source_swizzled": bool(source_swizzled),
+                            "replacement_swizzle_hint": bool(
+                                replacement_swizzle_hint
+                            ),
+                            "replacement_process_swizzle": bool(
+                                replacement_process_swizzle
+                            ),
+                            "asset_process_swizzle": bool(asset_process_swizzle),
+                            "alpha8_linear_source": atlas_linear_for_alpha8,
+                            "metadata_width": atlas_metadata_width,
+                            "metadata_height": atlas_metadata_height,
+                            "preview_sdf_data": replace_data,
+                        }
+                        if texture_target_file_key == current_file_key:
+                            _store_patch_value(
+                                texture_patch_plans,
+                                texture_key,
+                                texture_plan,
                             )
+                        else:
+                            texture_plan = _spill_deferred_texture_plan_to_disk(
+                                texture_plan,
+                                deferred_payload_dir,
+                            )
+                            _register_deferred_patch(
+                                deferred_texture_plans,
+                                texture_target_file_key,
+                                texture_key,
+                                texture_plan,
+                                pending_files=pending_external_patch_files,
+                                patch_kind="texture",
+                            )
+                    elif int(m_AtlasTextures_PathID) != 0:
+                        _log_warning(
+                            f"[replace_sdf] file={fn_without_path} assets={assets_name} "
+                            f"path_id={pathid} atlas_ref={m_AtlasTextures_FileID}:{m_AtlasTextures_PathID} "
+                            "could_not_resolve_texture_target=True"
+                        )
 
-                    texture_key = f"{assets_name}|{m_AtlasTextures_PathID}"
-                    texture_replacements[texture_key] = atlas_for_write
-                    texture_replacement_target_swizzle[texture_key] = bool(
-                        desired_swizzle_state
-                    )
-                    texture_replacement_linear_source[texture_key] = (
-                        atlas_linear_for_alpha8
-                    )
-                    texture_replacement_metadata_size[texture_key] = (
-                        atlas_metadata_width,
-                        atlas_metadata_height,
-                    )
-                    material_replacements_by_atlas[texture_key] = {
+                    atlas_fallback_payload: JsonDict = {
                         "w": atlas_metadata_width,
                         "h": atlas_metadata_height,
                         "gs": None,
                         "float_overrides": {},
                         "color_overrides": {},
+                        "outline_ratio": outline_ratio,
                         "reset_keywords": False,
                         "prune_raster_material": False,
                         "preserve_gradient_floor": False,
+                        "replacement_font": replacement_font,
+                        "source_entry": f"{fn_without_path}|{assets_name}|{pathid}",
                     }
-                    material_replacements_by_atlas[texture_key.lower()] = (
-                        material_replacements_by_atlas[texture_key]
-                    )
+                    if texture_key and texture_target_file_key:
+                        if texture_target_file_key == current_file_key:
+                            _store_patch_value(
+                                material_replacements_by_atlas,
+                                texture_key,
+                                atlas_fallback_payload,
+                            )
+                        else:
+                            _register_deferred_patch(
+                                deferred_material_atlas_plans,
+                                texture_target_file_key,
+                                texture_key,
+                                atlas_fallback_payload,
+                                pending_files=pending_external_patch_files,
+                                patch_kind="material_atlas",
+                            )
                     if m_Material_PathID != 0:
                         gradient_scale = None
                         apply_replacement_material = not use_game_mat
@@ -5927,9 +6965,18 @@ def replace_fonts_in_file(
                                     f"  Applied material padding ratio: {game_padding_for_material:.2f}/{replacement_padding:.2f} "
                                     f"(x{material_padding_ratio:.3f})"
                                 )
-                        material_target_assets_name = _resolve_assets_name_from_file_id(
+                        material_target_assets_name = _resolve_target_assets_name(
+                            obj.assets_file,
+                            assets_name,
+                            int(m_Material_FileID),
+                        )
+                        material_target_file_key = _resolve_target_outer_file_key(
+                            current_file_key,
                             obj.assets_file,
                             int(m_Material_FileID),
+                            material_target_assets_name,
+                            source_bundle_signature=source_bundle_signature,
+                            asset_file_index=asset_file_index,
                         )
                         material_payload = {
                             "w": atlas_metadata_width,
@@ -5937,22 +6984,36 @@ def replace_fonts_in_file(
                             "gs": gradient_scale,
                             "float_overrides": float_overrides,
                             "color_overrides": color_overrides,
+                            "outline_ratio": outline_ratio,
                             "reset_keywords": reset_keywords,
                             "prune_raster_material": bool(prune_raster_material),
                             "preserve_gradient_floor": bool(
                                 preserve_gradient_floor
                             ),
+                            "replacement_font": replacement_font,
+                            "source_entry": f"{fn_without_path}|{assets_name}|{pathid}",
                         }
-                        if material_target_assets_name:
-                            material_key_exact = (
-                                f"{material_target_assets_name}|{m_Material_PathID}"
+                        if material_target_assets_name and material_target_file_key:
+                            material_key_exact = _make_assets_object_key(
+                                material_target_assets_name,
+                                int(m_Material_PathID),
                             )
-                            material_key_lower = (
-                                f"{material_target_assets_name.lower()}|{m_Material_PathID}"
-                            )
-                            material_replacements[material_key_exact] = material_payload
-                            material_replacements[material_key_lower] = material_payload
-                        else:
+                            if material_target_file_key == current_file_key:
+                                _store_patch_value(
+                                    material_replacements,
+                                    material_key_exact,
+                                    material_payload,
+                                )
+                            else:
+                                _register_deferred_patch(
+                                    deferred_material_plans,
+                                    material_target_file_key,
+                                    material_key_exact,
+                                    material_payload,
+                                    pending_files=pending_external_patch_files,
+                                    patch_kind="material",
+                                )
+                        elif material_target_file_key == current_file_key:
                             material_replacements_by_pathid[int(m_Material_PathID)] = (
                                 material_payload
                             )
@@ -5960,6 +7021,12 @@ def replace_fonts_in_file(
                                 f"[replace_sdf] file={fn_without_path} assets={assets_name} path_id={pathid} "
                                 f"material_ref={m_Material_FileID}:{m_Material_PathID} "
                                 "could_not_resolve_material_assets_name=True; fallback_to_pathid_only=True"
+                            )
+                        else:
+                            _log_warning(
+                                f"[replace_sdf] file={fn_without_path} assets={assets_name} path_id={pathid} "
+                                f"material_ref={m_Material_FileID}:{m_Material_PathID} "
+                                "could_not_resolve_material_target=True"
                             )
                     obj.patch(parse_dict)
                     patched_sdf_targets += 1
@@ -5981,11 +7048,23 @@ def replace_fonts_in_file(
                             f"(missing: {', '.join(missing_parts) if missing_parts else 'unknown'})"
                         )
 
+    phase_started_at = time.perf_counter()
+    _emit_phase_callback(
+        phase_callback,
+        "patch_begin",
+        file=fn_without_path,
+        object_count=(
+            len(getattr(env_file, "objects", {}))
+            if hasattr(env_file, "objects")
+            else None
+        ),
+    )
     for obj in env.objects:
         assets_name = obj.assets_file.name
         if obj.type.name == "Texture2D":
-            replacement_key = f"{assets_name}|{obj.path_id}"
-            if replacement_key in texture_replacements:
+            replacement_key = _make_assets_object_key(assets_name, int(obj.path_id))
+            texture_plan = _lookup_patch_value(texture_patch_plans, replacement_key)
+            if isinstance(texture_plan, dict):
                 parse_dict = obj.parse_as_object()
                 if lang == "ko":
                     _log_console(
@@ -5995,16 +7074,34 @@ def replace_fonts_in_file(
                     _log_console(
                         f"Texture replaced: {obj.peek_name()} (PathID: {obj.path_id})"
                     )
-                replacement_image = texture_replacements[replacement_key]
-                target_swizzled_state = texture_replacement_target_swizzle.get(
-                    replacement_key
+                prepared_texture = _prepare_texture_replacement_for_target(
+                    texture_plan,
+                    assets_file_name=fn_without_path,
+                    target_assets_name=assets_name,
+                    target_path_id=int(obj.path_id),
+                    texture_object_lookup=texture_object_lookup,
+                    texture_swizzle_state_cache=texture_swizzle_state_cache,
+                    ps5_swizzle=ps5_swizzle,
+                    preview_export=preview_export,
+                    preview_root=preview_root,
+                    lang=lang,
                 )
-                replacement_linear_source = texture_replacement_linear_source.get(
-                    replacement_key
+                if not isinstance(prepared_texture, dict):
+                    continue
+                replacement_image = prepared_texture.get("replacement_image")
+                target_swizzled_state = prepared_texture.get(
+                    "target_swizzled_state"
                 )
-                metadata_w, metadata_h = texture_replacement_metadata_size.get(
-                    replacement_key, (0, 0)
+                replacement_linear_source = prepared_texture.get(
+                    "replacement_linear_source"
                 )
+                metadata_size = prepared_texture.get("metadata_size", (0, 0))
+                if (
+                    not isinstance(metadata_size, tuple)
+                    or len(metadata_size) != 2
+                ):
+                    metadata_size = (0, 0)
+                metadata_w, metadata_h = cast(tuple[int, int], metadata_size)
                 applied_raw_alpha8 = False
                 try:
                     texture_format = int(
@@ -6017,8 +7114,7 @@ def replace_fonts_in_file(
                     f"name={obj.peek_name()} texture_format={texture_format} metadata={metadata_w}x{metadata_h}"
                 )
                 if (
-                    ps5_swizzle
-                    and texture_format == 1
+                    texture_format == 1
                     and isinstance(replacement_image, Image.Image)
                 ):
                     try:
@@ -6031,25 +7127,11 @@ def replace_fonts_in_file(
                         # KR: RGBA 기준 swizzle 후 알파만 추출하면 바이트 순서가 깨질 수 있습니다.
                         # EN: Alpha8 must be encoded via bpe=1 path.
                         # EN: Swizzling as RGBA then extracting alpha can corrupt byte order.
-                        if target_swizzled_state is True:
-                            alpha_linear, aw, ah = _image_to_alpha8_bytes(alpha_source)
-                            alpha_linear_img = Image.frombytes(
-                                "L", (int(aw), int(ah)), alpha_linear
-                            )
-                            alpha_swizzled_img = apply_ps5_swizzle_to_image(
-                                alpha_linear_img
-                            )
-                            alpha_raw, aw, ah = _image_to_alpha8_bytes(
-                                alpha_swizzled_img
-                            )
-                        elif target_swizzled_state is False:
-                            # KR: linear(비-swizzled) 타겟은 Unity 저장 좌표계 보정을 위해 상하 반전을 적용합니다.
-                            # EN: Linear (non-swizzled) targets are vertically flipped for Unity storage coordinates.
-                            alpha_raw, aw, ah = _image_to_alpha8_bytes(
-                                ImageOps.flip(alpha_source)
-                            )
-                        else:
-                            alpha_raw, aw, ah = _image_to_alpha8_bytes(alpha_source)
+                        alpha_raw, aw, ah, alpha_mode = _encode_alpha8_replacement_bytes(
+                            alpha_source,
+                            ps5_swizzle=ps5_swizzle,
+                            target_swizzled_state=target_swizzled_state,
+                        )
                         parse_dict.m_Width = int(metadata_w if metadata_w > 0 else aw)
                         parse_dict.m_Height = int(metadata_h if metadata_h > 0 else ah)
                         if hasattr(parse_dict, "m_CompleteImageSize"):
@@ -6067,14 +7149,14 @@ def replace_fonts_in_file(
                         _log_debug(
                             f"[replace_texture] file={fn_without_path} assets={assets_name} path_id={obj.path_id} "
                             f"action=alpha8_raw_injection target_swizzled={target_swizzled_state} "
-                            f"raw_size={len(alpha_raw)} width={aw} height={ah}"
+                            f"mode={alpha_mode} raw_size={len(alpha_raw)} width={aw} height={ah}"
                         )
                         if lang == "ko":
-                            if target_swizzled_state is True:
+                            if alpha_mode == "swizzled":
                                 _log_console(
                                     "  Alpha8 raw 주입 적용: swizzled 바이트를 image_data에 직접 기록합니다."
                                 )
-                            elif target_swizzled_state is False:
+                            elif alpha_mode == "linear_flipped":
                                 _log_console(
                                     "  Alpha8 raw 주입 적용: linear 바이트(상하 반전 보정)를 image_data에 직접 기록합니다."
                                 )
@@ -6083,11 +7165,11 @@ def replace_fonts_in_file(
                                     "  Alpha8 raw 주입 적용: 판정 불명(inconclusive) 상태로 image_data에 직접 기록합니다."
                                 )
                         else:
-                            if target_swizzled_state is True:
+                            if alpha_mode == "swizzled":
                                 _log_console(
                                     "  Applied Alpha8 raw injection: writing swizzled bytes directly to image_data."
                                 )
-                            elif target_swizzled_state is False:
+                            elif alpha_mode == "linear_flipped":
                                 _log_console(
                                     "  Applied Alpha8 raw injection: writing linear bytes (with vertical-flip compensation) to image_data."
                                 )
@@ -6110,10 +7192,8 @@ def replace_fonts_in_file(
                 modified = True
         if obj.type.name == "Material":
             parse_dict = None
-            material_key = f"{assets_name}|{obj.path_id}"
-            mat_info = material_replacements.get(material_key)
-            if mat_info is None:
-                mat_info = material_replacements.get(f"{assets_name.lower()}|{obj.path_id}")
+            material_key = _make_assets_object_key(assets_name, int(obj.path_id))
+            mat_info = _lookup_patch_value(material_replacements, material_key)
             if mat_info is None:
                 fallback_path_id = int(obj.path_id)
                 if fallback_path_id in material_replacements_by_pathid:
@@ -6152,17 +7232,24 @@ def replace_fonts_in_file(
                                 )
                             break
                 if main_tex_path_id > 0:
-                    atlas_key = f"{assets_name}|{main_tex_path_id}"
-                    mat_info = material_replacements_by_atlas.get(atlas_key)
-                    if mat_info is None:
-                        mat_info = material_replacements_by_atlas.get(
-                            atlas_key.lower()
-                        )
+                    atlas_key = _make_assets_object_key(assets_name, main_tex_path_id)
+                    mat_info = _lookup_patch_value(
+                        material_replacements_by_atlas,
+                        atlas_key,
+                    )
             if mat_info is not None:
                 if parse_dict is None:
                     parse_dict = obj.parse_as_object()
                 if _apply_material_replacement_to_object(parse_dict, mat_info):
                     parse_dict.save()
+
+    _emit_phase_callback(
+        phase_callback,
+        "patch_end",
+        file=fn_without_path,
+        elapsed_sec=(time.perf_counter() - phase_started_at),
+        modified=bool(modified),
+    )
 
     if modified:
         if lang == "ko":
@@ -6238,6 +7325,14 @@ def replace_fonts_in_file(
                     _log_console(f"  Save validation failed: {reason}")
                 return False, reason
             try:
+                _emit_phase_callback(
+                    phase_callback,
+                    "validate_begin",
+                    file=fn_without_path,
+                    path=saved_path,
+                )
+                validation_started_at = time.perf_counter()
+                validation_inner_names = _collect_validation_inner_names(env_file)
                 if getattr(sys, "frozen", False):
                     cmd = [sys.executable, "--_validate-bundle", saved_path]
                 else:
@@ -6247,6 +7342,8 @@ def replace_fonts_in_file(
                         "--_validate-bundle",
                         saved_path,
                     ]
+                for inner_name in validation_inner_names:
+                    cmd.extend(["--_validate-inner-name", inner_name])
                 proc = subprocess.run(
                     cmd,
                     capture_output=True,
@@ -6256,6 +7353,14 @@ def replace_fonts_in_file(
                     timeout=1800,
                 )
                 if proc.returncode == 0:
+                    _emit_phase_callback(
+                        phase_callback,
+                        "validate_end",
+                        file=fn_without_path,
+                        path=saved_path,
+                        elapsed_sec=(time.perf_counter() - validation_started_at),
+                        ok=True,
+                    )
                     return True, None
                 detail = (proc.stderr or proc.stdout or "").strip()
                 reason = (
@@ -6267,6 +7372,15 @@ def replace_fonts_in_file(
                     _log_console(f"  저장 검증 실패 [{reason}]")
                 else:
                     _log_console(f"  Save validation failed [{reason}]")
+                _emit_phase_callback(
+                    phase_callback,
+                    "validate_end",
+                    file=fn_without_path,
+                    path=saved_path,
+                    elapsed_sec=(time.perf_counter() - validation_started_at),
+                    ok=False,
+                    reason=reason,
+                )
                 return False, reason
             except Exception as e:
                 reason = (
@@ -6278,6 +7392,14 @@ def replace_fonts_in_file(
                     _log_console(f"  저장 검증 워커 실행 실패: {e!r}")
                 else:
                     _log_console(f"  Failed to run save validation worker: {e!r}")
+                _emit_phase_callback(
+                    phase_callback,
+                    "validate_end",
+                    file=fn_without_path,
+                    path=saved_path,
+                    ok=False,
+                    reason=reason,
+                )
                 return False, reason
 
         def _try_save(packer_label: Any, log_label: str) -> bool:
@@ -6289,31 +7411,42 @@ def replace_fonts_in_file(
             has_save_to = callable(getattr(env_file, "save_to", None))
             saved_blob: bytes | None = None
             try:
+                _emit_phase_callback(
+                    phase_callback,
+                    "save_begin",
+                    file=fn_without_path,
+                    packer=packer_label,
+                    method=log_label,
+                )
+                save_started_at = time.perf_counter()
                 use_stream_fallback = False
                 if has_save_to and source_bundle_signature in bundle_signatures:
-                    # KR: 번들은 안정성을 위해 legacy save()를 우선 시도하고, 메모리 부족 시에만 save_to로 폴백합니다.
-                    # EN: For bundles, prefer legacy save() for stability; fall back to save_to on MemoryError.
+                    # KR: 번들은 기본적으로 save_to()를 우선 사용해 최종 bytes blob 생성을 피합니다.
+                    # KR: save_to() 실패 시에만 legacy save()로 폴백합니다.
+                    # EN: For bundles, prefer save_to() first to avoid materializing the final bytes blob.
+                    # EN: Fall back to legacy save() only if save_to() fails.
                     try:
-                        saved_blob = _save_env_file(packer_label, use_save_to=False)
-                    except MemoryError:
-                        use_stream_fallback = True
-                        if lang == "ko":
-                            _log_console(
-                                "  메모리 부족으로 스트리밍 저장(save_to)으로 폴백합니다..."
-                            )
-                        else:
-                            _log_console(
-                                "  Falling back to streaming save_to due to MemoryError..."
-                            )
-
-                    if not use_stream_fallback:
-                        with open(tmp_file, "wb") as f:
-                            f.write(cast(bytes, saved_blob))
-                        saved_blob = None
-                    else:
                         _save_env_file(
                             packer_label, save_path=tmp_file, use_save_to=True
                         )
+                    except Exception as primary_save_error:
+                        use_stream_fallback = True
+                        if lang == "ko":
+                            _log_console(
+                                "  save_to() 저장 실패로 legacy save()로 폴백합니다... "
+                                f"({type(primary_save_error).__name__}: {primary_save_error})"
+                            )
+                        else:
+                            _log_console(
+                                "  save_to() failed; falling back to legacy save()... "
+                                f"({type(primary_save_error).__name__}: {primary_save_error})"
+                            )
+
+                    if use_stream_fallback:
+                        saved_blob = _save_env_file(packer_label, use_save_to=False)
+                        with open(tmp_file, "wb") as f:
+                            f.write(cast(bytes, saved_blob))
+                        saved_blob = None
                 elif has_save_to:
                     # KR: save_to()로 파일에 직접 저장 — bytes 중간 변수 없음 (메모리 절약)
                     # EN: save_to() writes directly to file — no intermediate bytes blob (memory-efficient)
@@ -6349,6 +7482,16 @@ def replace_fonts_in_file(
                                     f"  Validation failure reason: {validation_reason}"
                                 )
                         save_success = True
+                        _emit_phase_callback(
+                            phase_callback,
+                            "save_end",
+                            file=fn_without_path,
+                            packer=packer_label,
+                            method=log_label,
+                            elapsed_sec=(time.perf_counter() - save_started_at),
+                            ok=True,
+                            validated=False,
+                        )
                         return True
                     last_save_failure_reason = (
                         validation_reason or "validation failed (empty output file)"
@@ -6360,6 +7503,16 @@ def replace_fonts_in_file(
                         pass
                     return False
                 save_success = True
+                _emit_phase_callback(
+                    phase_callback,
+                    "save_end",
+                    file=fn_without_path,
+                    packer=packer_label,
+                    method=log_label,
+                    elapsed_sec=(time.perf_counter() - save_started_at),
+                    ok=True,
+                    validated=True,
+                )
                 return True
             except Exception as e:
                 last_save_failure_reason = (
@@ -6380,6 +7533,15 @@ def replace_fonts_in_file(
                         os.remove(tmp_file)
                 except Exception:
                     pass
+                _emit_phase_callback(
+                    phase_callback,
+                    "save_end",
+                    file=fn_without_path,
+                    packer=packer_label,
+                    method=log_label,
+                    ok=False,
+                    reason=last_save_failure_reason,
+                )
                 return False
             finally:
                 saved_blob = None
@@ -6518,19 +7680,23 @@ def create_batch_replacements(
     replace_ttf: bool = True,
     replace_sdf: bool = True,
     target_files: set[str] | None = None,
+    exclude_exts: set[str] | None = None,
     scan_jobs: int = 1,
     lang: Language = "ko",
     ps5_swizzle: bool = False,
 ) -> dict[str, JsonDict]:
     """KR: 게임 내 모든 폰트를 지정 폰트로 치환하는 배치 매핑을 생성합니다.
     KR: target_files가 있으면 해당 파일만 대상으로 매핑을 생성합니다.
+    KR: exclude_exts가 있으면 해당 확장자는 스캔에서 제외합니다.
     EN: Create batch replacement mapping for all fonts in a game.
     EN: If target_files is provided, build mapping only for those files.
+    EN: If exclude_exts is provided, skip files with those extensions.
     """
     fonts = scan_fonts(
         game_path,
         lang=lang,
         target_files=target_files,
+        exclude_exts=exclude_exts,
         scan_jobs=scan_jobs,
         ps5_swizzle=ps5_swizzle,
     )
@@ -6587,19 +7753,21 @@ def create_batch_replacements(
 def create_preview_export_targets(
     game_path: str,
     target_files: set[str] | None = None,
+    exclude_exts: set[str] | None = None,
     scan_jobs: int = 1,
     lang: Language = "ko",
     ps5_swizzle: bool = False,
 ) -> dict[str, JsonDict]:
     """KR: preview-export 전용 SDF 대상 매핑(Replace_to 비어 있음)을 생성합니다.
-    KR: scan_jobs/target_files 조건을 그대로 반영합니다.
+    KR: scan_jobs/target_files/exclude_exts 조건을 그대로 반영합니다.
     EN: Build preview-export-only SDF mapping (Replace_to left empty).
-    EN: scan_jobs/target_files are applied as-is.
+    EN: scan_jobs/target_files/exclude_exts are applied as-is.
     """
     fonts = scan_fonts(
         game_path,
         lang=lang,
         target_files=target_files,
+        exclude_exts=exclude_exts,
         scan_jobs=scan_jobs,
         ps5_swizzle=ps5_swizzle,
     )
@@ -6626,7 +7794,12 @@ def create_preview_export_targets(
     return targets
 
 
-def exit_with_error(message: str, lang: Language = "ko") -> NoReturn:
+def exit_with_error(
+    message: str,
+    lang: Language = "ko",
+    *,
+    pause: bool | None = None,
+) -> NoReturn:
     """KR: 로컬라이즈된 오류 메시지를 출력하고 종료합니다.
     EN: Print localized error message and terminate the process.
     """
@@ -6634,10 +7807,10 @@ def exit_with_error(message: str, lang: Language = "ko") -> NoReturn:
         _log_console(f"오류: {message}")
     else:
         _log_console(f"Error: {message}")
-    if lang == "ko":
-        input("\n엔터를 눌러 종료...")
-    else:
-        input("\nPress Enter to exit...")
+    if pause is None:
+        pause = _should_pause_before_exit(interactive_session=False)
+    if pause:
+        _pause_before_exit(lang=lang, interactive_session=False)
     sys.exit(1)
 
 
@@ -6648,9 +7821,367 @@ def exit_with_error_en(message: str) -> NoReturn:
     exit_with_error(message, lang="en")
 
 
-def run_validation_worker(bundle_path: str, lang: Language = "ko") -> int:
-    """KR: 저장 검증 전용 워커입니다. bundle_path를 UnityPy로 로드해 성공/실패 코드만 반환합니다.
-    EN: Validation worker that loads bundle_path with UnityPy and returns a status code.
+_STRUCTURAL_VALIDATE_MAX_METADATA_BYTES = 64 * 1024 * 1024
+
+
+def _align_value(value: int, alignment: int = 16) -> int:
+    return int(value) + ((alignment - (int(value) % alignment)) % alignment)
+
+
+def _read_c_string(handle: Any, limit: int = 4096) -> str:
+    chunks = bytearray()
+    while len(chunks) < limit:
+        byte = handle.read(1)
+        if not byte:
+            raise ValueError("Unexpected EOF while reading C string")
+        if byte == b"\0":
+            return chunks.decode("utf-8", "surrogateescape")
+        chunks.extend(byte)
+    raise ValueError("C string exceeds limit")
+
+
+def _parse_version_triplet(version_text: str) -> tuple[int, int, int]:
+    match = re.match(r"^\s*(\d+)\.(\d+)\.(\d+)", version_text or "")
+    if not match:
+        return (0, 0, 0)
+    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
+
+
+def _read_unityfs_structure(bundle_path: str) -> tuple[JsonDict | None, str | None]:
+    try:
+        with open(bundle_path, "rb") as handle:
+            signature = _read_c_string(handle, limit=64)
+            if signature != "UnityFS":
+                return None, f"unsupported signature: {signature}"
+
+            version = struct_module.unpack(">I", handle.read(4))[0]
+            version_player = _read_c_string(handle)
+            version_engine = _read_c_string(handle)
+            total_file_size = struct_module.unpack(">Q", handle.read(8))[0]
+            compressed_size, uncompressed_size, data_flags = struct_module.unpack(
+                ">III", handle.read(12)
+            )
+
+            version_triplet = _parse_version_triplet(version_engine)
+            uses_block_alignment = bool(
+                version >= 7
+                or (
+                    version_triplet[0] == 2019
+                    and version_triplet >= (2019, 4, 15)
+                )
+            )
+            if uses_block_alignment:
+                handle.seek(_align_value(handle.tell(), 16), os.SEEK_SET)
+
+            blocks_info_start = handle.tell()
+            file_length = os.path.getsize(bundle_path)
+            if data_flags & 0x80:
+                handle.seek(file_length - compressed_size, os.SEEK_SET)
+                compressed_blocks_info = handle.read(compressed_size)
+                data_start = blocks_info_start
+            else:
+                compressed_blocks_info = handle.read(compressed_size)
+                data_start = blocks_info_start + compressed_size
+
+            compression_flag = CompressionFlags(data_flags & 0x3F)
+            blocks_info_bytes = cast(
+                bytes,
+                CompressionHelper.DECOMPRESSION_MAP[compression_flag](
+                    compressed_blocks_info,
+                    uncompressed_size,
+                ),
+            )
+            if data_flags & 0x200:
+                data_start = _align_value(data_start, 16)
+
+            blocks_reader = UnityPy.streams.EndianBinaryReader(blocks_info_bytes)
+            blocks_reader.read_bytes(16)
+            block_count = blocks_reader.read_int()
+            blocks: list[JsonDict] = []
+            compressed_offset = 0
+            uncompressed_offset = 0
+            for _ in range(block_count):
+                block_uncompressed = int(blocks_reader.read_u_int())
+                block_compressed = int(blocks_reader.read_u_int())
+                block_flags = int(blocks_reader.read_u_short())
+                blocks.append(
+                    {
+                        "compressed_offset": compressed_offset,
+                        "compressed_size": block_compressed,
+                        "uncompressed_offset": uncompressed_offset,
+                        "uncompressed_size": block_uncompressed,
+                        "flags": block_flags,
+                    }
+                )
+                compressed_offset += block_compressed
+                uncompressed_offset += block_uncompressed
+
+            directory_count = blocks_reader.read_int()
+            directory_infos: list[JsonDict] = []
+            for _ in range(directory_count):
+                directory_infos.append(
+                    {
+                        "offset": int(blocks_reader.read_long()),
+                        "size": int(blocks_reader.read_long()),
+                        "flags": int(blocks_reader.read_u_int()),
+                        "path": blocks_reader.read_string_to_null(),
+                    }
+                )
+
+            return (
+                {
+                    "signature": signature,
+                    "version": version,
+                    "version_player": version_player,
+                    "version_engine": version_engine,
+                    "total_file_size": int(total_file_size),
+                    "data_flags": int(data_flags),
+                    "data_start": int(data_start),
+                    "blocks": blocks,
+                    "directory_infos": directory_infos,
+                    "bundle_data_size": int(uncompressed_offset),
+                },
+                None,
+            )
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _read_unityfs_range(
+    bundle_path: str,
+    structure: JsonDict,
+    offset: int,
+    size: int,
+) -> bytes:
+    blocks = cast(list[JsonDict], structure.get("blocks") or [])
+    data_start = int(structure.get("data_start") or 0)
+    range_start = int(offset)
+    range_end = range_start + int(size)
+    out = bytearray()
+    with open(bundle_path, "rb") as handle:
+        for block in blocks:
+            block_start = int(block["uncompressed_offset"])
+            block_end = block_start + int(block["uncompressed_size"])
+            if block_end <= range_start or block_start >= range_end:
+                continue
+            compression_flag = CompressionFlags(int(block["flags"]) & 0x3F)
+            local_start = max(range_start, block_start) - block_start
+            local_end = min(range_end, block_end) - block_start
+            slice_len = local_end - local_start
+            if slice_len <= 0:
+                continue
+            if compression_flag == CompressionFlags.NONE:
+                handle.seek(
+                    data_start + int(block["compressed_offset"]) + local_start,
+                    os.SEEK_SET,
+                )
+                out.extend(handle.read(slice_len))
+            else:
+                handle.seek(data_start + int(block["compressed_offset"]), os.SEEK_SET)
+                compressed_payload = handle.read(int(block["compressed_size"]))
+                decompressed_payload = cast(
+                    bytes,
+                    CompressionHelper.DECOMPRESSION_MAP[compression_flag](
+                        compressed_payload,
+                        int(block["uncompressed_size"]),
+                    ),
+                )
+                out.extend(decompressed_payload[local_start:local_end])
+            if len(out) >= size:
+                break
+    return bytes(out[:size])
+
+
+def _parse_serialized_header_info(
+    header_bytes: bytes,
+    entry_size: int,
+) -> tuple[JsonDict | None, str | None]:
+    if len(header_bytes) < 20:
+        return None, "serialized header too small"
+    metadata_size, file_size, version, data_offset = struct_module.unpack(
+        ">4I", header_bytes[:16]
+    )
+    if version < 9:
+        return None, f"unsupported serialized header version: {version}"
+    endian = ">" if header_bytes[16] else "<"
+    header_size = 20
+    if version >= 22:
+        if len(header_bytes) < 48:
+            return None, "v22 serialized header too small"
+        metadata_size = struct_module.unpack(">I", header_bytes[20:24])[0]
+        file_size = struct_module.unpack(">Q", header_bytes[24:32])[0]
+        data_offset = struct_module.unpack(">Q", header_bytes[32:40])[0]
+        header_size = 48
+    if metadata_size <= 0 or file_size <= 0 or data_offset <= 0:
+        return None, "serialized header has non-positive critical fields"
+    if file_size > entry_size:
+        return None, f"serialized file_size {file_size} exceeds entry size {entry_size}"
+    if data_offset > entry_size:
+        return None, f"serialized data_offset {data_offset} exceeds entry size {entry_size}"
+    return (
+        {
+            "metadata_size": int(metadata_size),
+            "file_size": int(file_size),
+            "version": int(version),
+            "data_offset": int(data_offset),
+            "endian": endian,
+            "header_size": header_size,
+        },
+        None,
+    )
+
+
+def _is_probable_serialized_entry(header_bytes: bytes, entry_size: int) -> bool:
+    info, _ = _parse_serialized_header_info(header_bytes, entry_size)
+    return info is not None
+
+
+def _parse_serialized_metadata_summary(
+    metadata_bytes: bytes,
+    entry_size: int,
+) -> tuple[JsonDict | None, str | None]:
+    header_info, reason = _parse_serialized_header_info(metadata_bytes[:48], entry_size)
+    if header_info is None:
+        return None, reason
+
+    version = int(header_info["version"])
+    endian = cast(str, header_info["endian"])
+    data_offset = int(header_info["data_offset"])
+    if len(metadata_bytes) < data_offset:
+        return None, f"metadata bytes truncated: need {data_offset}, got {len(metadata_bytes)}"
+
+    reader = UnityPy.streams.EndianBinaryReader(metadata_bytes, endian=endian)
+    reader.Position = int(header_info["header_size"])
+
+    unity_version = ""
+    if version >= 7:
+        unity_version = reader.read_string_to_null()
+    if version >= 8:
+        reader.read_int()
+    enable_type_tree = True
+    if version >= 13:
+        enable_type_tree = bool(reader.read_boolean())
+
+    type_count = int(reader.read_int())
+    if type_count < 0 or type_count > 100000:
+        return None, f"invalid type_count: {type_count}"
+
+    dummy_file = SimpleNamespace(
+        header=SimpleNamespace(version=version),
+        _enable_type_tree=enable_type_tree,
+    )
+    for _ in range(type_count):
+        SerializedType(reader, dummy_file, False)
+
+    if 7 <= version < 14:
+        reader.read_int()
+
+    object_count = int(reader.read_int())
+    if object_count <= 0:
+        return None, f"invalid object_count: {object_count}"
+
+    return (
+        {
+            "version": version,
+            "unity_version": unity_version,
+            "type_count": type_count,
+            "object_count": object_count,
+            "data_offset": data_offset,
+        },
+        None,
+    )
+
+
+def _structural_validate_unityfs_bundle(
+    bundle_path: str,
+    *,
+    inner_names: list[str] | None = None,
+) -> tuple[bool, str | None]:
+    structure, reason = _read_unityfs_structure(bundle_path)
+    if structure is None:
+        return False, reason
+
+    directory_infos = cast(list[JsonDict], structure.get("directory_infos") or [])
+    if not directory_infos:
+        return False, "bundle has no directory infos"
+
+    bundle_data_size = int(structure.get("bundle_data_size") or 0)
+    selected_paths = set(str(name) for name in (inner_names or []) if str(name).strip())
+    selected_entries = [
+        entry
+        for entry in directory_infos
+        if not selected_paths or str(entry.get("path")) in selected_paths
+    ]
+    if selected_paths and not selected_entries:
+        return False, f"validation targets not found: {sorted(selected_paths)}"
+
+    validated_serialized = 0
+    for entry in selected_entries:
+        entry_name = str(entry.get("path") or "")
+        entry_offset = int(entry.get("offset") or 0)
+        entry_size = int(entry.get("size") or 0)
+        if entry_size <= 0:
+            return False, f"entry has invalid size: {entry_name}"
+        if entry_offset < 0 or entry_offset + entry_size > bundle_data_size:
+            return False, f"entry range exceeds bundle data: {entry_name}"
+
+        header_sample = _read_unityfs_range(
+            bundle_path,
+            structure,
+            entry_offset,
+            min(entry_size, 64),
+        )
+        if not _is_probable_serialized_entry(header_sample, entry_size):
+            continue
+
+        header_info, header_reason = _parse_serialized_header_info(header_sample, entry_size)
+        if header_info is None:
+            return False, f"{entry_name}: {header_reason}"
+
+        metadata_span = int(header_info["data_offset"])
+        if metadata_span > _STRUCTURAL_VALIDATE_MAX_METADATA_BYTES:
+            return False, f"{entry_name}: metadata span too large ({metadata_span} bytes)"
+
+        metadata_bytes = _read_unityfs_range(
+            bundle_path,
+            structure,
+            entry_offset,
+            metadata_span,
+        )
+        metadata_summary, metadata_reason = _parse_serialized_metadata_summary(
+            metadata_bytes,
+            entry_size,
+        )
+        if metadata_summary is None:
+            return False, f"{entry_name}: {metadata_reason}"
+
+        validated_serialized += 1
+
+    if validated_serialized <= 0 and not selected_paths:
+        return False, "no serialized entries validated"
+
+    return True, None
+
+
+def _collect_validation_inner_names(env_file: Any) -> list[str]:
+    files = getattr(env_file, "files", None)
+    if not isinstance(files, dict):
+        return []
+    names = [
+        str(name)
+        for name, value in files.items()
+        if getattr(value, "is_changed", False)
+    ]
+    return sorted(set(names))
+
+
+def run_validation_worker(
+    bundle_path: str,
+    lang: Language = "ko",
+    inner_names: list[str] | None = None,
+) -> int:
+    """KR: 저장 검증 전용 워커입니다. 가능한 경우 경량 structural 검증을 수행합니다.
+    EN: Validation worker that prefers lightweight structural validation when possible.
     """
     try:
         if not os.path.exists(bundle_path):
@@ -6658,6 +8189,20 @@ def run_validation_worker(bundle_path: str, lang: Language = "ko") -> int:
                 _log_console("[validate] 검증 실패: 저장 파일이 존재하지 않습니다.")
             else:
                 _log_console("[validate] Validation failed: saved file does not exist.")
+            return 2
+
+        signature = _read_bundle_signature(bundle_path, BUNDLE_SIGNATURES)
+        if signature == "UnityFS":
+            ok, reason = _structural_validate_unityfs_bundle(
+                bundle_path,
+                inner_names=inner_names,
+            )
+            if ok:
+                return 0
+            if lang == "ko":
+                _log_console(f"[validate] structural 검증 실패: {reason}")
+            else:
+                _log_console(f"[validate] Structural validation failed: {reason}")
             return 2
 
         env = UnityPy.load(bundle_path)
@@ -6672,9 +8217,6 @@ def run_validation_worker(bundle_path: str, lang: Language = "ko") -> int:
                     "[validate] Validation failed: UnityPy.load returned no files."
                 )
             return 2
-
-        # KR: 실제 오브젝트가 없으면 저장 결과가 비정상일 가능성이 높습니다.
-        # EN: Empty object list usually indicates an invalid or incomplete save result.
         if not getattr(env, "objects", None):
             if lang == "ko":
                 _log_console("[validate] 검증 실패: 로드된 오브젝트가 없습니다.")
@@ -6683,7 +8225,6 @@ def run_validation_worker(bundle_path: str, lang: Language = "ko") -> int:
                     "[validate] Validation failed: loaded object list is empty."
                 )
             return 2
-
         return 0
     except Exception as e:
         if lang == "ko":
@@ -6760,9 +8301,15 @@ def main_cli(lang: Language = "ko") -> None:
         ttf_help = "TTF 폰트만 교체"
         list_help = "JSON 파일을 읽어서 폰트 교체"
         target_file_help = "지정한 파일명만 교체 대상에 포함 (여러 번 사용 가능)"
+        exclude_ext_help = (
+            "스캔 제외 확장자 목록 (콤마 구분, 예: \"resS,.resource\")"
+        )
         game_mat_help = "SDF 교체 시 게임 원본 Material 파라미터를 유지 (기본: 교체 Material 보정 적용)"
         force_raster_help = "SDF 교체 시 교체 폰트를 Raster 모드로 강제 (렌더 모드/Material 효과값 Raster 기준 적용)"
         game_line_metrics_help = "SDF 교체 시 게임 원본 줄 간격 메트릭 사용 (기본: 교체 폰트 메트릭 보정 적용)"
+        outline_ratio_help = (
+            "SDF 외곽선 비율 배율 (기본: 1.0, _OutlineWidth/_OutlineSoftness에 적용)"
+        )
         original_compress_help = (
             "저장 시 원본 압축 모드를 우선 사용 (기본: 무압축 계열 우선)"
         )
@@ -6800,9 +8347,15 @@ Examples:
         target_file_help = (
             "Limit replacement targets to specific file name(s) (repeatable)"
         )
+        exclude_ext_help = (
+            "Additional scan-excluded extensions (comma-separated, e.g. \"resS,.resource\")"
+        )
         game_mat_help = "Use original in-game Material parameters for SDF replacement (default: adjusted replacement material)"
         force_raster_help = "Force replacement fonts into Raster mode for SDF replacement (render mode/material effects follow Raster behavior)"
         game_line_metrics_help = "Use original in-game line metrics for SDF replacement (default: adjusted replacement font metrics)"
+        outline_ratio_help = (
+            "SDF outline ratio multiplier (default: 1.0, applied to _OutlineWidth/_OutlineSoftness)"
+        )
         original_compress_help = "Prefer original compression mode on save (default: uncompressed-family first)"
         temp_dir_help = "Root path for temporary save files (fast SSD/NVMe recommended)"
         output_only_help = "Keep originals untouched and write modified files only to this folder (preserve relative paths)"
@@ -6828,6 +8381,9 @@ Examples:
     parser.add_argument(
         "--target-file", action="append", metavar="FILE_NAME", help=target_file_help
     )
+    parser.add_argument(
+        "--exclude-ext", action="append", metavar="EXTS", help=exclude_ext_help
+    )
     parser.add_argument("--use-game-material", action="store_true", help=game_mat_help)
     parser.add_argument("--force-raster", action="store_true", help=force_raster_help)
     parser.add_argument("--use-game-mat", action="store_true", help=argparse.SUPPRESS)
@@ -6835,10 +8391,14 @@ Examples:
         "--use-game-line-metrics", action="store_true", help=game_line_metrics_help
     )
     parser.add_argument(
-        "--use-game-line-matrics", action="store_true", help=argparse.SUPPRESS
+        "--outline-ratio",
+        type=float,
+        default=1.0,
+        metavar="RATIO",
+        help=outline_ratio_help,
     )
     parser.add_argument(
-        "--material-scale-by-padding", action="store_true", help=argparse.SUPPRESS
+        "--use-game-line-matrics", action="store_true", help=argparse.SUPPRESS
     )
     parser.add_argument(
         "--original-compress", action="store_true", help=original_compress_help
@@ -6870,6 +8430,12 @@ Examples:
         "--_validate-bundle", type=str, metavar="BUNDLE_PATH", help=argparse.SUPPRESS
     )
     parser.add_argument(
+        "--_validate-inner-name",
+        action="append",
+        metavar="INNER_NAME",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--_scan-file-worker",
         type=str,
         metavar="ASSET_FILE_PATH",
@@ -6889,6 +8455,12 @@ Examples:
         args.list = strip_wrapping_quotes_repeated(args.list)
     if isinstance(args.output_only, str):
         args.output_only = strip_wrapping_quotes_repeated(args.output_only)
+    if isinstance(getattr(args, "exclude_ext", None), list):
+        args.exclude_ext = [
+            strip_wrapping_quotes_repeated(str(item))
+            for item in args.exclude_ext
+            if str(item).strip()
+        ]
 
     verbose_path: str | None = None
     if args.verbose:
@@ -6926,12 +8498,31 @@ Examples:
     args.preview_export = bool(
         getattr(args, "preview_export", False) or getattr(args, "preview", False)
     )
+    explicit_primary_modes = _selected_primary_modes(args)
+    if len(explicit_primary_modes) > 1:
+        joined = ", ".join(explicit_primary_modes)
+        if is_ko:
+            exit_with_error(
+                f"작업 모드 인자는 하나만 사용할 수 있습니다: {joined}",
+                lang=lang,
+            )
+        else:
+            exit_with_error(
+                f"Only one primary mode may be selected: {joined}",
+                lang=lang,
+            )
     selected_files = parse_target_files_arg(getattr(args, "target_file", None))
     if args.target_file and not selected_files:
         if is_ko:
             exit_with_error("--target-file 값이 비어 있습니다.", lang=lang)
         else:
             exit_with_error("--target-file values are empty.", lang=lang)
+    excluded_exts = parse_exclude_exts_arg(getattr(args, "exclude_ext", None))
+    if args.exclude_ext and not excluded_exts:
+        if is_ko:
+            exit_with_error("--exclude-ext 값이 비어 있습니다.", lang=lang)
+        else:
+            exit_with_error("--exclude-ext values are empty.", lang=lang)
 
     if args.split_save_force and args.oneshot_save_force:
         if is_ko:
@@ -6955,15 +8546,18 @@ Examples:
             exit_with_error(
                 "--scan-jobs must be an integer greater than or equal to 1.", lang=lang
             )
-    interactive_mode_requested = not any(
-        [
-            bool(args.parse),
-            bool(args.mulmaru),
-            bool(args.nanumgothic),
-            bool(args.list),
-            bool(args.preview_export),
-        ]
-    )
+    if args.outline_ratio <= 0:
+        if is_ko:
+            exit_with_error(
+                "--outline-ratio는 0보다 큰 실수여야 합니다.",
+                lang=lang,
+            )
+        else:
+            exit_with_error(
+                "--outline-ratio must be a float greater than 0.",
+                lang=lang,
+            )
+    interactive_mode_requested = len(explicit_primary_modes) == 0
     scan_jobs_explicit = any(
         arg == "--scan-jobs"
         or arg == "--max-workers"
@@ -7020,57 +8614,10 @@ Examples:
             os.path.join(args.temp_dir, "unity_font_replacer_temp")
         )
 
-    output_only_root: str | None = None
-    if args.output_only:
-        output_only_root = os.path.abspath(str(args.output_only))
-        try:
-            os.makedirs(output_only_root, exist_ok=True)
-        except Exception as e:
-            if is_ko:
-                exit_with_error(
-                    f"출력 폴더를 만들 수 없습니다: {output_only_root} ({e})", lang=lang
-                )
-            else:
-                exit_with_error(
-                    f"Failed to create output folder: {output_only_root} ({e})",
-                    lang=lang,
-                )
-        if is_ko:
-            _log_console(
-                f"출력 전용 모드: 수정 파일을 '{output_only_root}'에 저장합니다."
-            )
-        else:
-            _log_console(
-                f"Output-only mode: writing modified files to '{output_only_root}'."
-            )
-
+    output_only_root: str | None = (
+        os.path.abspath(str(args.output_only)) if args.output_only else None
+    )
     preview_root: str | None = None
-    if args.preview_export:
-        preview_root = os.path.join(get_script_dir(), "preview")
-        try:
-            os.makedirs(preview_root, exist_ok=True)
-        except Exception as e:
-            if is_ko:
-                exit_with_error(
-                    f"preview 폴더를 만들 수 없습니다: {preview_root} ({e})", lang=lang
-                )
-            else:
-                exit_with_error(
-                    f"Failed to create preview folder: {preview_root} ({e})", lang=lang
-                )
-        if is_ko:
-            _log_console(f"Preview 모드: '{preview_root}'에 미리보기를 저장합니다.")
-        else:
-            _log_console(f"Preview mode: saving previews to '{preview_root}'.")
-        if args.ps5_swizzle:
-            if is_ko:
-                _log_console(
-                    "  PS5 swizzle 활성화: preview를 unswizzle 기준으로 저장합니다."
-                )
-            else:
-                _log_console(
-                    "  PS5 swizzle enabled: saving previews in unswizzled view."
-                )
 
     if args.use_game_line_metrics:
         if is_ko:
@@ -7126,9 +8673,24 @@ Examples:
             _log_console("PS5 swizzle 모드: 비활성화")
         else:
             _log_console("PS5 swizzle mode: disabled")
+    if args.outline_ratio != 1.0:
+        if is_ko:
+            _log_console(
+                f"외곽선 비율 모드: Material _OutlineWidth/_OutlineSoftness에 x{args.outline_ratio:.3f} 배율을 적용합니다."
+            )
+        else:
+            _log_console(
+                f"Outline ratio mode: applying x{args.outline_ratio:.3f} to Material _OutlineWidth/_OutlineSoftness."
+            )
 
     if args._validate_bundle:
-        raise SystemExit(run_validation_worker(args._validate_bundle, lang=lang))
+        raise SystemExit(
+            run_validation_worker(
+                args._validate_bundle,
+                lang=lang,
+                inner_names=args._validate_inner_name,
+            )
+        )
 
     input_path = strip_wrapping_quotes_repeated(args.gamepath) if args.gamepath else ""
     _log_debug(f"[runtime] requested_gamepath={input_path!r}")
@@ -7177,78 +8739,6 @@ Examples:
         except FileNotFoundError as e:
             exit_with_error(str(e), lang=lang)
 
-    if interactive_mode_requested and not scan_jobs_explicit:
-        while True:
-            if is_ko:
-                entered_workers = input(
-                    f"스캔 워커 수를 입력하세요 (기본 {args.scan_jobs}): "
-                ).strip()
-            else:
-                entered_workers = input(
-                    f"Enter scan worker count (default {args.scan_jobs}): "
-                ).strip()
-            if not entered_workers:
-                break
-            try:
-                parsed_workers = int(entered_workers)
-            except (TypeError, ValueError):
-                if is_ko:
-                    _log_console("숫자를 입력해주세요. (1 이상의 정수)")
-                else:
-                    _log_console("Please enter a number. (integer >= 1)")
-                continue
-            if parsed_workers < 1:
-                if is_ko:
-                    _log_console("스캔 워커 수는 1 이상이어야 합니다.")
-                else:
-                    _log_console("Scan worker count must be >= 1.")
-                continue
-            args.scan_jobs = parsed_workers
-            break
-
-    compile_method = get_compile_method(data_path)
-    if is_ko:
-        _log_console(f"게임 경로: {game_path}")
-        _log_console(f"데이터 경로: {data_path}")
-        _log_console(f"컴파일 방식: {compile_method}")
-        _log_console(f"스캔 워커 수: {args.scan_jobs}")
-    else:
-        _log_console(f"Game path: {game_path}")
-        _log_console(f"Data path: {data_path}")
-        _log_console(f"Compile method: {compile_method}")
-        _log_console(f"Scan workers: {args.scan_jobs}")
-    _log_debug(
-        f"[runtime] input_path={input_path} game_path={game_path} data_path={data_path} "
-        f"compile_method={compile_method} scan_jobs={args.scan_jobs} "
-        f"ps5_swizzle={args.ps5_swizzle} preview_export={args.preview_export}"
-    )
-    detected_unity_version = get_unity_version(game_path, lang=lang)
-    _log_debug(f"[runtime] unity_version={detected_unity_version}")
-
-    if selected_files:
-        target_text = ", ".join(sorted(selected_files))
-        if is_ko:
-            _log_console(f"--target-file 적용: {target_text}")
-        else:
-            _log_console(f"Applied --target-file: {target_text}")
-        _log_debug(f"[runtime] target_files={target_text}")
-
-    default_temp_root = register_temp_dir_for_cleanup(os.path.join(data_path, "temp"))
-    if os.path.exists(default_temp_root):
-        shutil.rmtree(default_temp_root)
-
-    replace_ttf = not args.sdfonly
-    replace_sdf = not args.ttfonly
-    if args.sdfonly and args.ttfonly:
-        if is_ko:
-            exit_with_error(
-                "--sdfonly와 --ttfonly를 동시에 사용할 수 없습니다.", lang=lang
-            )
-        else:
-            exit_with_error(
-                "Cannot use --sdfonly and --ttfonly at the same time.", lang=lang
-            )
-
     replacements: dict[str, JsonDict] | None = None
     mode: str | None = None
     interactive_session = False
@@ -7271,9 +8761,10 @@ Examples:
                 _log_console("  2. JSON 파일로 폰트 교체")
                 _log_console("  3. Mulmaru(물마루체)로 일괄 교체")
                 _log_console("  4. NanumGothic(나눔고딕)으로 일괄 교체")
+                _log_console("  5. Preview export (Atlas/Glyph crop 추출)")
                 _log_console()
-                choice = input("선택 (1-4): ").strip()
-                if choice in {"1", "2", "3", "4"}:
+                choice = input("선택 (1-5): ").strip()
+                if choice in {"1", "2", "3", "4", "5"}:
                     break
                 _log_console("잘못된 선택입니다. 다시 입력해주세요.")
         else:
@@ -7283,9 +8774,10 @@ Examples:
                 _log_console("  2. Replace fonts using JSON")
                 _log_console("  3. Bulk replace with Mulmaru")
                 _log_console("  4. Bulk replace with NanumGothic")
+                _log_console("  5. Preview export (Atlas/Glyph crops)")
                 _log_console()
-                choice = input("Choose (1-4): ").strip()
-                if choice in {"1", "2", "3", "4"}:
+                choice = input("Choose (1-5): ").strip()
+                if choice in {"1", "2", "3", "4", "5"}:
                     break
                 _log_console("Invalid selection. Please try again.")
 
@@ -7316,6 +8808,155 @@ Examples:
             mode = "mulmaru"
         elif choice == "4":
             mode = "nanumgothic"
+        elif choice == "5":
+            mode = "preview_export"
+
+    args.preview_export = mode == "preview_export"
+
+    if output_only_root and mode == "preview_export":
+        if is_ko:
+            exit_with_error(
+                "--output-only는 --preview-export와 함께 사용할 수 없습니다.",
+                lang=lang,
+            )
+        else:
+            exit_with_error(
+                "--output-only cannot be used with --preview-export.",
+                lang=lang,
+            )
+
+    if output_only_root:
+        try:
+            os.makedirs(output_only_root, exist_ok=True)
+        except Exception as e:
+            if is_ko:
+                exit_with_error(
+                    f"출력 폴더를 만들 수 없습니다: {output_only_root} ({e})",
+                    lang=lang,
+                )
+            else:
+                exit_with_error(
+                    f"Failed to create output folder: {output_only_root} ({e})",
+                    lang=lang,
+                )
+        if is_ko:
+            _log_console(
+                f"출력 전용 모드: 수정 파일을 '{output_only_root}'에 저장합니다."
+            )
+        else:
+            _log_console(
+                f"Output-only mode: writing modified files to '{output_only_root}'."
+            )
+
+    if mode == "preview_export":
+        preview_root = os.path.join(get_script_dir(), "preview")
+        try:
+            os.makedirs(preview_root, exist_ok=True)
+        except Exception as e:
+            if is_ko:
+                exit_with_error(
+                    f"preview 폴더를 만들 수 없습니다: {preview_root} ({e})",
+                    lang=lang,
+                )
+            else:
+                exit_with_error(
+                    f"Failed to create preview folder: {preview_root} ({e})",
+                    lang=lang,
+                )
+        if is_ko:
+            _log_console(f"Preview 모드: '{preview_root}'에 미리보기를 저장합니다.")
+        else:
+            _log_console(f"Preview mode: saving previews to '{preview_root}'.")
+        if args.ps5_swizzle:
+            if is_ko:
+                _log_console(
+                    "  PS5 swizzle 활성화: preview를 unswizzle 기준으로 저장합니다."
+                )
+            else:
+                _log_console(
+                    "  PS5 swizzle enabled: saving previews in unswizzled view."
+                )
+
+    if interactive_mode_requested and not scan_jobs_explicit and _mode_uses_scan_jobs(mode):
+        while True:
+            if is_ko:
+                entered_workers = input(
+                    f"스캔 워커 수를 입력하세요 (기본 {args.scan_jobs}): "
+                ).strip()
+            else:
+                entered_workers = input(
+                    f"Enter scan worker count (default {args.scan_jobs}): "
+                ).strip()
+            if not entered_workers:
+                break
+            try:
+                parsed_workers = int(entered_workers)
+            except (TypeError, ValueError):
+                if is_ko:
+                    _log_console("숫자를 입력해주세요. (1 이상의 정수)")
+                else:
+                    _log_console("Please enter a number. (integer >= 1)")
+                continue
+            if parsed_workers < 1:
+                if is_ko:
+                    _log_console("스캔 워커 수는 1 이상이어야 합니다.")
+                else:
+                    _log_console("Scan worker count must be >= 1.")
+                continue
+            args.scan_jobs = parsed_workers
+            break
+
+    compile_method = get_compile_method(data_path)
+    detected_unity_version = get_unity_version(game_path, lang=lang)
+    default_temp_root = register_temp_dir_for_cleanup(os.path.join(data_path, "temp"))
+    if os.path.exists(default_temp_root):
+        shutil.rmtree(default_temp_root)
+
+    replace_ttf = not args.sdfonly
+    replace_sdf = not args.ttfonly
+    material_scale_by_padding = not args.use_game_material
+    if args.sdfonly and args.ttfonly:
+        if is_ko:
+            exit_with_error(
+                "--sdfonly와 --ttfonly를 동시에 사용할 수 없습니다.", lang=lang
+            )
+        else:
+            exit_with_error(
+                "Cannot use --sdfonly and --ttfonly at the same time.", lang=lang
+            )
+
+    if is_ko:
+        _log_console(f"게임 경로: {game_path}")
+        _log_console(f"데이터 경로: {data_path}")
+        _log_console(f"컴파일 방식: {compile_method}")
+        _log_console(f"스캔 워커 수: {args.scan_jobs}")
+    else:
+        _log_console(f"Game path: {game_path}")
+        _log_console(f"Data path: {data_path}")
+        _log_console(f"Compile method: {compile_method}")
+        _log_console(f"Scan workers: {args.scan_jobs}")
+    _log_debug(
+        f"[runtime] input_path={input_path} game_path={game_path} data_path={data_path} "
+        f"compile_method={compile_method} scan_jobs={args.scan_jobs} "
+        f"ps5_swizzle={args.ps5_swizzle} preview_export={args.preview_export}"
+    )
+    _log_debug(f"[runtime] unity_version={detected_unity_version}")
+
+    if selected_files:
+        target_text = ", ".join(sorted(selected_files))
+        if is_ko:
+            _log_console(f"--target-file 적용: {target_text}")
+        else:
+            _log_console(f"Applied --target-file: {target_text}")
+        _log_debug(f"[runtime] target_files={target_text}")
+    if excluded_exts:
+        excluded_text = ", ".join(sorted(excluded_exts))
+        if is_ko:
+            _log_console(f"--exclude-ext 적용: {excluded_text}")
+        else:
+            _log_console(f"Applied --exclude-ext: {excluded_text}")
+        _log_debug(f"[runtime] exclude_exts={excluded_text}")
+
     _log_debug(
         f"[runtime] mode={mode} interactive={interactive_session} "
         f"replace_ttf={replace_ttf} replace_sdf={replace_sdf}"
@@ -7399,13 +9040,11 @@ Examples:
             game_path,
             lang=lang,
             target_files=selected_files if selected_files else None,
+            exclude_exts=excluded_exts if excluded_exts else None,
             scan_jobs=args.scan_jobs,
             ps5_swizzle=args.ps5_swizzle,
         )
-        if is_ko:
-            input("\n엔터를 눌러 종료...")
-        else:
-            input("\nPress Enter to exit...")
+        _pause_before_exit(lang=lang, interactive_session=interactive_session)
         return
 
     if mode == "preview_export":
@@ -7420,6 +9059,7 @@ Examples:
         replacements = create_preview_export_targets(
             game_path,
             target_files=selected_files if selected_files else None,
+            exclude_exts=excluded_exts if excluded_exts else None,
             scan_jobs=args.scan_jobs,
             lang=lang,
             ps5_swizzle=args.ps5_swizzle,
@@ -7427,10 +9067,9 @@ Examples:
         if not replacements:
             if is_ko:
                 _log_console("Preview 대상 SDF 폰트를 찾지 못했습니다.")
-                input("\n엔터를 눌러 종료...")
             else:
                 _log_console("No SDF fonts found for preview export.")
-                input("\nPress Enter to exit...")
+            _pause_before_exit(lang=lang, interactive_session=interactive_session)
             return
         if is_ko:
             _log_console(f"Preview 대상 SDF 폰트: {len(replacements)}개")
@@ -7447,6 +9086,7 @@ Examples:
             replace_ttf,
             replace_sdf,
             target_files=selected_files if selected_files else None,
+            exclude_exts=excluded_exts if excluded_exts else None,
             scan_jobs=args.scan_jobs,
             lang=lang,
             ps5_swizzle=args.ps5_swizzle,
@@ -7468,6 +9108,7 @@ Examples:
             replace_ttf,
             replace_sdf,
             target_files=selected_files if selected_files else None,
+            exclude_exts=excluded_exts if excluded_exts else None,
             scan_jobs=args.scan_jobs,
             lang=lang,
             ps5_swizzle=args.ps5_swizzle,
@@ -7541,6 +9182,9 @@ Examples:
                     lang=lang,
                 )
 
+    if mode != "preview_export":
+        _ensure_custom_unitypy_streaming_save(lang=lang)
+
     unity_version = detected_unity_version
     generator = _create_generator(
         unity_version, game_path, data_path, compile_method, lang=lang
@@ -7563,32 +9207,83 @@ Examples:
         f"[runtime] process_files={len(process_files)} "
         f"preview_only_files={len(preview_files_to_process)}"
     )
-    assets_files = find_assets_files(
+    all_assets_files = find_assets_files(
         game_path,
         lang=lang,
-        target_files=process_files if process_files else None,
+        exclude_exts=excluded_exts if excluded_exts else None,
     )
-    _log_debug(f"[runtime] matched_asset_files={len(assets_files)}")
+    asset_file_index = _build_asset_file_index(all_assets_files, data_path)
+    asset_path_by_key = cast(dict[str, str], asset_file_index.get("path_by_key", {}))
+    basename_by_key = cast(dict[str, str], asset_file_index.get("basename_by_key", {}))
+    basename_to_keys = cast(
+        dict[str, list[str]],
+        asset_file_index.get("basename_to_keys", {}),
+    )
+    duplicate_asset_names: dict[str, list[str]] = {
+        basename: [asset_path_by_key[key] for key in keys if key in asset_path_by_key]
+        for basename, keys in basename_to_keys.items()
+        if len(keys) > 1
+    }
+    if duplicate_asset_names:
+        for duplicate_name, duplicate_paths in sorted(duplicate_asset_names.items()):
+            _log_warning(
+                f"[runtime] duplicate_asset_basename={duplicate_name} "
+                f"count={len(duplicate_paths)} paths={duplicate_paths}"
+            )
+    asset_file_queue: list[str] = [
+        asset_key
+        for asset_key, asset_path in asset_path_by_key.items()
+        if os.path.basename(asset_path) in process_files
+    ]
+    _log_debug(
+        f"[runtime] matched_asset_files={len(asset_file_queue)} all_candidates={len(all_assets_files)}"
+    )
+    if output_only_root and mode != "preview_export":
+        prepare_output_only_dependencies(data_path, output_only_root, lang=lang)
 
+    deferred_texture_plans: dict[str, dict[str, Any]] = {}
+    deferred_material_plans: dict[str, dict[str, Any]] = {}
+    deferred_material_atlas_plans: dict[str, dict[str, Any]] = {}
+    pending_external_patch_files: set[str] = set()
+    pending_queue_keys: set[str] = set(asset_file_queue)
+    prepared_output_targets: set[str] = set()
     modified_count = 0
-    for assets_file in assets_files:
+    queue_index = 0
+    while queue_index < len(asset_file_queue):
+        asset_file_key = asset_file_queue[queue_index]
+        queue_index += 1
+        pending_queue_keys.discard(asset_file_key)
+        assets_file = asset_path_by_key.get(asset_file_key)
+        if not assets_file:
+            _log_warning(f"[runtime] queued file not found: {asset_file_key}")
+            continue
         fn = os.path.basename(assets_file)
-        if fn in process_files:
-            working_assets_file = assets_file
-            if output_only_root and mode != "preview_export":
-                working_assets_file = resolve_output_only_path(
-                    assets_file, data_path, output_only_root
-                )
-                working_dir = os.path.dirname(working_assets_file)
-                if working_dir and not os.path.exists(working_dir):
-                    os.makedirs(working_dir, exist_ok=True)
+        working_assets_file = assets_file
+        if output_only_root and mode != "preview_export":
+            working_assets_file = resolve_output_only_path(
+                assets_file, data_path, output_only_root
+            )
+            working_dir = os.path.dirname(working_assets_file)
+            if working_dir and not os.path.exists(working_dir):
+                os.makedirs(working_dir, exist_ok=True)
+            working_assets_key = (
+                _normalize_asset_file_key(working_assets_file) or working_assets_file
+            )
+            if working_assets_key not in prepared_output_targets:
                 shutil.copy2(assets_file, working_assets_file)
+                prepared_output_targets.add(working_assets_key)
                 if is_ko:
                     rel_out = os.path.relpath(working_assets_file, output_only_root)
                     _log_console(f"  출력 대상 준비: {rel_out}")
                 else:
                     rel_out = os.path.relpath(working_assets_file, output_only_root)
                     _log_console(f"  Prepared output target: {rel_out}")
+        if (
+            fn in process_files
+            or asset_file_key in deferred_texture_plans
+            or asset_file_key in deferred_material_plans
+            or asset_file_key in deferred_material_atlas_plans
+        ):
             if is_ko:
                 _log_console(f"\n처리 중: {fn}")
             else:
@@ -7654,7 +9349,8 @@ Examples:
                             use_game_mat=args.use_game_material,
                             force_raster=args.force_raster,
                             use_game_line_metrics=args.use_game_line_metrics,
-                            material_scale_by_padding=not args.use_game_material,
+                            material_scale_by_padding=material_scale_by_padding,
+                            outline_ratio=args.outline_ratio,
                             prefer_original_compress=args.original_compress,
                             temp_root_dir=args.temp_dir,
                             generator=generator,
@@ -7662,6 +9358,11 @@ Examples:
                             ps5_swizzle=args.ps5_swizzle,
                             preview_export=args.preview_export,
                             preview_root=preview_root,
+                            asset_file_index=asset_file_index,
+                            deferred_texture_plans=deferred_texture_plans,
+                            deferred_material_plans=deferred_material_plans,
+                            deferred_material_atlas_plans=deferred_material_atlas_plans,
+                            pending_external_patch_files=pending_external_patch_files,
                             lang=lang,
                         )
                     except MemoryError as e:
@@ -7686,6 +9387,8 @@ Examples:
                 if one_shot_ok:
                     file_modified = True
                 else:
+                    auto_split_profile: JsonDict | None = None
+                    suggested_sdf_batch_size = 0
                     split_stopped = False
                     if replace_ttf and file_ttf_replacements:
                         file_ttf_lookup, _ = build_replacement_lookup(
@@ -7702,7 +9405,8 @@ Examples:
                                 use_game_mat=args.use_game_material,
                                 force_raster=args.force_raster,
                                 use_game_line_metrics=args.use_game_line_metrics,
-                                material_scale_by_padding=not args.use_game_material,
+                                material_scale_by_padding=material_scale_by_padding,
+                                outline_ratio=args.outline_ratio,
                                 prefer_original_compress=args.original_compress,
                                 temp_root_dir=args.temp_dir,
                                 generator=generator,
@@ -7710,6 +9414,11 @@ Examples:
                                 ps5_swizzle=args.ps5_swizzle,
                                 preview_export=args.preview_export,
                                 preview_root=preview_root,
+                                asset_file_index=asset_file_index,
+                                deferred_texture_plans=deferred_texture_plans,
+                                deferred_material_plans=deferred_material_plans,
+                                deferred_material_atlas_plans=deferred_material_atlas_plans,
+                                pending_external_patch_files=pending_external_patch_files,
                                 lang=lang,
                             ):
                                 file_modified = True
@@ -7725,11 +9434,51 @@ Examples:
                             split_stopped = True
 
                     if replace_sdf and not split_stopped:
+                        if not args.split_save_force:
+                            auto_split_profile = _estimate_sdf_texture_batch_profile(
+                                file_sdf_replacements,
+                                force_raster=args.force_raster,
+                            )
+                            suggested_sdf_batch_size = int(
+                                auto_split_profile.get("suggested_batch_size", 0) or 0
+                            )
+                            estimated_texture_bytes = int(
+                                auto_split_profile.get("estimated_total_bytes", 0)
+                                or 0
+                            )
+                            estimated_texture_targets = int(
+                                auto_split_profile.get("estimated_target_count", 0)
+                                or 0
+                            )
+                            if estimated_texture_bytes > 0:
+                                _log_debug(
+                                    f"[split_save_estimate] file={fn} targets={estimated_texture_targets} "
+                                    f"estimated_total={estimated_texture_bytes} "
+                                    f"suggested_batch_size={suggested_sdf_batch_size}"
+                                )
+                                if suggested_sdf_batch_size > 0:
+                                    if is_ko:
+                                        _log_console(
+                                            "  one-shot 실패 후 적응형 분할 저장 초기 배치를 "
+                                            f"{suggested_sdf_batch_size}로 시작합니다 "
+                                            f"(예상 texture payload: {_format_byte_size(estimated_texture_bytes)})."
+                                        )
+                                    else:
+                                        _log_console(
+                                            "  One-shot failed; starting adaptive split save with "
+                                            f"initial batch {suggested_sdf_batch_size} "
+                                            f"(estimated texture payload: {_format_byte_size(estimated_texture_bytes)})."
+                                        )
                         sdf_items = list(file_sdf_replacements.items())
                         sdf_total = len(sdf_items)
                         if sdf_total > 0:
                             if args.split_save_force:
                                 batch_size = 1
+                            elif suggested_sdf_batch_size > 0:
+                                batch_size = min(
+                                    sdf_total,
+                                    max(1, suggested_sdf_batch_size),
+                                )
                             else:
                                 batch_size = min(sdf_total, max(1, sdf_total // 2))
 
@@ -7750,7 +9499,8 @@ Examples:
                                         use_game_mat=args.use_game_material,
                                         force_raster=args.force_raster,
                                         use_game_line_metrics=args.use_game_line_metrics,
-                                        material_scale_by_padding=not args.use_game_material,
+                                        material_scale_by_padding=material_scale_by_padding,
+                                        outline_ratio=args.outline_ratio,
                                         prefer_original_compress=args.original_compress,
                                         temp_root_dir=args.temp_dir,
                                         generator=generator,
@@ -7758,6 +9508,11 @@ Examples:
                                         ps5_swizzle=args.ps5_swizzle,
                                         preview_export=args.preview_export,
                                         preview_root=preview_root,
+                                        asset_file_index=asset_file_index,
+                                        deferred_texture_plans=deferred_texture_plans,
+                                        deferred_material_plans=deferred_material_plans,
+                                        deferred_material_atlas_plans=deferred_material_atlas_plans,
+                                        pending_external_patch_files=pending_external_patch_files,
                                         lang=lang,
                                     )
                                 except Exception as e:
@@ -7774,6 +9529,7 @@ Examples:
                                 if ok:
                                     file_modified = True
                                     idx += current_batch
+                                    gc.collect()
                                     if idx < sdf_total:
                                         if args.split_save_force:
                                             if is_ko:
@@ -7857,7 +9613,8 @@ Examples:
                         use_game_mat=args.use_game_material,
                         force_raster=args.force_raster,
                         use_game_line_metrics=args.use_game_line_metrics,
-                        material_scale_by_padding=not args.use_game_material,
+                        material_scale_by_padding=material_scale_by_padding,
+                        outline_ratio=args.outline_ratio,
                         prefer_original_compress=args.original_compress,
                         temp_root_dir=args.temp_dir,
                         generator=generator,
@@ -7865,6 +9622,11 @@ Examples:
                         ps5_swizzle=args.ps5_swizzle,
                         preview_export=args.preview_export,
                         preview_root=preview_root,
+                        asset_file_index=asset_file_index,
+                        deferred_texture_plans=deferred_texture_plans,
+                        deferred_material_plans=deferred_material_plans,
+                        deferred_material_atlas_plans=deferred_material_atlas_plans,
+                        pending_external_patch_files=pending_external_patch_files,
                         lang=lang,
                     ):
                         file_modified = True
@@ -7878,25 +9640,51 @@ Examples:
 
             if file_modified:
                 modified_count += 1
+                _cleanup_deferred_patch_bucket(
+                    deferred_texture_plans.pop(asset_file_key, None)
+                )
+                _cleanup_deferred_patch_bucket(
+                    deferred_material_plans.pop(asset_file_key, None)
+                )
+                _cleanup_deferred_patch_bucket(
+                    deferred_material_atlas_plans.pop(asset_file_key, None)
+                )
+
+        if pending_external_patch_files:
+            queued_from_external = sorted(pending_external_patch_files)
+            pending_external_patch_files.clear()
+            for pending_key in queued_from_external:
+                pending_path = asset_path_by_key.get(pending_key)
+                if not pending_path:
+                    _log_warning(
+                        f"[runtime] deferred target file not found: {pending_key}"
+                    )
+                    continue
+                if pending_key in pending_queue_keys:
+                    continue
+                asset_file_queue.append(pending_key)
+                pending_queue_keys.add(pending_key)
+                _log_debug(
+                    f"[runtime] queued_deferred_patch_file={pending_path} "
+                    f"queue_size={len(asset_file_queue)}"
+                )
 
     if mode == "preview_export":
         if is_ko:
             _log_console(
                 f"\n완료! preview export 처리 파일: {len(process_files)}개 (원본 수정 없음)"
             )
-            input("\n엔터를 눌러 종료...")
         else:
             _log_console(
                 f"\nDone! Preview-export processed {len(process_files)} file(s) (no source modifications)."
             )
-            input("\nPress Enter to exit...")
+        _pause_before_exit(lang=lang, interactive_session=interactive_session)
     else:
         if is_ko:
             _log_console(f"\n완료! {modified_count}개의 파일이 수정되었습니다.")
-            input("\n엔터를 눌러 종료...")
         else:
             _log_console(f"\nDone! Modified {modified_count} file(s).")
-            input("\nPress Enter to exit...")
+        _pause_before_exit(lang=lang, interactive_session=interactive_session)
 
 
 def main() -> None:
@@ -7921,7 +9709,7 @@ def run_main_ko() -> None:
         main()
     except Exception as e:
         _log_exception(f"\n예상치 못한 오류가 발생했습니다: {e}")
-        input("\n엔터를 눌러 종료...")
+        _pause_before_exit(lang="ko", interactive_session=False)
         sys.exit(1)
     finally:
         logging.shutdown()
@@ -7936,7 +9724,7 @@ def run_main_en() -> None:
         main_en()
     except Exception as e:
         _log_exception(f"\nAn unexpected error occurred: {e}")
-        input("\nPress Enter to exit...")
+        _pause_before_exit(lang="en", interactive_session=False)
         sys.exit(1)
     finally:
         logging.shutdown()
@@ -7948,5 +9736,5 @@ if __name__ == "__main__":
         run_main_ko()
     except Exception as e:
         _log_exception(f"\n예상치 못한 오류가 발생했습니다: {e}")
-        input("\n엔터를 눌러 종료...")
+        _pause_before_exit(lang="ko", interactive_session=False)
         sys.exit(1)
