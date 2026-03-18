@@ -4506,6 +4506,7 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
         outline_ratio = 1.0
     if outline_ratio <= 0:
         outline_ratio = 1.0
+    outline_fallback_used = False
     prune_raster_material = bool(mat_info.get("prune_raster_material", False))
     preserve_gradient_floor = bool(mat_info.get("preserve_gradient_floor", False))
     gradient_scale = mat_info.get("gs")
@@ -4563,16 +4564,27 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                         changed = True
                 elif prop_name in _MATERIAL_OUTLINE_RATIO_KEYS:
                     candidate: float | None = None
+                    existing_value: float | None = None
+                    try:
+                        existing_value = float(entry[1])
+                    except Exception:
+                        existing_value = None
                     if prop_name in float_overrides:
                         try:
                             candidate = float(float_overrides[prop_name])
                         except Exception:
                             candidate = None
+                        if (
+                            outline_ratio != 1.0
+                            and candidate is not None
+                            and abs(candidate) <= 1e-9
+                            and existing_value is not None
+                            and abs(existing_value) > 1e-9
+                        ):
+                            candidate = existing_value
+                            outline_fallback_used = True
                     elif outline_ratio != 1.0:
-                        try:
-                            candidate = float(entry[1])
-                        except Exception:
-                            candidate = None
+                        candidate = existing_value
                     if candidate is not None:
                         float_props[i] = (prop_name, float(candidate * outline_ratio))
                         changed = True
@@ -4602,6 +4614,11 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
             if gradient_scale is not None and not has_gradient_scale:
                 float_props.append(("_GradientScale", float(gradient_scale)))
                 changed = True
+            if outline_fallback_used:
+                logger.debug(
+                    "outline_ratio used original material baseline because replacement outline values were zero: %s",
+                    mat_info.get("source_entry", ""),
+                )
 
         color_props = getattr(saved_props, "m_Colors", None)
         if isinstance(color_props, list) and color_overrides:
