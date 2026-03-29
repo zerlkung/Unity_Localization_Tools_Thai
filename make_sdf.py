@@ -204,7 +204,14 @@ def _render_glyph_bitmap(font: ImageFont.FreeTypeFont, unicode_value: int) -> An
     if np is None:
         raise RuntimeError("numpy is required for SDF generation.")
 
-    mask = font.getmask(chr(unicode_value), mode="L")
+    try:
+        mask = font.getmask(chr(unicode_value), mode="L")
+    except OSError:
+        # Some glyphs have metrics but no bitmap (e.g. certain CJK fonts with
+        # missing outlines for specific code points).  Return an empty bitmap
+        # so the caller can still place an empty tile in the atlas.
+        return np.zeros((0, 0), dtype=np.uint8)
+
     mask_w, mask_h = mask.size
     if mask_w <= 0 or mask_h <= 0:
         return np.zeros((0, 0), dtype=np.uint8)

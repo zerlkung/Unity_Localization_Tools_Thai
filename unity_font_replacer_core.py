@@ -1808,6 +1808,7 @@ def get_unity_version(game_path: str, lang: Language = "ko") -> str:
         except Exception:
             continue
         finally:
+            close_unitypy_env(env)
             env = None
             gc.collect()
 
@@ -2019,10 +2020,28 @@ atexit.register(cleanup_registered_temp_dirs)
 
 def _close_unitypy_reader(obj: Any) -> None:
     """KR: UnityPy 내부 reader/object를 안전하게 dispose합니다.
+    KR: BundleFile의 mmap/temp 파일과 SerializedFile의 spill store도 정리합니다.
     EN: Safely dispose UnityPy internal reader/object resources.
+    EN: Also cleans up BundleFile mmap/temp files and SerializedFile spill stores.
     """
     if obj is None:
         return
+    # KR: BundleFile의 mmap/temp 블록 저장소 정리
+    # EN: Clean up BundleFile mmap/temp block storage
+    cleanup_fn = getattr(obj, "_cleanup_temp_blocks_storage", None)
+    if callable(cleanup_fn):
+        try:
+            cleanup_fn()
+        except Exception:
+            pass
+    # KR: SerializedFile의 spill store (temp 파일) 정리
+    # EN: Clean up SerializedFile spill store (temp file)
+    close_fn = getattr(obj, "close", None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception:
+            pass
     reader = getattr(obj, "reader", None)
     if reader is not None and hasattr(reader, "dispose"):
         try:
@@ -3280,14 +3299,14 @@ def apply_ps5_swizzle_to_image(
     prepared = _ps5_prepare_image(image)
     bytes_per_element = len(prepared.getbands())
     if not _ps5_dimensions_supported(prepared.width, prepared.height, bytes_per_element):
-        return prepared.copy()
+        return prepared
     # KR: 전치 bpe (예: Alpha8)에만 역방향 회전을 적용합니다.
     # EN: Only apply inverse rotation for transposing bpe (e.g. Alpha8).
     should_transpose = _PS5_AXIS_TRANSPOSE.get(bytes_per_element, False)
     if should_transpose and rotate % 360 != 0:
         prepared = prepared.rotate((-rotate) % 360, expand=True)
     if not _ps5_dimensions_supported(prepared.width, prepared.height, bytes_per_element):
-        return _ps5_prepare_image(image).copy()
+        return _ps5_prepare_image(image)
 
     data = prepared.tobytes()
     swizzled = ps5_swizzle_bytes(
@@ -3317,7 +3336,7 @@ def apply_ps5_unswizzle_to_image(
     prepared = _ps5_prepare_image(image)
     bytes_per_element = len(prepared.getbands())
     if not _ps5_dimensions_supported(prepared.width, prepared.height, bytes_per_element):
-        return prepared.copy()
+        return prepared
     data = prepared.tobytes()
     unswizzled, out_width, out_height, variant, _ = _ps5_unswizzle_best_variant(
         data,
@@ -3330,7 +3349,7 @@ def apply_ps5_unswizzle_to_image(
         roughness_guard=roughness_guard,
     )
     if variant == "already_linear":
-        return prepared.copy()
+        return prepared
     output = Image.frombytes(prepared.mode, (out_width, out_height), unswizzled)
     # KR: rotate는 축-스왑(전치) 된 경우에만 적용 (예: Alpha8).
     # EN: Only apply rotation when axes were swapped (transposing bpe).
@@ -4233,8 +4252,9 @@ def _load_spilled_plan_image(
     image_path = str(payload.get(path_key, "")).strip()
     if not image_path or not os.path.exists(image_path):
         return None
-    with Image.open(image_path) as loaded_image:
-        return loaded_image.copy()
+    loaded_image = Image.open(image_path)
+    loaded_image.load()
+    return loaded_image
 
 
 def _cleanup_deferred_patch_bucket(bucket: dict[str, Any] | None) -> None:
@@ -6422,7 +6442,8 @@ def replace_fonts_in_file(
                 assets = load_font_assets(replacement_font)
                 if assets["ttf_data"]:
                     font = obj.parse_as_object()
-                    current_ttf_data = bytes(getattr(font, "m_FontData", b""))
+                    _raw_font_data = getattr(font, "m_FontData", b"")
+                    current_ttf_data = _raw_font_data if isinstance(_raw_font_data, bytes) else bytes(_raw_font_data)
                     if current_ttf_data == assets["ttf_data"]:
                         _log_debug(
                             f"[replace_ttf] file={fn_without_path} assets={assets_name} path_id={font_pathid} "
@@ -7485,6 +7506,7 @@ def replace_fonts_in_file(
                     parse_dict.image = replacement_image
                 parse_dict.save()
                 modified = True
+                parse_dict = None
         if obj.type.name == "Material":
             parse_dict = None
             material_key = _make_assets_object_key(assets_name, int(obj.path_id))

@@ -17,6 +17,28 @@ from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 logger = logging.getLogger(__name__)
 
 
+def _close_env(environment: Any) -> None:
+    """Best-effort cleanup of UnityPy environment resources (mmap, temp files)."""
+    if environment is None:
+        return
+    stack: list[Any] = []
+    files = getattr(environment, "files", None)
+    if isinstance(files, dict):
+        stack.extend(files.values())
+    while stack:
+        item = stack.pop()
+        for attr in ("_cleanup_temp_blocks_storage", "close"):
+            fn = getattr(item, attr, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+        sub_files = getattr(item, "files", None)
+        if isinstance(sub_files, dict):
+            stack.extend(sub_files.values())
+
+
 Language = Literal["ko", "en"]
 JsonDict = dict[str, Any]
 _TMP_OLD_ONLY_LAST = (2018, 3, 14)
@@ -1026,6 +1048,8 @@ def export_fonts(
                         f"Warning: TMP parse failed (file: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}"
                     )
 
+        _close_env(env)
+
     unresolved_texture_targets = {
         outer_key: dict(bucket)
         for outer_key, bucket in texture_targets_by_outer.items()
@@ -1115,6 +1139,8 @@ def export_fonts(
                     _log_console(
                         f"Warning: export error (file: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}"
                     )
+
+        _close_env(env)
 
         if texture_bucket is not None and not texture_bucket:
             unresolved_texture_targets.pop(outer_key, None)
