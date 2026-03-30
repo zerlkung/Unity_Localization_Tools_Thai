@@ -4567,6 +4567,7 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
         style_padding_scale_ratio = 1.0
     prune_raster_material = bool(mat_info.get("prune_raster_material", False))
     preserve_gradient_floor = bool(mat_info.get("preserve_gradient_floor", False))
+    replacement_padding = float(mat_info.get("replacement_padding", 0) or 0)
     gradient_scale = mat_info.get("gs")
     texture_h_raw = mat_info.get("h")
     texture_w_raw = mat_info.get("w")
@@ -4619,13 +4620,10 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                         except Exception:
                             candidate = None
                     if candidate is not None:
-                        if preserve_gradient_floor:
-                            try:
-                                existing = float(entry[1])
-                                if candidate < existing:
-                                    candidate = existing
-                            except Exception:
-                                pass
+                        # KR: _GradientScale은 교체 아틀라스의 padding 기반 값을 강제 적용합니다.
+                        # KR: preserve_gradient_floor 로직은 교체 아틀라스와 불일치를 유발하므로 제거되었습니다.
+                        # EN: _GradientScale must match the replacement atlas padding.
+                        # EN: preserve_gradient_floor was removed as it causes atlas mismatch.
                         float_props[i] = ("_GradientScale", candidate)
                         has_gradient_scale = True
                         changed = True
@@ -4710,16 +4708,18 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                     if candidate is not None:
                         float_props[i] = (prop_name, float(candidate * outline_ratio))
                         changed = True
-                elif prop_name in float_overrides:
-                    float_props[i] = (prop_name, float(float_overrides[prop_name]))
-                    changed = True
                 elif prop_name == "_TextureHeight" and texture_h is not None:
+                    # KR: _TextureHeight는 실제 아틀라스 크기가 float_overrides보다 우선합니다.
+                    # EN: _TextureHeight uses actual atlas size, overriding float_overrides.
                     float_props[i] = ("_TextureHeight", texture_h)
                     has_texture_height = True
                     changed = True
                 elif prop_name == "_TextureWidth" and texture_w is not None:
                     float_props[i] = ("_TextureWidth", texture_w)
                     has_texture_width = True
+                    changed = True
+                elif prop_name in float_overrides:
+                    float_props[i] = (prop_name, float(float_overrides[prop_name]))
                     changed = True
                 if prop_name == "_TextureHeight":
                     has_texture_height = True
@@ -4736,6 +4736,28 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
             if gradient_scale is not None and not has_gradient_scale:
                 float_props.append(("_GradientScale", float(gradient_scale)))
                 changed = True
+
+            # KR: _ScaleRatioA를 교체 아틀라스의 padding/GradientScale로 재계산합니다.
+            # KR: TMP에서 ScaleRatioA = padding / GradientScale이며, 이 값이 불일치하면 외곽선/그림자 크기가 틀어집니다.
+            # EN: Recalculate _ScaleRatioA = replacement_padding / GradientScale.
+            # EN: TMP uses this ratio for outline/shadow sizing; mismatch causes visual artifacts.
+            if replacement_padding > 0:
+                final_gs = None
+                for _fp in float_props:
+                    if isinstance(_fp, (list, tuple)) and len(_fp) >= 2 and _fp[0] == "_GradientScale":
+                        try:
+                            final_gs = float(_fp[1])
+                        except Exception:
+                            pass
+                        break
+                if final_gs and final_gs > 0:
+                    new_scale_ratio_a = replacement_padding / final_gs
+                    for k, fp in enumerate(float_props):
+                        if isinstance(fp, (list, tuple)) and len(fp) >= 2 and fp[0] == "_ScaleRatioA":
+                            float_props[k] = ("_ScaleRatioA", float(new_scale_ratio_a))
+                            changed = True
+                            break
+
             if outline_fallback_used:
                 logger.debug(
                     "outline_ratio used original material baseline because replacement outline values were zero: %s",
@@ -6381,50 +6403,102 @@ def _binary_patch_texture2d(
             except Exception:
                 continue
 
-    if stream_path_marker is None:
-        # KR: 스트리밍 경로를 찾을 수 없으면 바이너리 패치 불가
-        # EN: Cannot locate stream path — binary patch not possible
-        return False
-
-    path_len_pos, path_len, path_str_start = stream_path_marker
-    stream_size_pos = path_len_pos - 4
-    stream_offset_pos = stream_size_pos - 8
-    image_data_size_pos = stream_offset_pos - 4
-
-    if image_data_size_pos < 0:
-        return False
-
-    # KR: Part 1 — image_data 이전의 모든 바이트 (메타데이터)
-    # EN: Part 1 — all bytes before image_data (metadata fields)
-    part1 = bytearray(original_raw[:image_data_size_pos])
-
-    # KR: m_Width/m_Height 패치 (원본 값을 찾아서 교체)
-    # EN: Patch m_Width/m_Height by finding original values
-    # 원본 Texture2D의 width/height를 읽어서 위치를 특정
-    # m_Width와 m_Height는 연속된 int32 (little-endian)
-    orig_w_bytes = None
+    # KR: TypeTree로 파싱하여 image data 위치와 trailing bytes를 정확히 파악합니다.
+    # EN: Use TypeTree parse to accurately locate image data and trailing bytes.
     try:
         d_temp = obj.read_typetree(check_read=False)
         orig_w = int(d_temp.get("m_Width", 0))
         orig_h = int(d_temp.get("m_Height", 0))
-        if orig_w > 0 and orig_h > 0:
-            orig_w_bytes = _struct.pack("<i", orig_w)
-            # m_Width/m_Height 위치 검색
-            search_pattern = _struct.pack("<ii", orig_w, orig_h)
-            wh_pos = bytes(part1).find(search_pattern)
-            if wh_pos >= 0:
-                _struct.pack_into("<i", part1, wh_pos, width)
-                _struct.pack_into("<i", part1, wh_pos + 4, height)
-
-        # m_CompleteImageSize 패치
         orig_cis = int(d_temp.get("m_CompleteImageSize", 0))
-        if orig_cis > 0:
-            cis_bytes = _struct.pack("<I", orig_cis)
-            cis_pos = bytes(part1).find(cis_bytes)
-            if cis_pos >= 0:
-                _struct.pack_into("<I", part1, cis_pos, len(image_data))
+        orig_img_data = d_temp.get("image data", b"")
+        orig_img_len = len(orig_img_data) if isinstance(orig_img_data, (bytes, bytearray, memoryview)) else 0
+    except Exception:
+        return False
+
+    if stream_path_marker is not None:
+        # KR: 스트리밍 모드 — 경로 문자열 기준으로 필드 위치를 역추적합니다.
+        # EN: Streaming mode — locate fields by stream path string position.
+        path_len_pos, path_len, path_str_start = stream_path_marker
+        stream_size_pos = path_len_pos - 4
+        stream_offset_pos = stream_size_pos - 8
+        image_data_size_pos = stream_offset_pos - 4
+        orig_stream_end = path_str_start + path_len
+        orig_stream_end += (4 - orig_stream_end % 4) % 4
+    else:
+        # KR: 이미 인라인 모드 (이전 교체로 .resS 참조가 제거됨) —
+        # KR: raw 끝에서 trailing + empty StreamData + image data 역순으로 위치를 계산합니다.
+        # EN: Already inline mode (stream path removed by previous patch) —
+        # EN: Calculate positions backwards from raw end: trailing + empty StreamData + image data.
+        #
+        # Layout (inline, empty StreamData):
+        #   ... metadata ...
+        #   int image_data_size
+        #   byte[] image_data (+ align to 4)
+        #   uint64 stream_offset = 0
+        #   uint32 stream_size = 0
+        #   int path_len = 0
+        #   (align to 4)
+        #   [trailing bytes]
+        #
+        # StreamData (empty) = 8 + 4 + 4 = 16 bytes (already aligned)
+        # Image data block = 4 (size int) + orig_img_len + align
+
+        # TypeTree가 읽은 바이트 수를 계산합니다
+        obj.reset()
+        pos0 = obj.reader.Position
+        obj.read_typetree(check_read=False)
+        pos1 = obj.reader.Position
+        typetree_bytes = pos1 - pos0
+
+        trailing_size = len(original_raw) - typetree_bytes
+        # StreamData (empty) 크기: uint64(8) + uint32(4) + int32(4) = 16
+        empty_stream_data_size = 16
+        # image data block: 4 (size prefix) + data + padding
+        img_block_size = 4 + orig_img_len
+        img_block_padded = img_block_size + (4 - img_block_size % 4) % 4
+
+        image_data_size_pos = typetree_bytes - trailing_size - empty_stream_data_size - img_block_padded
+        if image_data_size_pos < 0:
+            # KR: 위치 계산 실패 — 대안: metadata 크기를 직접 계산
+            # EN: Position calc failed — fallback: directly compute metadata size
+            # metadata = total_raw - trailing - empty_stream - img_block
+            image_data_size_pos = len(original_raw) - trailing_size - empty_stream_data_size - img_block_padded
+        orig_stream_end = len(original_raw) - trailing_size
+
+    if image_data_size_pos < 0 or image_data_size_pos >= len(original_raw):
+        return False
+
+    # KR: TypeTree 파싱으로 정확한 필드 오프셋을 구하고, 원본 raw를 직접 패치합니다.
+    # EN: Get exact field offsets via TypeTree parse, then patch original raw directly.
+    from UnityPy.helpers.TypeTreeHelper import TypeTreeConfig as _TTC, read_value as _rv
+    from UnityPy.streams import EndianBinaryReader as _EBR
+    field_offsets: dict[str, int] = {}
+    try:
+        _tmp_reader = _EBR(original_raw, endian=obj.reader.endian)
+        _tmp_config = _TTC(True, obj.assets_file, False)
+        _node = obj._get_typetree_node()
+        for _child in _node.m_Children:
+            _pos_before = _tmp_reader.Position
+            _rv(_child, _tmp_reader, _tmp_config)
+            field_offsets[_child.m_Name] = _pos_before
     except Exception:
         pass
+
+    # KR: image data 필드의 시작 오프셋 = image_data_size_pos (TypeTree 기준)
+    # EN: Use TypeTree-derived offset for image data field start
+    if "image data" in field_offsets:
+        image_data_size_pos = field_offsets["image data"]
+
+    part1 = bytearray(original_raw[:image_data_size_pos])
+
+    # KR: 정확한 오프셋으로 필드 패치 (패턴 검색 대신 직접 오프셋 사용)
+    # EN: Patch fields at exact offsets (no pattern search needed)
+    if "m_Width" in field_offsets and field_offsets["m_Width"] + 4 <= len(part1):
+        _struct.pack_into("<i", part1, field_offsets["m_Width"], width)
+    if "m_Height" in field_offsets and field_offsets["m_Height"] + 4 <= len(part1):
+        _struct.pack_into("<i", part1, field_offsets["m_Height"], height)
+    if "m_CompleteImageSize" in field_offsets and field_offsets["m_CompleteImageSize"] + 4 <= len(part1):
+        _struct.pack_into("<I", part1, field_offsets["m_CompleteImageSize"], len(image_data))
 
     part1 = bytes(part1)
 
@@ -6434,7 +6508,6 @@ def _binary_patch_texture2d(
     w = EndianBinaryWriter(endian="<")
     w.write_int(len(image_data))
     w.write(image_data)
-    # Align to 4
     pos = w.Length
     pad = (4 - pos % 4) % 4
     if pad:
@@ -6450,11 +6523,14 @@ def _binary_patch_texture2d(
     part2_3 = w.bytes
     w.dispose()
 
-    # KR: Part 4 — 원본 StreamData 이후의 trailing bytes
-    # EN: Part 4 — trailing bytes after original StreamData
-    orig_stream_end = path_str_start + path_len
-    orig_stream_end += (4 - orig_stream_end % 4) % 4  # align
-    part4 = original_raw[orig_stream_end:]
+    # KR: Part 4 — trailing bytes (TypeTree가 읽은 이후의 바이트)
+    # EN: Part 4 — trailing bytes (after what TypeTree read)
+    if "image data" in field_offsets and _tmp_reader is not None:
+        # TypeTree가 읽은 총 바이트 수를 사용
+        typetree_end = _tmp_reader.Position
+        part4 = original_raw[typetree_end:]
+    else:
+        part4 = original_raw[orig_stream_end:]
 
     new_raw = part1 + part2_3 + part4
     obj.set_raw_data(new_raw)
@@ -7548,6 +7624,7 @@ def replace_fonts_in_file(
                             "preserve_gradient_floor": bool(
                                 preserve_gradient_floor
                             ),
+                            "replacement_padding": replacement_padding,
                             "replacement_font": replacement_font,
                             "source_entry": f"{fn_without_path}|{assets_name}|{pathid}",
                         }
