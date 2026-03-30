@@ -94,6 +94,18 @@
             [
                 "_VertexOffsetY",
                 0.0
+            ],
+            [
+                "_GradientScale",
+                8.0
+            ],
+            [
+                "_TextureWidth",
+                4096.0
+            ],
+            [
+                "_TextureHeight",
+                4096.0
             ]
         ],
         "m_Colors": [

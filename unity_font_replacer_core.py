@@ -6231,6 +6231,244 @@ def load_font_assets(
     }
 
 
+# KR: TypeTree에 정의되지 않은 trailing bytes를 ObjectReader path_id 기준으로 보존합니다.
+# EN: Store trailing bytes (not covered by TypeTree) keyed by ObjectReader path_id.
+_trailing_bytes_store: dict[int, bytes] = {}
+
+
+def _capture_trailing_bytes(obj: Any) -> bytes:
+    """KR: TypeTree 파싱 후 읽히지 않은 trailing bytes를 캡처합니다.
+    EN: Capture unread trailing bytes after TypeTree parsing.
+    """
+    pos = obj.reader.Position
+    end = obj.byte_start + obj.byte_size
+    if pos < end:
+        remaining = obj.reader.read_bytes(end - pos)
+        obj.reader.Position = pos
+        return remaining
+    return b""
+
+
+def _safe_parse_as_object(obj: Any, **kwargs: Any) -> Any:
+    """KR: parse_as_object()를 check_read=True로 먼저 시도하고,
+    KR: 바이트 크기 불일치(중국판 Unity 등)로 실패하면 check_read=False로 재시도하고
+    KR: trailing bytes를 별도 저장소에 보존합니다.
+    EN: Try parse_as_object(check_read=True) first; on byte-size mismatch
+    EN: retry with check_read=False and preserve trailing bytes in a side store.
+    """
+    obj_id = id(obj)
+    try:
+        result = obj.parse_as_object(check_read=True, **kwargs)
+        _trailing_bytes_store.pop(obj_id, None)
+        return result
+    except ValueError as e:
+        if "Expected to read" in str(e) and "bytes" in str(e):
+            result = obj.parse_as_object(check_read=False, **kwargs)
+            trailing = _capture_trailing_bytes(obj)
+            if trailing:
+                _trailing_bytes_store[obj_id] = trailing
+            else:
+                _trailing_bytes_store.pop(obj_id, None)
+            return result
+        raise
+
+
+def _safe_parse_as_dict(obj: Any, **kwargs: Any) -> dict[str, Any]:
+    """KR: parse_as_dict()를 check_read=True로 먼저 시도하고,
+    KR: 바이트 크기 불일치로 실패하면 check_read=False로 재시도하고
+    KR: trailing bytes를 별도 저장소에 보존합니다.
+    EN: Try parse_as_dict(check_read=True) first; on byte-size mismatch
+    EN: retry with check_read=False and preserve trailing bytes in a side store.
+    """
+    obj_id = id(obj)
+    try:
+        result = obj.parse_as_dict(check_read=True, **kwargs)
+        _trailing_bytes_store.pop(obj_id, None)
+        return result
+    except ValueError as e:
+        if "Expected to read" in str(e) and "bytes" in str(e):
+            result = obj.parse_as_dict(check_read=False, **kwargs)
+            trailing = _capture_trailing_bytes(obj)
+            if trailing:
+                _trailing_bytes_store[obj_id] = trailing
+            else:
+                _trailing_bytes_store.pop(obj_id, None)
+            return result
+        raise
+
+
+def _safe_save(obj: Any, parse_dict: Any) -> None:
+    """KR: save() 후 trailing bytes가 있으면 raw data에 append합니다.
+    EN: After save(), append any trailing bytes to the raw data.
+    """
+    parse_dict.save()
+    obj_id = id(obj)
+    trailing = _trailing_bytes_store.pop(obj_id, b"")
+    if trailing:
+        current_data = obj.get_raw_data()
+        obj.set_raw_data(current_data + trailing)
+
+
+def _has_trailing_bytes(obj: Any) -> bool:
+    """KR: 이 오브젝트에 TypeTree로 읽히지 않는 trailing bytes가 있는지 확인합니다.
+    EN: Check if this object has trailing bytes not covered by TypeTree.
+    """
+    return id(obj) in _trailing_bytes_store
+
+
+def _detect_typetree_size_mismatch(obj: Any) -> bool:
+    """KR: TypeTree로 읽은 후 다시 쓰면 원본보다 작아지는지 감지합니다.
+    KR: 중국판 Unity 등에서 TypeTree에 없는 추가 필드가 있으면 True를 반환합니다.
+    EN: Detect if TypeTree write produces fewer bytes than the original raw data.
+    EN: Returns True if extra fields exist outside TypeTree (e.g. China Unity builds).
+    """
+    try:
+        from UnityPy.helpers.TypeTreeHelper import write_typetree
+        from UnityPy.streams import EndianBinaryWriter
+        original_raw = obj.get_raw_data()
+        d = obj.read_typetree(check_read=False)
+        node = obj._get_typetree_node()
+        w = EndianBinaryWriter(endian=obj.reader.endian)
+        write_typetree(d, node, w, obj.assets_file)
+        rewritten_size = w.Length
+        w.dispose()
+        return rewritten_size < len(original_raw)
+    except Exception:
+        return False
+
+
+def _binary_patch_texture2d(
+    obj: Any,
+    *,
+    image_data: bytes,
+    width: int,
+    height: int,
+    lang: str = "ko",
+) -> bool:
+    """KR: Texture2D를 TypeTree 재직렬화 없이 바이너리 패치합니다.
+    KR: 중국판 Unity 등에서 TypeTree가 커버하지 못하는 extra bytes가 있을 때 사용합니다.
+    EN: Binary-patch a Texture2D without TypeTree re-serialization.
+    EN: Used when extra bytes exist that TypeTree cannot cover (e.g. China Unity builds).
+    """
+    import struct as _struct
+
+    original_raw = obj.get_raw_data()
+    if len(original_raw) < 48:
+        return False
+
+    # KR: 원본 raw에서 스트림 경로 문자열을 찾아 필드 위치를 역추적합니다.
+    # EN: Locate field positions by finding the stream path string in raw bytes.
+    # 스트리밍 경로 문자열 검색 (.resS 또는 .resource)
+    stream_path_marker = None
+    for marker in [b".resS", b".resource"]:
+        idx = original_raw.find(marker)
+        if idx >= 0:
+            # 문자열 시작 위치를 찾기 위해 앞쪽으로 탐색
+            str_start = idx
+            while str_start > 0 and original_raw[str_start - 1:str_start] not in (b"\x00",):
+                str_start -= 1
+                if idx - str_start > 200:
+                    break
+            # string length prefix는 str_start - 4 위치
+            path_len_pos = str_start - 4
+            if path_len_pos < 0:
+                continue
+            try:
+                path_len = _struct.unpack_from("<i", original_raw, path_len_pos)[0]
+                if 0 < path_len < 256 and path_len_pos + 4 + path_len <= len(original_raw):
+                    stream_path_marker = (path_len_pos, path_len, str_start)
+                    break
+            except Exception:
+                continue
+
+    if stream_path_marker is None:
+        # KR: 스트리밍 경로를 찾을 수 없으면 바이너리 패치 불가
+        # EN: Cannot locate stream path — binary patch not possible
+        return False
+
+    path_len_pos, path_len, path_str_start = stream_path_marker
+    stream_size_pos = path_len_pos - 4
+    stream_offset_pos = stream_size_pos - 8
+    image_data_size_pos = stream_offset_pos - 4
+
+    if image_data_size_pos < 0:
+        return False
+
+    # KR: Part 1 — image_data 이전의 모든 바이트 (메타데이터)
+    # EN: Part 1 — all bytes before image_data (metadata fields)
+    part1 = bytearray(original_raw[:image_data_size_pos])
+
+    # KR: m_Width/m_Height 패치 (원본 값을 찾아서 교체)
+    # EN: Patch m_Width/m_Height by finding original values
+    # 원본 Texture2D의 width/height를 읽어서 위치를 특정
+    # m_Width와 m_Height는 연속된 int32 (little-endian)
+    orig_w_bytes = None
+    try:
+        d_temp = obj.read_typetree(check_read=False)
+        orig_w = int(d_temp.get("m_Width", 0))
+        orig_h = int(d_temp.get("m_Height", 0))
+        if orig_w > 0 and orig_h > 0:
+            orig_w_bytes = _struct.pack("<i", orig_w)
+            # m_Width/m_Height 위치 검색
+            search_pattern = _struct.pack("<ii", orig_w, orig_h)
+            wh_pos = bytes(part1).find(search_pattern)
+            if wh_pos >= 0:
+                _struct.pack_into("<i", part1, wh_pos, width)
+                _struct.pack_into("<i", part1, wh_pos + 4, height)
+
+        # m_CompleteImageSize 패치
+        orig_cis = int(d_temp.get("m_CompleteImageSize", 0))
+        if orig_cis > 0:
+            cis_bytes = _struct.pack("<I", orig_cis)
+            cis_pos = bytes(part1).find(cis_bytes)
+            if cis_pos >= 0:
+                _struct.pack_into("<I", part1, cis_pos, len(image_data))
+    except Exception:
+        pass
+
+    part1 = bytes(part1)
+
+    # KR: Part 2+3 — inline image data + 빈 StreamingInfo
+    # EN: Part 2+3 — inline image data + empty StreamingInfo
+    from UnityPy.streams import EndianBinaryWriter
+    w = EndianBinaryWriter(endian="<")
+    w.write_int(len(image_data))
+    w.write(image_data)
+    # Align to 4
+    pos = w.Length
+    pad = (4 - pos % 4) % 4
+    if pad:
+        w.write(b"\x00" * pad)
+    # Empty StreamingInfo
+    w.write_u_long(0)   # offset
+    w.write_u_int(0)    # size
+    w.write_int(0)      # empty path (length=0)
+    pos = w.Length
+    pad = (4 - pos % 4) % 4
+    if pad:
+        w.write(b"\x00" * pad)
+    part2_3 = w.bytes
+    w.dispose()
+
+    # KR: Part 4 — 원본 StreamData 이후의 trailing bytes
+    # EN: Part 4 — trailing bytes after original StreamData
+    orig_stream_end = path_str_start + path_len
+    orig_stream_end += (4 - orig_stream_end % 4) % 4  # align
+    part4 = original_raw[orig_stream_end:]
+
+    new_raw = part1 + part2_3 + part4
+    obj.set_raw_data(new_raw)
+    obj.assets_file.mark_changed()
+
+    if lang == "ko":
+        _log_debug(
+            f"[binary_patch_texture2d] PathID={obj.path_id} "
+            f"orig_raw={len(original_raw)}B new_raw={len(new_raw):,}B "
+            f"trailing={len(part4)}B"
+        )
+    return True
+
+
 def replace_fonts_in_file(
     unity_version: str,
     game_path: str,
@@ -6441,7 +6679,7 @@ def replace_fonts_in_file(
             if replacement_font:
                 assets = load_font_assets(replacement_font)
                 if assets["ttf_data"]:
-                    font = obj.parse_as_object()
+                    font = _safe_parse_as_object(obj)
                     _raw_font_data = getattr(font, "m_FontData", b"")
                     current_ttf_data = _raw_font_data if isinstance(_raw_font_data, bytes) else bytes(_raw_font_data)
                     if current_ttf_data == assets["ttf_data"]:
@@ -6474,7 +6712,7 @@ def replace_fonts_in_file(
                         f"old_size={len(current_ttf_data)} new_size={len(assets['ttf_data'])}"
                     )
                     font.m_FontData = assets["ttf_data"]
-                    font.save()
+                    _safe_save(obj, font)
                     modified = True
 
         if obj.type.name == "MonoBehaviour" and replace_sdf:
@@ -6483,7 +6721,7 @@ def replace_fonts_in_file(
             if target_sdf_targets and target_key not in target_sdf_targets:
                 continue
             try:
-                parse_dict = obj.parse_as_dict()
+                parse_dict = _safe_parse_as_dict(obj)
             except Exception as e:
                 reason = f"PathID {obj.path_id} parse_as_dict 실패 [{type(e).__name__}]: {e!r}"
                 sdf_parse_failure_reasons.append(reason)
@@ -7244,6 +7482,10 @@ def replace_fonts_in_file(
                                             * material_padding_ratio
                                         )
                             gradient_scale = float_overrides.get("_GradientScale")
+                        # KR: 교체 material에 _GradientScale이 없으면 m_AtlasPadding+1로 자동 추론합니다.
+                        # EN: If replacement material lacks _GradientScale, infer from m_AtlasPadding+1.
+                        if gradient_scale is None and replacement_is_sdf and replacement_padding > 0:
+                            gradient_scale = float(replacement_padding + 1)
                         if apply_replacement_material and effective_force_raster:
                             # KR: Raster 모드에서는 SDF 계열 필드 0 덮기 대신 최소 필드만 남깁니다.
                             # EN: In raster mode, prune to minimal fields instead of zero-overriding SDF properties.
@@ -7345,6 +7587,10 @@ def replace_fonts_in_file(
                                 "could_not_resolve_material_target=True"
                             )
                     obj.patch(parse_dict)
+                    trailing = _trailing_bytes_store.pop(id(obj), b"")
+                    if trailing:
+                        current_data = obj.get_raw_data()
+                        obj.set_raw_data(current_data + trailing)
                     patched_sdf_targets += 1
                     modified = True
                 else:
@@ -7381,7 +7627,7 @@ def replace_fonts_in_file(
             replacement_key = _make_assets_object_key(assets_name, int(obj.path_id))
             texture_plan = _lookup_patch_value(texture_patch_plans, replacement_key)
             if isinstance(texture_plan, dict):
-                parse_dict = obj.parse_as_object()
+                parse_dict = _safe_parse_as_object(obj)
                 if lang == "ko":
                     _log_console(
                         f"텍스처 교체: {obj.peek_name()} (PathID: {obj.path_id})"
@@ -7504,7 +7750,39 @@ def replace_fonts_in_file(
                             )
                 if not applied_raw_alpha8:
                     parse_dict.image = replacement_image
-                parse_dict.save()
+
+                # KR: TypeTree 재직렬화 시 원본보다 작아지는 Texture2D (중국판 Unity 등)는
+                # KR: 바이너리 패치를 사용하여 extra bytes를 보존합니다.
+                # EN: For Texture2D where TypeTree re-serialization loses bytes (China Unity etc.),
+                # EN: use binary patch to preserve extra bytes.
+                if _has_trailing_bytes(obj) or _detect_typetree_size_mismatch(obj):
+                    tex_w = int(getattr(parse_dict, "m_Width", 0) or 0)
+                    tex_h = int(getattr(parse_dict, "m_Height", 0) or 0)
+                    tex_image_data = getattr(parse_dict, "image_data", b"")
+                    if not isinstance(tex_image_data, (bytes, bytearray)):
+                        tex_image_data = bytes(tex_image_data)
+                    if tex_image_data and tex_w > 0 and tex_h > 0:
+                        if _binary_patch_texture2d(
+                            obj,
+                            image_data=tex_image_data,
+                            width=tex_w,
+                            height=tex_h,
+                            lang=lang,
+                        ):
+                            if lang == "ko":
+                                _log_console(
+                                    "  바이너리 패치 적용 (TypeTree 외 extra bytes 보존)"
+                                )
+                            else:
+                                _log_console(
+                                    "  Applied binary patch (preserving extra bytes outside TypeTree)"
+                                )
+                        else:
+                            _safe_save(obj, parse_dict)
+                    else:
+                        _safe_save(obj, parse_dict)
+                else:
+                    _safe_save(obj, parse_dict)
                 modified = True
                 parse_dict = None
         if obj.type.name == "Material":
@@ -7524,7 +7802,7 @@ def replace_fonts_in_file(
                         )
             if mat_info is None:
                 if parse_dict is None:
-                    parse_dict = obj.parse_as_object()
+                    parse_dict = _safe_parse_as_object(obj)
                 saved_props = getattr(parse_dict, "m_SavedProperties", None)
                 tex_envs = getattr(saved_props, "m_TexEnvs", None)
                 main_tex_path_id = 0
@@ -7556,9 +7834,9 @@ def replace_fonts_in_file(
                     )
             if mat_info is not None:
                 if parse_dict is None:
-                    parse_dict = obj.parse_as_object()
+                    parse_dict = _safe_parse_as_object(obj)
                 if _apply_material_replacement_to_object(parse_dict, mat_info):
-                    parse_dict.save()
+                    _safe_save(obj, parse_dict)
 
     _emit_phase_callback(
         phase_callback,
