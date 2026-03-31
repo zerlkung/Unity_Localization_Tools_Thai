@@ -1,4 +1,10 @@
-"""English launcher for Unity Font Replacer CLI."""
+"""KR: Unity Font Replacer 영문 CLI 런처.
+    unity_font_replacer_core의 run_main_en()을 호출하여
+    영문 인터페이스로 폰트 교체 파이프라인을 실행한다.
+EN: Unity Font Replacer English CLI launcher.
+    Calls run_main_en() from unity_font_replacer_core to run
+    the font replacement pipeline with an English interface.
+"""
 
 import logging
 
@@ -8,7 +14,9 @@ logger = logging.getLogger(__name__)
 
 
 def main() -> None:
-    """Run English CLI entrypoint."""
+    """KR: 영문 CLI 엔트리포인트.
+    EN: English CLI entry point.
+    """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     run_main_en()
 

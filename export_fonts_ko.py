@@ -1,4 +1,10 @@
-"""Korean launcher for TMP font export CLI."""
+"""KR: TMP 폰트 에셋 추출기 한국어 CLI 런처.
+    export_fonts_core의 main_cli(lang="ko")를 호출하여
+    게임 에셋에서 TMP SDF 폰트 JSON/PNG를 한국어 인터페이스로 추출한다.
+EN: TMP font asset extractor Korean CLI launcher.
+    Calls main_cli(lang="ko") from export_fonts_core to extract
+    TMP SDF font JSON/PNG from game assets with a Korean interface.
+"""
 
 import logging
 import sys
@@ -9,8 +15,8 @@ logger = logging.getLogger(__name__)
 
 
 def main() -> None:
-    """KR: 한국어 추출기 CLI를 실행합니다.
-    EN: Run the Korean exporter CLI entrypoint.
+    """KR: 한국어 추출기 CLI 엔트리포인트.
+    EN: Korean extractor CLI entry point.
     """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     main_cli(lang="ko")

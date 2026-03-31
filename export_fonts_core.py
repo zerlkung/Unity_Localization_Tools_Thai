@@ -1,4 +1,43 @@
-"""Core logic for exporting TMP SDF assets from Unity game data."""
+"""KR: Unity 게임 데이터에서 TextMeshPro SDF 폰트 에셋을 추출하는 핵심 모듈.
+
+동작 흐름:
+  1. globalgamemanagers 로드 → Unity 버전 감지
+  2. TypeTreeGenerator 초기화 (Mono DLL 또는 Il2cpp 메타데이터)
+  3. 전체 에셋 파일 순회 → MonoBehaviour 중 TMP_FontAsset 판별
+  4. TMP 스키마 판별 (신형 m_GlyphTable / 구형 m_glyphInfoList)
+  5. atlas Texture2D, Material 참조 해석 → JSON/PNG 추출
+
+TMP 스키마 경계 (TMP_Info 기준):
+  구형 전용 마지막 : Unity 2018.3.14 (TMP git 1.3.0 이하)
+  신형 시작         : Unity 2018.4.2  (TMP git 1.4.0 이상)
+  구형은 m_glyphInfoList + m_fontInfo + atlas(단일 참조),
+  신형은 m_GlyphTable + m_CharacterTable + m_FaceInfo + m_AtlasTextures(리스트).
+
+UnityPy 연동:
+  UnityPy.load()로 에셋 파일을 열고, TypeTreeGenerator로 MonoBehaviour를
+  딕셔너리로 역직렬화한다. Texture2D는 parse_as_object()로 이미지를 추출.
+  UnityPy의 externals 리스트로 FileID → 외부 에셋 파일명을 해석한다.
+
+EN: Core module for extracting TextMeshPro SDF font assets from Unity game data.
+
+Workflow:
+  1. Load globalgamemanagers -> detect Unity version
+  2. Initialize TypeTreeGenerator (Mono DLL or Il2cpp metadata)
+  3. Iterate all asset files -> identify TMP_FontAsset among MonoBehaviours
+  4. Determine TMP schema (new m_GlyphTable / old m_glyphInfoList)
+  5. Resolve atlas Texture2D and Material references -> extract JSON/PNG
+
+TMP schema boundary (per TMP_Info):
+  Last old-only  : Unity 2018.3.14 (TMP git <= 1.3.0)
+  First new      : Unity 2018.4.2  (TMP git >= 1.4.0)
+  Old uses m_glyphInfoList + m_fontInfo + atlas (single ref),
+  New uses m_GlyphTable + m_CharacterTable + m_FaceInfo + m_AtlasTextures (list).
+
+UnityPy integration:
+  Opens asset files with UnityPy.load() and deserializes MonoBehaviours into
+  dicts via TypeTreeGenerator. Extracts Texture2D images with parse_as_object().
+  Resolves FileID -> external asset file names using UnityPy's externals list.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +57,15 @@ logger = logging.getLogger(__name__)
 
 
 def _close_env(environment: Any) -> None:
-    """Best-effort cleanup of UnityPy environment resources (mmap, temp files)."""
+    """KR: UnityPy Environment가 보유한 리소스(mmap, 임시 블록 파일)를 정리한다.
+    UnityPy는 BundleFile 내부에 mmap이나 임시 파일을 보유할 수 있으며,
+    이를 명시적으로 해제하지 않으면 파일 핸들 누수가 발생한다.
+    스택 기반 DFS로 중첩된 files 딕셔너리까지 순회한다.
+
+    EN: Clean up resources (mmap, temp block files) held by a UnityPy Environment.
+    UnityPy may hold mmaps or temp files inside BundleFile objects;
+    failing to release them explicitly causes file handle leaks.
+    Uses stack-based DFS to traverse nested files dicts."""
     if environment is None:
         return
     stack: list[Any] = []
@@ -41,12 +88,20 @@ def _close_env(environment: Any) -> None:
 
 Language = Literal["ko", "en"]
 JsonDict = dict[str, Any]
+
+# KR: TMP 스키마 경계 버전 (TMP_Info/03_tmpro_unity_combined_changes 참조).
+#     구형: m_glyphInfoList + m_fontInfo, UV 계산에 "1 - ..." 보정 사용.
+#     신형: m_GlyphTable + m_FaceInfo, GlyphRect.y가 bottom-origin으로 직접 사용.
+# EN: TMP schema boundary versions (see TMP_Info/03_tmpro_unity_combined_changes).
+#     Old: m_glyphInfoList + m_fontInfo, UV calculation uses "1 - ..." correction.
+#     New: m_GlyphTable + m_FaceInfo, GlyphRect.y is used directly as bottom-origin.
 _TMP_OLD_ONLY_LAST = (2018, 3, 14)
 _TMP_NEW_SCHEMA_FIRST = (2018, 4, 2)
 
 
 def _configure_logging(level: int = logging.INFO) -> None:
-    """Configure console logging for CLI-mode output."""
+    """KR: CLI 모드 콘솔 로깅을 구성한다. 이미 핸들러가 있으면 레벨만 변경.
+    EN: Configure console logging for CLI mode. If handlers already exist, only change the level."""
     if logging.getLogger().handlers:
         logging.getLogger().setLevel(level)
         return
@@ -54,6 +109,8 @@ def _configure_logging(level: int = logging.INFO) -> None:
 
 
 def _coerce_log_level(message: str, default_level: int = logging.INFO) -> int:
+    """KR: 한/영 로그 메시지 내 키워드로 로그 레벨을 추론한다.
+    EN: Infer log level from keywords in Korean/English log messages."""
     lowered = message.lower()
     if "경고" in message or "warning" in lowered:
         return logging.WARNING
@@ -72,31 +129,29 @@ def _log_console(
     sep: str = " ",
     level: int | None = None,
 ) -> None:
-    """Print-compatible logging adapter."""
+    """KR: print() 호환 로깅 어댑터. 레벨 미지정 시 메시지 키워드로 자동 추론.
+    EN: print()-compatible logging adapter. Auto-infers level from message keywords when not specified."""
     message = sep.join(str(part) for part in parts)
     resolved_level = _coerce_log_level(message) if level is None else level
     logger.log(resolved_level, message)
 
 
 def _debug_parse_enabled() -> bool:
-    """KR: TMP 파싱 디버그 로그 출력 여부를 반환합니다.
-    EN: Return whether TMP parsing debug logging is enabled.
-    """
+    """KR: UFR_DEBUG_PARSE=1 환경변수로 TMP 파싱 디버그 로그 활성화 여부를 반환.
+    EN: Return whether TMP parsing debug logging is enabled via UFR_DEBUG_PARSE=1 env var."""
     return os.environ.get("UFR_DEBUG_PARSE", "").strip() == "1"
 
 
 def _debug_parse_log(message: str) -> None:
-    """KR: 디버그 모드일 때만 메시지를 출력합니다.
-    EN: Print a debug message only when debug mode is enabled.
-    """
+    """KR: 디버그 모드일 때만 메시지를 출력한다.
+    EN: Print the message only when debug mode is enabled."""
     if _debug_parse_enabled():
         _log_console(message)
 
 
 def exit_with_error(lang: Language, message: str) -> NoReturn:
-    """KR: 로컬라이즈된 오류를 출력하고 종료합니다.
-    EN: Print a localized error and terminate the process.
-    """
+    """KR: 로컬라이즈된 오류를 출력하고 프로세스를 종료한다(exit code 1).
+    EN: Print a localized error message and terminate the process (exit code 1)."""
     if lang == "ko":
         _log_console(f"오류: {message}")
         input("\n엔터를 눌러 종료...")
@@ -107,9 +162,10 @@ def exit_with_error(lang: Language, message: str) -> NoReturn:
 
 
 def find_ggm_file(data_path: str) -> str | None:
-    """KR: 데이터 폴더에서 globalgamemanagers 계열 파일을 찾습니다.
-    EN: Find a globalgamemanagers-like file under the data folder.
-    """
+    """KR: _Data 폴더에서 globalgamemanagers 계열 파일을 찾아 경로를 반환한다.
+    후보: globalgamemanagers -> globalgamemanagers.assets -> data.unity3d.
+    EN: Find and return the path of a globalgamemanagers-family file in the _Data folder.
+    Candidates: globalgamemanagers -> globalgamemanagers.assets -> data.unity3d."""
     candidates = [
         "globalgamemanagers",
         "globalgamemanagers.assets",
@@ -123,9 +179,13 @@ def find_ggm_file(data_path: str) -> str | None:
 
 
 def resolve_game_path(lang: Language, path: str | None = None) -> tuple[str, str]:
-    """KR: 입력 경로를 게임 루트/데이터 폴더 경로로 정규화합니다.
-    EN: Normalize an input path into game-root and data-folder paths.
-    """
+    """KR: 입력 경로를 (game_root, data_path) 튜플로 정규화한다.
+    경로가 *_Data로 끝나면 data_path, 아니면 game_root로 간주하고
+    하위 *_Data 폴더를 탐색한다. globalgamemanagers 존재를 검증.
+
+    EN: Normalize the input path into a (game_root, data_path) tuple.
+    If the path ends with *_Data, treat it as data_path; otherwise treat it as
+    game_root and search for a *_Data subfolder. Validates globalgamemanagers existence."""
     if path is None:
         path = os.getcwd()
 
@@ -171,9 +231,8 @@ def resolve_game_path(lang: Language, path: str | None = None) -> tuple[str, str
 
 
 def get_unity_version(data_path: str) -> str:
-    """KR: 데이터 폴더의 Unity 버전을 반환합니다.
-    EN: Return the Unity version detected from the data folder.
-    """
+    """KR: globalgamemanagers를 로드하여 Unity 빌드 버전 문자열을 반환한다.
+    EN: Load globalgamemanagers and return the Unity build version string."""
     ggm_path = find_ggm_file(data_path)
     if not ggm_path:
         raise FileNotFoundError(f"globalgamemanagers not found in '{data_path}'")
@@ -181,9 +240,10 @@ def get_unity_version(data_path: str) -> str:
 
 
 def find_assets_files(data_path: str) -> list[str]:
-    """KR: 교체/추출 대상이 될 에셋 파일 목록을 수집합니다.
-    EN: Collect candidate asset files for replacement/export.
-    """
+    """KR: _Data 하위를 재귀 순회하여 Unity 에셋 후보 파일을 수집한다.
+    이미지/오디오/DLL 등 비에셋 확장자는 제외.
+    EN: Recursively walk _Data subdirectories and collect candidate Unity asset files.
+    Excludes non-asset extensions such as images, audio, and DLLs."""
     assets_files: list[str] = []
     exclude_exts = {
         ".dll",
@@ -216,9 +276,8 @@ def find_assets_files(data_path: str) -> list[str]:
 
 
 def get_compile_method(data_path: str) -> str:
-    """KR: Managed 폴더 존재 여부로 Mono/Il2cpp를 판별합니다.
-    EN: Detect Mono/Il2cpp based on the Managed folder presence.
-    """
+    """KR: Managed 폴더 존재 여부로 빌드 방식(Mono/Il2cpp)을 판별한다.
+    EN: Determine build method (Mono/Il2cpp) by checking for the Managed folder."""
     return "Mono" if os.path.exists(os.path.join(data_path, "Managed")) else "Il2cpp"
 
 
@@ -229,9 +288,15 @@ def create_generator(
     compile_method: str,
     lang: Language,
 ) -> TypeTreeGenerator:
-    """KR: Unity 타입트리 생성기를 초기화하고 메타데이터를 로드합니다.
-    EN: Initialize a Unity typetree generator and load metadata.
-    """
+    """KR: TypeTreeGenerator를 초기화하고 어셈블리 메타데이터를 로드한다.
+    Mono 빌드: Managed/*.dll을 순회하며 load_dll().
+    Il2cpp 빌드: GameAssembly.dll + global-metadata.dat -> load_il2cpp().
+    TypeTree는 UnityPy가 MonoBehaviour를 딕셔너리로 역직렬화할 때 필요.
+
+    EN: Initialize TypeTreeGenerator and load assembly metadata.
+    Mono builds: iterate Managed/*.dll and call load_dll().
+    Il2cpp builds: GameAssembly.dll + global-metadata.dat -> load_il2cpp().
+    TypeTree is required for UnityPy to deserialize MonoBehaviours into dicts."""
     try:
         generator = TypeTreeGenerator(unity_version)
     except ImportError:
@@ -282,6 +347,8 @@ def create_generator(
 
 @lru_cache(maxsize=256)
 def _parse_unity_version_triplet(version_text: str) -> tuple[int, int, int] | None:
+    """KR: '2020.3.13f1' 등의 Unity 버전 문자열에서 (major, minor, patch) 튜플을 추출한다.
+    EN: Extract a (major, minor, patch) tuple from a Unity version string like '2020.3.13f1'."""
     match = re.search(r"(\d+)\.(\d+)\.(\d+)", version_text or "")
     if not match:
         return None
@@ -292,6 +359,8 @@ def _parse_unity_version_triplet(version_text: str) -> tuple[int, int, int] | No
 
 
 def _tmp_version_hint(unity_version: str | None) -> Literal["new", "old"] | None:
+    """KR: Unity 버전으로 TMP 스키마를 추정한다. 경계 밖이면 None.
+    EN: Estimate TMP schema from Unity version. Returns None if outside boundary range."""
     if not unity_version:
         return None
     triplet = _parse_unity_version_triplet(str(unity_version))
@@ -305,10 +374,14 @@ def _tmp_version_hint(unity_version: str | None) -> Literal["new", "old"] | None
 
 
 def _safe_list_len(value: Any) -> int:
+    """KR: 리스트이면 길이, 아니면 0.
+    EN: Return length if value is a list, otherwise 0."""
     return len(value) if isinstance(value, list) else 0
 
 
 def _first_atlas_ref(value: Any) -> JsonDict | None:
+    """KR: 리스트에서 첫 번째 딕셔너리 항목을 반환한다(아틀라스 참조용).
+    EN: Return the first dict item from a list (for atlas reference lookup)."""
     if not isinstance(value, list):
         return None
     for item in value:
@@ -318,6 +391,8 @@ def _first_atlas_ref(value: Any) -> JsonDict | None:
 
 
 def _atlas_ref_ids(ref: Any) -> tuple[int, int]:
+    """KR: 아틀라스 참조 딕셔너리에서 (m_FileID, m_PathID) 정수 튜플을 추출한다.
+    EN: Extract an (m_FileID, m_PathID) integer tuple from an atlas reference dict."""
     if not isinstance(ref, dict):
         return 0, 0
     try:
@@ -332,6 +407,8 @@ def _atlas_ref_ids(ref: Any) -> tuple[int, int]:
 
 
 def _normalize_assets_basename(value: Any) -> str | None:
+    """KR: 경로에서 basename만 추출한다. 역슬래시를 슬래시로 정규화.
+    EN: Extract only the basename from a path. Normalizes backslashes to forward slashes."""
     text = str(value).strip() if value is not None else ""
     if not text:
         return None
@@ -341,6 +418,8 @@ def _normalize_assets_basename(value: Any) -> str | None:
 
 
 def _normalize_asset_lookup_path(value: Any) -> str | None:
+    """KR: 에셋 참조 경로를 정규화한다(archive://, file:// 접두사 제거, 소문자화).
+    EN: Normalize an asset reference path (strip archive://, file:// prefixes, lowercase)."""
     text = str(value).strip() if value is not None else ""
     if not text:
         return None
@@ -360,6 +439,8 @@ def _normalize_asset_lookup_path(value: Any) -> str | None:
 
 
 def _normalize_asset_file_key(path: Any) -> str | None:
+    """KR: 파일 경로를 절대 경로 + OS 정규화(normcase)한 키로 변환한다.
+    EN: Convert a file path into an absolute + OS-normalized (normcase) key."""
     text = str(path).strip() if path is not None else ""
     if not text:
         return None
@@ -367,6 +448,8 @@ def _normalize_asset_file_key(path: Any) -> str | None:
 
 
 def _normalize_assets_key(value: Any) -> str | None:
+    """KR: basename을 소문자로 변환한 에셋 조회 키를 반환한다.
+    EN: Return an asset lookup key with the basename lowercased."""
     name = _normalize_assets_basename(value)
     return name.lower() if name else None
 
@@ -375,6 +458,18 @@ def _build_asset_file_index(
     assets_files: list[str],
     data_path: str,
 ) -> dict[str, Any]:
+    """KR: 에셋 파일 목록을 상대경로/basename 기반 역인덱스로 구축한다.
+    반환 딕셔너리:
+      path_by_key       : 정규화 키 -> 절대 경로
+      relpath_to_keys   : 상대 경로 -> 키 리스트
+      basename_to_keys  : basename -> 키 리스트 (동명 에셋 중복 감지용)
+
+    EN: Build a reverse index of asset files based on relative paths and basenames.
+    Returned dict:
+      path_by_key       : normalized key -> absolute path
+      relpath_to_keys   : relative path -> list of keys
+      basename_to_keys  : basename -> list of keys (for detecting duplicate asset names)
+    """
     data_root = os.path.abspath(data_path)
     path_by_key: dict[str, str] = {}
     relpath_to_keys: dict[str, list[str]] = {}
@@ -406,6 +501,10 @@ def _build_asset_file_index(
 
 
 def _extract_external_assets_name(external_ref: Any) -> str | None:
+    """KR: UnityPy 외부 참조 객체에서 에셋 파일명(basename)을 추출한다.
+    path -> pathName -> name -> fileName -> asset_name -> assetPath 순서로 시도.
+    EN: Extract the asset filename (basename) from a UnityPy external reference object.
+    Tries in order: path -> pathName -> name -> fileName -> asset_name -> assetPath."""
     if external_ref is None:
         return None
 
@@ -440,6 +539,8 @@ def _extract_external_assets_name(external_ref: Any) -> str | None:
 
 
 def _extract_external_assets_candidates(external_ref: Any) -> list[str]:
+    """KR: 외부 참조에서 가능한 모든 경로/이름 후보를 정규화하여 반환한다.
+    EN: Normalize and return all possible path/name candidates from an external reference."""
     if external_ref is None:
         return []
 
@@ -483,6 +584,13 @@ def _extract_external_assets_candidates(external_ref: Any) -> list[str]:
 
 
 def _resolve_external_ref(source_assets_file: Any, file_id: int) -> Any:
+    """KR: SerializedFile의 externals 목록에서 FileID에 해당하는 외부 참조를 반환한다.
+    UnityPy의 externals는 dict(키=FileID) 또는 list(인덱스=FileID-1)일 수 있다.
+    FileID=0이면 자기 자신(같은 파일)을 가리키므로 None을 반환.
+
+    EN: Return the external reference corresponding to a FileID from a SerializedFile's externals list.
+    UnityPy's externals can be a dict (key=FileID) or list (index=FileID-1).
+    FileID=0 refers to self (same file), so None is returned."""
     try:
         resolved_file_id = int(file_id or 0)
     except Exception:
@@ -509,6 +617,10 @@ def _resolve_external_ref(source_assets_file: Any, file_id: int) -> Any:
 
 
 def _resolve_assets_name_from_file_id(source_assets_file: Any, file_id: int) -> str | None:
+    """KR: FileID로 참조되는 에셋 파일의 basename을 해석한다.
+    FileID=0이면 자기 자신의 이름을 반환.
+    EN: Resolve the basename of the asset file referenced by a FileID.
+    If FileID=0, return the name of the file itself."""
     try:
         resolved_file_id = int(file_id or 0)
     except Exception:
@@ -531,6 +643,10 @@ def _collect_asset_file_index_matches(
     asset_file_index: dict[str, Any] | None,
     reference: Any,
 ) -> list[str]:
+    """KR: 에셋 파일 인덱스에서 참조 문자열과 일치하는 모든 키를 수집한다.
+    상대경로 완전 일치 -> 접미사 일치 -> basename 일치 순서로 탐색.
+    EN: Collect all keys from the asset file index matching a reference string.
+    Search order: exact relative path -> suffix match -> basename match."""
     if not isinstance(asset_file_index, dict):
         return []
 
@@ -583,6 +699,10 @@ def _choose_asset_file_match(
     current_file_key: str | None,
     reference_desc: str,
 ) -> str | None:
+    """KR: 여러 매칭 후보 중 최적 1개를 선택한다.
+    단독 매칭 -> 같은 디렉토리 형제 우선 -> 사전순 첫 번째 폴백.
+    EN: Choose the best single match from multiple candidates.
+    Single match -> prefer sibling in same directory -> fallback to first alphabetically."""
     if not matches:
         return None
     if len(matches) == 1:
@@ -615,6 +735,13 @@ def _resolve_target_outer_key(
     local_assets_keys: set[str] | None = None,
     asset_file_index: dict[str, Any] | None,
 ) -> str | None:
+    """KR: FileID 참조를 실제 에셋 파일 키로 해석한다.
+    FileID=0이면 현재 파일(current_outer_key).
+    외부 참조이면 externals -> 후보 경로 -> 인덱스 매칭 순서로 해석.
+
+    EN: Resolve a FileID reference to an actual asset file key.
+    FileID=0 means the current file (current_outer_key).
+    For external refs, resolves via externals -> candidate paths -> index matching."""
     try:
         resolved_file_id = int(file_id or 0)
     except Exception:
@@ -647,6 +774,8 @@ def _resolve_target_outer_key(
 
 
 def _make_assets_object_key(assets_name: str, path_id: int) -> str:
+    """KR: '에셋명|PathID' 형식의 복합 조회 키를 생성한다.
+    EN: Create a composite lookup key in 'assetName|PathID' format."""
     normalized_assets = _normalize_assets_key(assets_name)
     if not normalized_assets:
         normalized_assets = ""
@@ -654,11 +783,15 @@ def _make_assets_object_key(assets_name: str, path_id: int) -> str:
 
 
 def _has_real_atlas_path(ref: Any) -> bool:
+    """KR: PathID > 0이면 실제 텍스처를 가리키는 유효한 참조.
+    EN: A valid reference pointing to an actual texture if PathID > 0."""
     _, path_id = _atlas_ref_ids(ref)
     return path_id > 0
 
 
 def _first_valid_atlas_ref(value: Any) -> JsonDict | None:
+    """KR: 리스트에서 PathID > 0인 첫 번째 유효 아틀라스 참조를 반환한다.
+    EN: Return the first valid atlas reference with PathID > 0 from a list."""
     if not isinstance(value, list):
         return None
     for item in value:
@@ -672,6 +805,13 @@ def _best_atlas_ref(
     *,
     prefer_new: bool,
 ) -> JsonDict | None:
+    """KR: 신형(m_AtlasTextures)/구형(atlas) 중 최선의 아틀라스 참조를 반환한다.
+    우선순위: PathID>0인 유효 참조 -> PathID=0이라도 존재하는 참조.
+    prefer_new=True이면 신형을 먼저 시도.
+
+    EN: Return the best atlas reference from new (m_AtlasTextures) or old (atlas) schema.
+    Priority: valid ref with PathID>0 -> any existing ref even with PathID=0.
+    If prefer_new=True, try new schema first."""
     new_any = _first_atlas_ref(data.get("m_AtlasTextures"))
     new_valid = _first_valid_atlas_ref(data.get("m_AtlasTextures"))
     old_any = (
@@ -695,8 +835,21 @@ def _best_atlas_ref(
 def detect_tmp_version(
     data: JsonDict, unity_version: str | None = None
 ) -> Literal["new", "old"]:
-    """KR: TMP 폰트 데이터가 신형/구형 포맷인지 판별합니다.
-    EN: Detect whether TMP font data uses new or old schema.
+    """KR: TMP 폰트 데이터의 스키마(신형/구형)를 판별한다.
+    판별 순서:
+      1. 글리프 테이블 존재: m_GlyphTable(신형) vs m_glyphInfoList(구형)
+      2. FaceInfo 존재: m_FaceInfo(신형) vs m_fontInfo(구형)
+      3. 아틀라스 참조: m_AtlasTextures(신형) vs atlas(구형)
+      4. Unity 버전 힌트 (2018.3.14 이하=구형, 2018.4.2 이상=신형)
+      5. 기타 키(m_CharacterTable 등) 존재 시 신형 추정
+
+    EN: Determine the schema (new/old) of TMP font data.
+    Detection order:
+      1. Glyph table presence: m_GlyphTable (new) vs m_glyphInfoList (old)
+      2. FaceInfo presence: m_FaceInfo (new) vs m_fontInfo (old)
+      3. Atlas reference: m_AtlasTextures (new) vs atlas (old)
+      4. Unity version hint (<=2018.3.14 = old, >=2018.4.2 = new)
+      5. Other keys (m_CharacterTable, etc.) present -> assume new
     """
     new_glyph_count = _safe_list_len(data.get("m_GlyphTable"))
     old_glyph_count = _safe_list_len(data.get("m_glyphInfoList"))
@@ -732,8 +885,19 @@ def inspect_tmp_font_schema(
     data: JsonDict,
     unity_version: str | None = None,
 ) -> dict[str, Any]:
-    """KR: TMP 스키마 판별 결과와 glyph/atlas 메타를 통합해 반환합니다.
-    EN: Return TMP schema result with unified glyph/atlas metadata.
+    """KR: TMP 스키마 판별 + 글리프 수/아틀라스 참조 메타를 통합 반환한다.
+    반환 딕셔너리:
+      version      : "new" | "old"
+      is_tmp       : TMP 에셋 여부
+      glyph_count  : 글리프 수
+      atlas_file_id, atlas_path_id : 아틀라스 Texture2D 참조
+
+    EN: Detect TMP schema and return combined glyph count / atlas reference metadata.
+    Returned dict:
+      version      : "new" | "old"
+      is_tmp       : whether it is a TMP asset
+      glyph_count  : number of glyphs
+      atlas_file_id, atlas_path_id : atlas Texture2D reference
     """
     target_version = detect_tmp_version(data, unity_version=unity_version)
     new_glyph_count = _safe_list_len(data.get("m_GlyphTable"))
@@ -774,9 +938,13 @@ def inspect_tmp_font_schema(
 
 
 def is_tmp_font_asset(obj: Any) -> bool:
-    """KR: MonoBehaviour 객체가 TMP 폰트 에셋인지 판별합니다.
-    EN: Determine whether a MonoBehaviour object is a TMP font asset.
-    """
+    """KR: MonoBehaviour 객체가 TMP FontAsset인지 판별한다.
+    1차: parse_as_object()로 get_type() == "TMP_FontAsset" 확인.
+    2차: parse_as_dict()로 inspect_tmp_font_schema() 호출.
+
+    EN: Determine whether a MonoBehaviour object is a TMP FontAsset.
+    First: check get_type() == "TMP_FontAsset" via parse_as_object().
+    Second: call inspect_tmp_font_schema() via parse_as_dict()."""
     try:
         parse_obj = obj.parse_as_object()
         if hasattr(parse_obj, "get_type") and parse_obj.get_type() == "TMP_FontAsset":
@@ -805,9 +973,19 @@ def is_tmp_font_asset(obj: Any) -> bool:
 
 
 def extract_tmp_refs(parse_dict: JsonDict) -> dict[str, int] | None:
-    """KR: TMP 폰트 데이터에서 atlas/material FileID/PathID를 추출합니다.
-    EN: Extract atlas/material FileID/PathID pairs from TMP font data.
-    """
+    """KR: TMP 폰트 데이터에서 atlas Texture2D와 Material의 참조 ID를 추출한다.
+    반환:
+      atlas_file_id, atlas_path_id, material_file_id, material_path_id
+    또는 유효하지 않으면(글리프 0개, 참조 없음, 외부 stub) None.
+    부수효과: m_CreationSettings.characterSequence를 빈 문자열로 정규화하여
+    직렬화 diff 노이즈를 방지한다.
+
+    EN: Extract atlas Texture2D and Material reference IDs from TMP font data.
+    Returns:
+      atlas_file_id, atlas_path_id, material_file_id, material_path_id
+    or None if invalid (zero glyphs, no reference, or external stub).
+    Side effect: normalizes m_CreationSettings.characterSequence to empty string
+    to prevent noisy serialization diffs."""
     info = inspect_tmp_font_schema(parse_dict)
     glyph_count = int(info.get("glyph_count", 0) or 0)
     version = str(info.get("version", "new"))
@@ -853,9 +1031,21 @@ def export_fonts(
     output_dir: str | None = None,
     lang: Language = "ko",
 ) -> int:
-    """KR: 게임 내 TMP SDF 폰트 JSON/PNG를 추출합니다.
-    EN: Export TMP SDF font JSON/PNG assets from a game.
-    """
+    """KR: 게임 에셋에서 TMP SDF 폰트를 JSON/PNG로 추출한다.
+    처리 흐름:
+      1패스: 모든 에셋 파일의 MonoBehaviour -> TMP FontAsset 판별 -> JSON 저장
+             + atlas/material 참조를 outer_key별로 수집
+      2패스: 수집된 참조 대상 에셋 파일만 재로드 -> Texture2D -> PNG,
+             Material -> JSON 추출
+    반환: 추출된 SDF 폰트 수.
+
+    EN: Extract TMP SDF fonts from game assets as JSON/PNG.
+    Processing flow:
+      Pass 1: All asset files' MonoBehaviours -> identify TMP FontAsset -> save JSON
+              + collect atlas/material references per outer_key
+      Pass 2: Reload only referenced asset files -> Texture2D -> PNG,
+              Material -> JSON extraction
+    Returns: number of extracted SDF fonts."""
     if output_dir is None:
         output_dir = os.getcwd()
     os.makedirs(output_dir, exist_ok=True)
@@ -1177,9 +1367,10 @@ def export_fonts(
 
 
 def main_cli(lang: Language = "ko") -> None:
-    """KR: SDF 폰트 추출 CLI 진입점입니다.
-    EN: CLI entry point for SDF font export.
-    """
+    """KR: SDF 폰트 추출 CLI 엔트리포인트.
+    게임 경로를 인자 또는 대화형 입력으로 받아 export_fonts()를 실행한다.
+    EN: CLI entry point for SDF font extraction.
+    Accepts a game path via argument or interactive input and runs export_fonts()."""
     _configure_logging()
     parser = argparse.ArgumentParser(
         description=(

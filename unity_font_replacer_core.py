@@ -1,7 +1,30 @@
-"""Core CLI and processing pipeline for Unity font replacement.
+"""KR: Unity 폰트 교체를 위한 핵심 CLI 및 처리 파이프라인.
+이 모듈은 Unity 폰트 에셋의 스캔, 파싱, 교체, 프리뷰 내보내기,
+    PS5 swizzle/unswizzle 지원 기능을 포함합니다.
+주요 기능:
+      - TTF 바이너리 교체: 기존 폰트 파일의 바이너리 데이터를 새 폰트로 대체
+      - TMP SDF 폰트 데이터 변환: 구 스키마(old)와 신 스키마(new) 간 양방향 변환
+      - 아틀라스 텍스처 교체: SDF 아틀라스 이미지 데이터 교체
+      - 머티리얼 패칭: TMP 머티리얼의 셰이더 프로퍼티 패딩/스타일 보정
+      - PS5 swizzle/unswizzle: PlayStation 5 텍스처 메모리 레이아웃 처리
+      - 프리뷰 내보내기: 교체 전후 미리보기 이미지 출력
+TMP 스키마 경계:
+      - 구 스키마 (old): Unity <=2018.3.14, m_glyphInfoList 사용, top-origin Y 좌표계
+      - 신 스키마 (new): Unity >=2018.4.2, m_GlyphTable 사용, bottom-origin Y 좌표계
 
-This module contains scanning, parsing, replacement, preview export, and
-PS5 swizzle/unswizzle support for Unity font assets.
+EN: Core CLI and processing pipeline for Unity font replacement.
+This module includes scanning, parsing, replacement, preview export,
+    and PS5 swizzle/unswizzle support for Unity font assets.
+Key features:
+      - TTF binary replacement: replace binary data of existing font files with new fonts
+      - TMP SDF font data conversion: bidirectional conversion between old and new schemas
+      - Atlas texture replacement: replace SDF atlas image data
+      - Material patching: padding/style correction of TMP material shader properties
+      - PS5 swizzle/unswizzle: PlayStation 5 texture memory layout handling
+      - Preview export: output before/after preview images
+TMP schema boundaries:
+      - Old schema: Unity <=2018.3.14, uses m_glyphInfoList, top-origin Y coordinates
+      - New schema: Unity >=2018.4.2, uses m_GlyphTable, bottom-origin Y coordinates
 """
 
 from __future__ import annotations
@@ -38,12 +61,12 @@ from UnityPy.helpers import CompressionHelper
 from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
 try:
     from UnityPy.enums import TextureFormat as _UnityTextureFormatEnum
-except Exception:  # pragma: no cover - optional at runtime
+except Exception:  # pragma: no cover - KR: 런타임에서 선택적으로 사용 / EN: optionally used at runtime
     _UnityTextureFormatEnum = None
 
 try:
     import texture2ddecoder
-except Exception:  # pragma: no cover - optional dependency
+except Exception:  # pragma: no cover - KR: 선택적 의존성 / EN: optional dependency
     texture2ddecoder = None
 
 logger = logging.getLogger(__name__)
@@ -51,16 +74,31 @@ logger = logging.getLogger(__name__)
 
 Language = Literal["ko", "en"]
 JsonDict = dict[str, Any]
+# KR: 등록된 임시 디렉토리 집합 (프로세스 종료 시 정리용)
+# EN: Set of registered temp directories (cleaned up on process exit)
 _REGISTERED_TEMP_DIRS: set[str] = set()
+# KR: 텍스처 자동 분할 기준값: 단일 텍스처가 이 바이트 수를 초과하면 원샷 분할 적용
+# EN: Auto-split threshold: apply one-shot split when a single texture exceeds this byte count
 _AUTO_SPLIT_ONESHOT_TEXTURE_BYTES = 1536 * 1024 * 1024
+# KR: 텍스처 배치 분할 목표 바이트 수
+# EN: Texture batch split target byte count
 _AUTO_SPLIT_TEXTURE_BATCH_TARGET_BYTES = 768 * 1024 * 1024
+# KR: PS5 swizzle 비트 마스크: X축 인터리브 패턴
+# EN: PS5 swizzle bit mask: X-axis interleave pattern
 PS5_SWIZZLE_MASK_X = 0x385F0
+# KR: PS5 swizzle 비트 마스크: Y축 인터리브 패턴
+# EN: PS5 swizzle bit mask: Y-axis interleave pattern
 PS5_SWIZZLE_MASK_Y = 0x07A0F
+# KR: PS5 텍스처 회전 각도 (도)
+# EN: PS5 texture rotation angle (degrees)
 PS5_SWIZZLE_ROTATE = 90
 
-# PS5 texture layout metadata.
-# word0 is the first qword field (e.g. 0x1d0000000a for DXT1/BC1).
-# block_pack packs bytes-per-block, width, height, and depth.
+# KR: PS5 텍스처 레이아웃 메타데이터.
+#     word0: 첫 번째 qword 필드 (예: DXT1/BC1의 경우 0x1d0000000a).
+#     block_pack: 블록당 바이트 수, 너비, 높이, 깊이를 하나의 정수로 패킹한 값.
+# EN: PS5 texture layout metadata.
+#     word0: first qword field (e.g. 0x1d0000000a for DXT1/BC1).
+#     block_pack: packed integer of bytes per block, width, height, depth.
 _PS5_LAYOUT_FORMAT_META: dict[int, dict[str, Any]] = {
     4: {"label": "R8B8G8A8", "word0": 0x00000004, "block_pack": 0x1010104},
     10: {"label": "DXT1|BC1", "word0": 0x1D0000000A, "block_pack": 0x1040408},
@@ -71,8 +109,10 @@ _PS5_LAYOUT_FORMAT_META: dict[int, dict[str, Any]] = {
     27: {"label": "BC5", "word0": 0x1D0000001B, "block_pack": 0x1040410},
 }
 
-# Extra format flags used by the runtime layout selection logic.
-# `layout_shift` is derived as: ((flags & 0x6) * 2) + 8.
+# KR: 런타임 레이아웃 선택 로직에서 사용하는 추가 포맷 플래그.
+#     `layout_shift`는 다음과 같이 계산됨: ((flags & 0x6) * 2) + 8.
+# EN: Additional format flags used in runtime layout selection logic.
+#     `layout_shift` is computed as: ((flags & 0x6) * 2) + 8.
 _PS5_LAYOUT_FORMAT_FLAGS: dict[int, int] = {
     10: 0x0024,  # DXT1|BC1
     12: 0x0000,  # DXT5|BC3
@@ -81,6 +121,8 @@ _PS5_LAYOUT_FORMAT_FLAGS: dict[int, int] = {
     26: 0x00A4,  # BC4
     27: 0x0084,  # BC5
 }
+# KR: 각 텍스처 포맷에 대응하는 BC 디코더 함수명 매핑
+# EN: BC decoder function name mapping for each texture format
 _PS5_BC_DECODER_BY_FORMAT: dict[int, str] = {
     10: "decode_bc1",
     12: "decode_bc3",
@@ -92,6 +134,18 @@ _PS5_BC_DECODER_BY_FORMAT: dict[int, str] = {
 
 
 def _ps5_unpack_block_pack(block_pack: int) -> tuple[int, int, int, int]:
+    """KR: block_pack 정수에서 블록당 바이트 수, 블록 너비, 블록 높이, 깊이를 추출한다.
+    매개변수:
+        block_pack: 4바이트로 패킹된 정수 (하위부터 bytes_per_block, block_w, block_h, depth)
+    반환값:
+        (bytes_per_block, block_w, block_h, depth) 튜플
+
+    EN: Extract bytes per block, block width, block height, and depth from a block_pack integer.
+    Args:
+        block_pack: 4바이트로 패킹된 정수 (하위부터 bytes_per_block, block_w, block_h, depth)
+    Returns:
+        (bytes_per_block, block_w, block_h, depth) 튜플
+    """
     packed = int(block_pack) & 0xFFFFFFFF
     bytes_per_block = packed & 0xFF
     block_w = (packed >> 8) & 0xFF
@@ -101,6 +155,14 @@ def _ps5_unpack_block_pack(block_pack: int) -> tuple[int, int, int, int]:
 
 
 def _ps5_build_bc_formats_from_layout_meta() -> dict[int, tuple[int, int, int, str]]:
+    """KR: 레이아웃 메타데이터로부터 BC 포맷 정보 딕셔너리를 구성한다.
+    반환값:
+        {텍스처포맷ID: (블록너비, 블록높이, 블록당바이트, 디코더함수명)} 딕셔너리
+
+    EN: Build a BC format info dictionary from layout metadata.
+    Returns:
+        {텍스처포맷ID: (블록너비, 블록높이, 블록당바이트, 디코더함수명)} 딕셔너리
+    """
     out: dict[int, tuple[int, int, int, str]] = {}
     for texture_format, decoder_name in _PS5_BC_DECODER_BY_FORMAT.items():
         meta = _PS5_LAYOUT_FORMAT_META.get(int(texture_format))
@@ -113,20 +175,25 @@ def _ps5_build_bc_formats_from_layout_meta() -> dict[int, tuple[int, int, int, s
     return out
 
 
+# KR: BC 포맷 테이블: 레이아웃 메타에서 빌드된 {포맷ID: (블록W, 블록H, 블록바이트, 디코더명)}
+# EN: BC format table: built from layout meta {formatID: (blockW, blockH, blockBytes, decoderName)}
 _PS5_BC_FORMATS: dict[int, tuple[int, int, int, str]] = _ps5_build_bc_formats_from_layout_meta()
 
-# Swizzle modes for Addrlib v2 (GFX10+) used by PS5.
-_PS5_ADDR_SW_256B_S = 1
-_PS5_ADDR_SW_256B_D = 2
-_PS5_ADDR_SW_4KB_S = 5
-_PS5_ADDR_SW_4KB_D = 6
-_PS5_ADDR_SW_64KB_S = 9
-_PS5_ADDR_SW_64KB_D = 10
-_PS5_ADDR_SW_4KB_S_X = 21
-_PS5_ADDR_SW_4KB_D_X = 22
-_PS5_ADDR_SW_64KB_S_X = 25
-_PS5_ADDR_SW_64KB_D_X = 26
+# KR: Addrlib v2 (GFX10+) swizzle 모드 상수 (PS5에서 사용)
+# EN: Addrlib v2 (GFX10+) swizzle mode constants (used on PS5)
+_PS5_ADDR_SW_256B_S = 1    # KR: 256바이트 표준 / EN: 256-byte standard
+_PS5_ADDR_SW_256B_D = 2    # KR: 256바이트 디스플레이 / EN: 256-byte display
+_PS5_ADDR_SW_4KB_S = 5     # KR: 4KB 표준 / EN: 4KB standard
+_PS5_ADDR_SW_4KB_D = 6     # KR: 4KB 디스플레이 / EN: 4KB display
+_PS5_ADDR_SW_64KB_S = 9    # KR: 64KB 표준 / EN: 64KB standard
+_PS5_ADDR_SW_64KB_D = 10   # KR: 64KB 디스플레이 / EN: 64KB display
+_PS5_ADDR_SW_4KB_S_X = 21  # KR: 4KB 표준 확장 / EN: 4KB standard extended
+_PS5_ADDR_SW_4KB_D_X = 22  # KR: 4KB 디스플레이 확장 / EN: 4KB display extended
+_PS5_ADDR_SW_64KB_S_X = 25 # KR: 64KB 표준 확장 / EN: 64KB standard extended
+_PS5_ADDR_SW_64KB_D_X = 26 # KR: 64KB 디스플레이 확장 / EN: 64KB display extended
 
+# KR: BC 모드 정보: {모드명: (swizzle모드ID, 패턴정보테이블명, 로그2페이지크기, X확장여부)}
+# EN: BC mode info: {modeName: (swizzleModeID, patternInfoTableName, log2PageSize, isXorMode)}
 _PS5_BC_MODE_INFO: dict[str, tuple[int, str, int, bool]] = {
     "256B_S": (_PS5_ADDR_SW_256B_S, "GFX10_SW_256_S_PATINFO", 8, False),
     "256B_D": (_PS5_ADDR_SW_256B_D, "GFX10_SW_256_D_PATINFO", 8, False),
@@ -139,9 +206,14 @@ _PS5_BC_MODE_INFO: dict[str, tuple[int, str, int, bool]] = {
     "64KB_S_X": (_PS5_ADDR_SW_64KB_S_X, "GFX10_SW_64K_S_X_PATINFO", 16, True),
     "64KB_D_X": (_PS5_ADDR_SW_64KB_D_X, "GFX10_SW_64K_D_X_PATINFO", 16, True),
 }
+# KR: 빠른 모드 탐색 순서 (자주 사용되는 모드 우선)
+# EN: Fast mode search order (frequently used modes first)
 _PS5_BC_FAST_MODE_NAMES = ["4KB_S", "64KB_S", "4KB_D", "256B_S", "64KB_D", "256B_D"]
 
-# Thin 2D tile dimensions by page class.
+# KR: Thin 2D 타일 차원 (페이지 클래스별): {블록당바이트: (x비트수, y비트수)}
+#     256바이트 페이지 클래스
+# EN: Thin 2D tile dimensions (by page class): {bytesPerBlock: (xBits, yBits)}
+#     256-byte page class
 _PS5_LAYOUT_BLOCK256_2D_BITS: dict[int, tuple[int, int]] = {
     1: (4, 4),
     2: (4, 3),
@@ -149,6 +221,8 @@ _PS5_LAYOUT_BLOCK256_2D_BITS: dict[int, tuple[int, int]] = {
     8: (3, 2),
     16: (2, 2),
 }
+# KR: 4KB 페이지 클래스
+# EN: 4KB page class
 _PS5_LAYOUT_BLOCK4K_2D_BITS: dict[int, tuple[int, int]] = {
     1: (6, 6),
     2: (6, 5),
@@ -156,6 +230,8 @@ _PS5_LAYOUT_BLOCK4K_2D_BITS: dict[int, tuple[int, int]] = {
     8: (5, 4),
     16: (4, 4),
 }
+# KR: 64KB 페이지 클래스
+# EN: 64KB page class
 _PS5_LAYOUT_BLOCK64K_2D_BITS: dict[int, tuple[int, int]] = {
     1: (8, 8),
     2: (8, 7),
@@ -164,7 +240,8 @@ _PS5_LAYOUT_BLOCK64K_2D_BITS: dict[int, tuple[int, int]] = {
     16: (6, 6),
 }
 
-# 4KB_S triplets indexed by log2(bytes_per_block).
+# KR: 4KB_S 트리플릿: log2(블록당바이트)별 인덱싱 {블록바이트: (깊이비트, x비트, y비트)}
+# EN: 4KB_S triplets: indexed by log2(bytesPerBlock) {blockBytes: (depthBits, xBits, yBits)}
 _PS5_4KB_S_TRIPLETS_BY_BLOCK_BYTES: dict[int, tuple[int, int, int]] = {
     1: (0, 6, 6),
     2: (0, 6, 5),
@@ -173,27 +250,40 @@ _PS5_4KB_S_TRIPLETS_BY_BLOCK_BYTES: dict[int, tuple[int, int, int]] = {
     16: (0, 4, 4),
 }
 
-# Per-format micro-tile dimensions.
+# KR: 포맷별 마이크로타일 차원: {블록당바이트: (x비트수, y비트수)}
+# EN: Micro-tile dimensions per format: {bytesPerBlock: (xBits, yBits)}
 _PS5_MICRO_TILE_BITS: dict[int, tuple[int, int]] = {
-    1: (5, 4),  # 32x16
-    2: (4, 3),  # 16x8
-    3: (4, 3),  # 16x8
-    4: (3, 2),  #  8x4
+    1: (5, 4),  # KR: 32x16 픽셀 / EN: 32x16 pixels
+    2: (4, 3),  # KR: 16x8 픽셀 / EN: 16x8 pixels
+    3: (4, 3),  # KR: 16x8 픽셀 / EN: 16x8 pixels
+    4: (3, 2),  # KR: 8x4 픽셀 / EN: 8x4 pixels
 }
-_PS5_MICRO_X_BITS_DEFAULT = 5  # 8bpp default
-_PS5_MICRO_Y_BITS_DEFAULT = 4
+_PS5_MICRO_X_BITS_DEFAULT = 5  # KR: 8bpp 기본 X 비트 수 / EN: 8bpp default X bit count
+_PS5_MICRO_Y_BITS_DEFAULT = 4  # KR: 8bpp 기본 Y 비트 수 / EN: 8bpp default Y bit count
 
-# Axis handling for non-square textures.
+# KR: 비정사각형 텍스처의 축 전치 여부: {블록당바이트: 전치여부}
+# EN: Axis transpose for non-square textures: {bytesPerBlock: shouldTranspose}
 _PS5_AXIS_TRANSPOSE: dict[int, bool] = {
-    1: True,   # Alpha8: always transposed
+    1: True,   # KR: Alpha8: 항상 전치 / EN: Alpha8: always transpose
     2: False,
     3: False,
-    4: False,  # RGBA32: never transposed
+    4: False,  # KR: RGBA32: 전치 안 함 / EN: RGBA32: no transpose
 }
 
 
 def _ps5_get_micro_tile_bits(bytes_per_element: int = 1) -> tuple[int, int]:
-    """Return (x_bits, y_bits) for the given bytes-per-element."""
+    """KR: 주어진 요소당 바이트 수에 대한 마이크로타일 비트 수를 반환한다.
+    매개변수:
+        bytes_per_element: 픽셀당 바이트 수 (bpe)
+    반환값:
+        (x_bits, y_bits) 튜플
+
+    EN: Return micro-tile bit counts for the given bytes per element.
+    Args:
+        bytes_per_element: 픽셀당 바이트 수 (bpe)
+    Returns:
+        (x_bits, y_bits) 튜플
+    """
     return _PS5_MICRO_TILE_BITS.get(
         bytes_per_element,
         (_PS5_MICRO_X_BITS_DEFAULT, _PS5_MICRO_Y_BITS_DEFAULT),
@@ -205,30 +295,56 @@ def _emit_phase_callback(
     phase: str,
     **payload: Any,
 ) -> None:
+    """KR: 진행 단계 콜백을 안전하게 호출한다.
+    매개변수:
+        phase_callback: 호출할 콜백 함수 (None이면 무시)
+        phase: 현재 처리 단계 이름
+        **payload: 콜백에 전달할 추가 데이터
+
+    EN: Safely invoke a progress phase callback.
+    Args:
+        phase_callback: 호출할 콜백 함수 (None이면 무시)
+        phase: 현재 처리 단계 이름
+        **payload: 콜백에 전달할 추가 데이터
+    """
     if phase_callback is None:
         return
     try:
         phase_callback(phase, cast(JsonDict, payload))
     except Exception:
-        logger.debug("phase callback failed for %s", phase, exc_info=True)
-# KR: Unity-Runtime-Libraries reports/sdf_font 분석 기준 경계 버전입니다.
-# EN: Boundary versions derived from Unity-Runtime-Libraries reports/sdf_font.
+        logger.debug("단계 콜백 실패: %s", phase, exc_info=True)
+# KR: Unity-Runtime-Libraries reports/sdf_font 분석 기준 경계 버전
+#     구 스키마(old)만 지원하는 마지막 버전
+# EN: Unity-Runtime-Libraries reports/sdf_font analysis boundary versions
+#     Last version supporting only old schema
 _TMP_OLD_ONLY_LAST = (2018, 3, 14)
+# KR: 신 스키마(new)가 처음 도입된 버전
+# EN: First version introducing new schema
 _TMP_NEW_SCHEMA_FIRST = (2018, 4, 2)
+# KR: TMP 폰트 에셋 생성 설정 키 (버전별로 다른 이름 사용)
+# EN: TMP font asset creation settings key (different names per version)
 _TMP_CREATION_SETTINGS_KEYS = (
     "m_CreationSettings",
     "m_FontAssetCreationSettings",
     "m_fontAssetCreationEditorSettings",
 )
+# KR: TMP 더티 플래그 키 (룩업 테이블 재빌드 필요 여부)
+# EN: TMP dirty flag key (whether lookup table rebuild is needed)
 _TMP_DIRTY_FLAG_KEYS = (
     "m_IsFontAssetLookupTablesDirty",
     "IsFontAssetLookupTablesDirty",
 )
+# KR: TMP 글리프 인덱스 목록 키
+# EN: TMP glyph index list keys
 _TMP_GLYPH_INDEX_LIST_KEYS = (
     "m_GlyphIndexList",
     "m_GlyphIndexes",
 )
+# KR: Unity 에셋 번들 시그니처 문자열 집합
+# EN: Unity asset bundle signature string set
 BUNDLE_SIGNATURES = {"UnityFS", "UnityWeb", "UnityRaw"}
+# KR: 구 스키마 라인 메트릭 키 목록 (TMP <=2018.3.14)
+# EN: Old schema line metric key list (TMP <=2018.3.14)
 _OLD_LINE_METRIC_KEYS = (
     "LineHeight",
     "Baseline",
@@ -246,6 +362,8 @@ _OLD_LINE_METRIC_KEYS = (
     "strikethroughThickness",
     "TabWidth",
 )
+# KR: 구 스키마에서 스케일 보정 대상이 되는 라인 메트릭 키
+# EN: Old schema line metric keys subject to scale correction
 _OLD_LINE_METRIC_SCALE_KEYS = (
     "LineHeight",
     "Baseline",
@@ -261,6 +379,8 @@ _OLD_LINE_METRIC_SCALE_KEYS = (
     "strikethroughThickness",
     "TabWidth",
 )
+# KR: 신 스키마 라인 메트릭 키 목록 (TMP >=2018.4.2)
+# EN: New schema line metric key list (TMP >=2018.4.2)
 _NEW_LINE_METRIC_KEYS = (
     "m_LineHeight",
     "m_AscentLine",
@@ -279,6 +399,8 @@ _NEW_LINE_METRIC_KEYS = (
     "m_StrikethroughThickness",
     "m_TabWidth",
 )
+# KR: 신 스키마에서 스케일 보정 대상이 되는 라인 메트릭 키
+# EN: New schema line metric keys subject to scale correction
 _NEW_LINE_METRIC_SCALE_KEYS = (
     "m_LineHeight",
     "m_AscentLine",
@@ -294,6 +416,8 @@ _NEW_LINE_METRIC_SCALE_KEYS = (
     "m_StrikethroughThickness",
     "m_TabWidth",
 )
+# KR: 머티리얼 패딩 스케일 키: 아틀라스 크기 변경 시 비례 보정이 필요한 셰이더 프로퍼티
+# EN: Material padding scale keys: shader properties needing proportional correction on atlas size change
 _MATERIAL_PADDING_SCALE_KEYS = (
     "_GradientScale",
     "_FaceDilate",
@@ -307,6 +431,8 @@ _MATERIAL_PADDING_SCALE_KEYS = (
     "_GlowInner",
     "_GlowOuter",
 )
+# KR: 머티리얼 스타일 float 키: 원본 머티리얼의 시각적 스타일을 보존해야 하는 프로퍼티
+# EN: Material style float keys: properties that must preserve the original material visual style
 _MATERIAL_STYLE_FLOAT_KEYS = (
     "_FaceDilate",
     "_OutlineWidth",
@@ -322,6 +448,8 @@ _MATERIAL_STYLE_FLOAT_KEYS = (
     "_ScaleRatioB",
     "_ScaleRatioC",
 )
+# KR: 머티리얼 스타일에서 패딩 스케일 보정이 필요한 키
+# EN: Material style keys needing padding scale correction
 _MATERIAL_STYLE_PADDING_SCALE_KEYS = (
     "_FaceDilate",
     "_OutlineWidth",
@@ -334,25 +462,42 @@ _MATERIAL_STYLE_PADDING_SCALE_KEYS = (
     "_GlowInner",
     "_GlowOuter",
 )
+# KR: 머티리얼 스타일 색상 키: 원본에서 보존해야 하는 색상 프로퍼티
+# EN: Material style color keys: color properties to preserve from original
 _MATERIAL_STYLE_COLOR_KEYS = (
     "_FaceColor",
     "_OutlineColor",
     "_UnderlayColor",
     "_GlowColor",
 )
+# KR: 외곽선 비율 보정 대상 키
+# EN: Outline ratio correction target keys
 _MATERIAL_OUTLINE_RATIO_KEYS = (
     "_OutlineWidth",
     "_OutlineSoftness",
 )
-LOG_CONSOLE_FORMAT = "%(message)s"
-LOG_FILE_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-LOG_FILE_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
-VERBOSE_LOG_FILENAME = "verbose.txt"
+# KR: 로그 포맷 상수
+# EN: Log format constants
+LOG_CONSOLE_FORMAT = "%(message)s"  # KR: 콘솔 출력 포맷 (메시지만) / EN: Console output format (message only)
+LOG_FILE_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"  # KR: 파일 로그 포맷 / EN: File log format
+LOG_FILE_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"  # KR: 파일 로그 날짜 포맷 / EN: File log date format
+VERBOSE_LOG_FILENAME = "verbose.txt"  # KR: 상세 로그 파일명 / EN: Verbose log filename
 
 
 def _compose_log_message(*parts: object, sep: str = " ") -> str:
-    """KR: 로그 파트를 하나의 문자열로 합칩니다.
-    EN: Join variadic log parts into one message string.
+    """KR: 로그 파트들을 하나의 문자열로 합친다.
+    매개변수:
+        *parts: 로그 메시지를 구성하는 각 부분
+        sep: 구분자 (기본: 공백)
+    반환값:
+        합쳐진 로그 메시지 문자열
+
+    EN: Combine log parts into a single string.
+    Args:
+        *parts: 로그 메시지를 구성하는 각 부분
+        sep: 구분자 (기본: 공백)
+    Returns:
+        합쳐진 로그 메시지 문자열
     """
     return sep.join(str(part) for part in parts)
 
@@ -361,8 +506,15 @@ def _configure_logging(
     console_level: int = logging.INFO,
     verbose_log_path: str | None = None,
 ) -> None:
-    """KR: 콘솔/파일 로그 핸들러를 구성합니다.
-    EN: Configure console and optional verbose file handlers.
+    """KR: 콘솔 및 선택적 파일 로그 핸들러를 구성한다.
+    매개변수:
+        console_level: 콘솔 출력 로그 레벨 (기본: INFO)
+        verbose_log_path: 상세 로그 파일 경로 (None이면 파일 로그 비활성화)
+
+    EN: Configure console and optional file log handlers.
+    Args:
+        console_level: 콘솔 출력 로그 레벨 (기본: INFO)
+        verbose_log_path: 상세 로그 파일 경로 (None이면 파일 로그 비활성화)
     """
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
@@ -387,7 +539,20 @@ def _configure_logging(
 
 
 def _coerce_log_level(message: str, default_level: int = logging.INFO) -> int:
-    """Infer logging level from localized message prefixes."""
+    """KR: 지역화된 메시지 접두사로부터 로그 레벨을 추론한다.
+    매개변수:
+        message: 로그 메시지 문자열
+        default_level: 추론 실패 시 기본 레벨 (기본: INFO)
+    반환값:
+        추론된 로그 레벨 정수
+
+    EN: Infer log level from localized message prefix.
+    Args:
+        message: 로그 메시지 문자열
+        default_level: 추론 실패 시 기본 레벨 (기본: INFO)
+    Returns:
+        추론된 로그 레벨 정수
+    """
     lowered = message.lower()
     if "경고" in message or "warning" in lowered:
         return logging.WARNING
@@ -407,7 +572,20 @@ def _log_console(
     level: int | None = None,
     include_traceback: bool = False,
 ) -> None:
-    """Print-compatible logging bridge used by legacy call sites."""
+    """KR: 레거시 호출 지점에서 사용하는 print 호환 로깅 브리지.
+    매개변수:
+        *parts: 로그 메시지 부분들
+        sep: 구분자
+        level: 로그 레벨 (None이면 메시지 내용에서 자동 추론)
+        include_traceback: True이면 예외 Traceback 포함
+
+    EN: Print-compatible logging bridge used at legacy call sites.
+    Args:
+        *parts: 로그 메시지 부분들
+        sep: 구분자
+        level: 로그 레벨 (None이면 메시지 내용에서 자동 추론)
+        include_traceback: True이면 예외 Traceback 포함
+    """
     message = _compose_log_message(*parts, sep=sep)
     resolved_level = _coerce_log_level(message) if level is None else level
     if include_traceback:
@@ -417,36 +595,36 @@ def _log_console(
 
 
 def _log_debug(*parts: object, sep: str = " ") -> None:
-    """KR: 디버그 레벨 로그를 기록합니다.
-    EN: Emit debug-level message.
+    """KR: 디버그 레벨 로그를 기록한다.
+    EN: Record a debug-level log entry.
     """
     logger.debug(_compose_log_message(*parts, sep=sep))
 
 
 def _log_info(*parts: object, sep: str = " ") -> None:
-    """KR: 정보 레벨 로그를 기록합니다.
-    EN: Emit info-level message.
+    """KR: 정보 레벨 로그를 기록한다.
+    EN: Record an info-level log entry.
     """
     logger.info(_compose_log_message(*parts, sep=sep))
 
 
 def _log_warning(*parts: object, sep: str = " ") -> None:
-    """KR: 경고 레벨 로그를 기록합니다.
-    EN: Emit warning-level message.
+    """KR: 경고 레벨 로그를 기록한다.
+    EN: Record a warning-level log entry.
     """
     logger.warning(_compose_log_message(*parts, sep=sep))
 
 
 def _log_error(*parts: object, sep: str = " ") -> None:
-    """KR: 오류 레벨 로그를 기록합니다.
-    EN: Emit error-level message.
+    """KR: 오류 레벨 로그를 기록한다.
+    EN: Record an error-level log entry.
     """
     logger.error(_compose_log_message(*parts, sep=sep))
 
 
 def _log_exception(*parts: object, sep: str = " ") -> None:
-    """KR: 예외 Traceback 포함 에러 로그를 기록합니다.
-    EN: Emit exception message with traceback.
+    """KR: 예외 Traceback을 포함한 에러 로그를 기록한다.
+    EN: Record an error log entry including exception traceback.
     """
     logger.exception(_compose_log_message(*parts, sep=sep))
 
@@ -455,62 +633,89 @@ def _log_exception(*parts: object, sep: str = " ") -> None:
 def compute_ps5_swizzle_masks(
     width: int, height: int, bytes_per_element: int = 1,
 ) -> tuple[int, int]:
-    """KR: 텍스처 크기에 맞는 PS5 swizzle 마스크를 계산합니다.
-    EN: Compute PS5 swizzle bit-masks for the given texture dimensions.
+    """KR: 텍스처 크기에 맞는 PS5 swizzle 비트 마스크를 계산한다.
+    PS5 텍스처 메모리는 타일 기반 swizzle 레이아웃을 사용한다.
+    마이크로타일 크기는 요소당 바이트 수(bpe)에 따라 결정된다:
+      bpe=1 -> 32x16, bpe=4 -> 8x4 등.
+    매크로타일 비트는 마이크로타일 비트 위에 다음 순서로 인터리브된다:
+      첫 번째 Y, 첫 번째 X, 나머지 Y..., 나머지 X...
+    매개변수:
+        width: 텍스처 너비 (2의 거듭제곱이어야 함)
+        height: 텍스처 높이 (2의 거듭제곱이어야 함)
+        bytes_per_element: 픽셀당 바이트 수 (기본: 1)
+    반환값:
+        (mask_x, mask_y) swizzle 비트 마스크 튜플
+    예외:
+        ValueError: 유효하지 않은 차원이거나 2의 거듭제곱이 아닌 경우
 
-    Micro-tile size depends on bytes-per-element (bpe):
-      bpe=1 → 32×16,  bpe=4 → 8×4, etc.
-    Macro-tile bits are interleaved as:
-    first-Y, first-X, remaining-Y…, remaining-X… above the micro-tile bits.
-    Dimensions must be powers of two and >= micro-tile size.
+    EN: Compute PS5 swizzle bit masks for the given texture dimensions.
+    PS5 텍스처 메모리는 타일 기반 swizzle 레이아웃을 사용한다.
+    마이크로타일 크기는 요소당 바이트 수(bpe)에 따라 결정된다:
+      bpe=1 -> 32x16, bpe=4 -> 8x4 등.
+    매크로타일 비트는 마이크로타일 비트 위에 다음 순서로 인터리브된다:
+      첫 번째 Y, 첫 번째 X, 나머지 Y..., 나머지 X...
+    Args:
+        width: 텍스처 너비 (2의 거듭제곱이어야 함)
+        height: 텍스처 높이 (2의 거듭제곱이어야 함)
+        bytes_per_element: 픽셀당 바이트 수 (기본: 1)
+    Returns:
+        (mask_x, mask_y) swizzle 비트 마스크 튜플
+    Raises:
+        ValueError: 유효하지 않은 차원이거나 2의 거듭제곱이 아닌 경우
     """
     if width <= 0 or height <= 0:
-        raise ValueError(f"Invalid dimensions for PS5 swizzle masks: {width}x{height}")
+        raise ValueError(f"PS5 swizzle 마스크에 유효하지 않은 크기: {width}x{height}")
     if width & (width - 1) or height & (height - 1):
         raise ValueError(
-            f"PS5 swizzle requires power-of-two dimensions: {width}x{height}"
+            f"PS5 swizzle에는 2의 거듭제곱 크기가 필요합니다: {width}x{height}"
         )
     micro_x_bits, micro_y_bits = _ps5_get_micro_tile_bits(bytes_per_element)
     micro_w = 1 << micro_x_bits
     micro_h = 1 << micro_y_bits
     if width < micro_w or height < micro_h:
         raise ValueError(
-            f"Texture too small for PS5 swizzle micro-tile ({micro_w}x{micro_h}): "
+            f"PS5 swizzle 마이크로타일({micro_w}x{micro_h})보다 작은 텍스처: "
             f"{width}x{height}"
         )
-    total_x = width.bit_length() - 1  # log2(width)
-    total_y = height.bit_length() - 1  # log2(height)
-    macro_x = total_x - micro_x_bits
-    macro_y = total_y - micro_y_bits
+    total_x = width.bit_length() - 1   # log2(width)
+    total_y = height.bit_length() - 1   # log2(height)
+    macro_x = total_x - micro_x_bits    # KR: 매크로타일 X 비트 수 / EN: Number of macro-tile X bits
+    macro_y = total_y - micro_y_bits     # KR: 매크로타일 Y 비트 수 / EN: Number of macro-tile Y bits
 
     mask_x = 0
     mask_y = 0
     pos = 0
-    # micro-tile Y bits (bottom)
+    # KR: 마이크로타일 Y 비트 (최하위 비트부터 배치)
+    # EN: Micro-tile Y bits (placed from least significant bit)
     for _ in range(micro_y_bits):
         mask_y |= 1 << pos
         pos += 1
-    # micro-tile X bits
+    # KR: 마이크로타일 X 비트
+    # EN: Micro-tile X bits
     for _ in range(micro_x_bits):
         mask_x |= 1 << pos
         pos += 1
-    # macro: first Y
+    # KR: 매크로: 첫 번째 Y 비트
+    # EN: Macro: first Y bit
     mx_rem = macro_x
     my_rem = macro_y
     if my_rem > 0:
         mask_y |= 1 << pos
         pos += 1
         my_rem -= 1
-    # macro: first X
+    # KR: 매크로: 첫 번째 X 비트
+    # EN: Macro: first X bit
     if mx_rem > 0:
         mask_x |= 1 << pos
         pos += 1
         mx_rem -= 1
-    # macro: remaining Y
+    # KR: 매크로: 나머지 Y 비트
+    # EN: Macro: remaining Y bits
     for _ in range(my_rem):
         mask_y |= 1 << pos
         pos += 1
-    # macro: remaining X
+    # KR: 매크로: 나머지 X 비트
+    # EN: Macro: remaining X bits
     for _ in range(mx_rem):
         mask_x |= 1 << pos
         pos += 1
@@ -518,6 +723,22 @@ def compute_ps5_swizzle_masks(
 
 
 def _ps5_dimensions_supported(width: int, height: int, bytes_per_element: int = 1) -> bool:
+    """KR: 주어진 텍스처 크기가 PS5 swizzle을 지원하는지 확인한다.
+    매개변수:
+        width: 텍스처 너비
+        height: 텍스처 높이
+        bytes_per_element: 픽셀당 바이트 수
+    반환값:
+        지원 가능하면 True, 아니면 False
+
+    EN: Check whether the given texture dimensions support PS5 swizzle.
+    Args:
+        width: 텍스처 너비
+        height: 텍스처 높이
+        bytes_per_element: 픽셀당 바이트 수
+    Returns:
+        지원 가능하면 True, 아니면 False
+    """
     if width <= 0 or height <= 0:
         return False
     if width & (width - 1) or height & (height - 1):
@@ -529,10 +750,25 @@ def _ps5_dimensions_supported(width: int, height: int, bytes_per_element: int = 
 
 
 def _ps5_is_power_of_two(value: int) -> bool:
+    """KR: 값이 2의 거듭제곱인지 확인한다.
+    EN: Check if a value is a power of two.
+    """
     return value > 0 and (value & (value - 1)) == 0
 
 
 def _ps5_iter_divisor_pairs(total: int) -> Iterable[tuple[int, int]]:
+    """KR: 주어진 정수의 모든 약수 쌍 (d, total/d)을 반복한다.
+    매개변수:
+        total: 약수를 구할 양의 정수
+    반환값:
+        (약수, 몲) 튜플의 반복자
+
+    EN: Iterate over all divisor pairs (d, total/d) of a given integer.
+    Args:
+        total: 약수를 구할 양의 정수
+    Returns:
+        (약수, 몲) 튜플의 반복자
+    """
     if total <= 0:
         return
     root = int(math.isqrt(total))
@@ -553,11 +789,29 @@ def _ps5_infer_physical_grid(
     align_width: int,
     align_height: int,
 ) -> tuple[int, int]:
-    """Infer a likely physical grid from raw element count.
+    """KR: 원시 요소 수로부터 유력한 물리적 그리드 크기를 추론한다.
+    PS5 런타임은 표면(특히 BC 텍스처)을 논리적 크기 이상으로 패딩하는 경우가 많다.
+    약수 쌍을 탐색하고 정렬/패딩 점수를 매겨 가장 적합한 물리적 WxH를 추론한다.
+    매개변수:
+        total_elements: 총 요소(픽셀/블록) 수
+        logical_width: 논리적 텍스처 너비
+        logical_height: 논리적 텍스처 높이
+        align_width: 너비 정렬 단위
+        align_height: 높이 정렬 단위
+    반환값:
+        (물리적너비, 물리적높이) 튜플
 
-    The PS5 runtime often pads surfaces (especially BC textures) beyond
-    logical dimensions.  We infer a plausible physical WxH by searching
-    divisor pairs and scoring alignment/padding.
+    EN: Infer the likely physical grid size from the raw element count.
+    PS5 런타임은 표면(특히 BC 텍스처)을 논리적 크기 이상으로 패딩하는 경우가 많다.
+    약수 쌍을 탐색하고 정렬/패딩 점수를 매겨 가장 적합한 물리적 WxH를 추론한다.
+    Args:
+        total_elements: 총 요소(픽셀/블록) 수
+        logical_width: 논리적 텍스처 너비
+        logical_height: 논리적 텍스처 높이
+        align_width: 너비 정렬 단위
+        align_height: 높이 정렬 단위
+    Returns:
+        (물리적너비, 물리적높이) 튜플
     """
     logical_total = max(0, logical_width) * max(0, logical_height)
     if (
@@ -581,16 +835,17 @@ def _ps5_infer_physical_grid(
         pad_h = cand_h - logical_height
         pad_area = (cand_w * cand_h) - logical_total
 
-        # Prefer minimum extra area, then prefer width-padding over height-padding.
+        # KR: 최소 여분 면적을 선호하고, 그 다음 높이 패딩보다 너비 패딩을 선호
+        # EN: Prefer minimal excess area, then prefer width padding over height padding
         score = pad_area * 1000 + pad_h * 32 + pad_w * 4
         if align_width > 1 and (cand_w % align_width) != 0:
-            score += 250
+            score += 250  # KR: 너비 정렬 미달 페널티 / EN: Width alignment miss penalty
         if align_height > 1 and (cand_h % align_height) != 0:
-            score += 250
+            score += 250  # KR: 높이 정렬 미달 페널티 / EN: Height alignment miss penalty
         if _ps5_is_power_of_two(cand_w):
-            score -= 32
+            score -= 32   # KR: 2의 거듭제곱 너비 보너스 / EN: Power-of-two width bonus
         if _ps5_is_power_of_two(cand_h):
-            score -= 16
+            score -= 16   # KR: 2의 거듭제곱 높이 보너스 / EN: Power-of-two height bonus
 
         if best_score is None or score < best_score:
             best_score = score
@@ -600,6 +855,9 @@ def _ps5_infer_physical_grid(
 
 
 def _ps5_align_up(value: int, align: int) -> int:
+    """KR: 값을 지정된 정렬 단위로 올림 정렬한다.
+    EN: Align a value up to the specified alignment unit.
+    """
     if align <= 1:
         return int(value)
     return ((int(value) + int(align) - 1) // int(align)) * int(align)
@@ -615,16 +873,19 @@ def _ps5_physical_grid_candidates_for_mode(
     align_width: int,
     align_height: int,
 ) -> list[tuple[int, int]]:
-    """Return ordered physical-grid candidates for a given BC swizzle mode.
+    """KR: 주어진 BC 스위즐 모드에 대한 물리 그리드 후보를 우선순위 순서로 반환한다.
+    EN: Return physical grid candidates in priority order for a given BC swizzle mode.
 
-    Order:
-    1) layout-aligned candidate,
-    2) divisor-based inference,
-    3) logical grid.
+    순서:
+    1) 레이아웃 정렬된 후보,
+    2) 약수 기반 추론 후보,
+    3) 논리 그리드.
     """
     out: list[tuple[int, int]] = []
 
     def _push(pair: tuple[int, int]) -> None:
+        # KR: 유효하지 않은 후보 필터링: 양수, 논리 크기 이상, 총 요소 수 이하
+        # EN: Filter out invalid candidates: positive, at least logical size, within total elements
         if pair[0] <= 0 or pair[1] <= 0:
             return
         if pair[0] < logical_width or pair[1] < logical_height:
@@ -634,13 +895,17 @@ def _ps5_physical_grid_candidates_for_mode(
         if pair not in out:
             out.append(pair)
 
+    # KR: 타일 비트 차원에서 정렬된 후보 계산
+    # EN: Compute aligned candidates from tile bit dimensions
     bits = _ps5_tile_bit_dimensions_for_mode(mode_name, bytes_per_block)
     if bits is not None:
-        tile_w = 1 << bits[0]
-        tile_h = 1 << bits[1]
+        tile_w = 1 << bits[0]  # KR: 타일 너비 (2의 거듭제곱) / EN: Tile width (power of two)
+        tile_h = 1 << bits[1]  # KR: 타일 높이 (2의 거듭제곱) / EN: Tile height (power of two)
         aligned_w = _ps5_align_up(logical_width, tile_w)
         aligned_h = _ps5_align_up(logical_height, tile_h)
         _push((aligned_w, aligned_h))
+        # KR: 정렬된 너비로 총 요소 수를 나누어 높이 후보 추론
+        # EN: Infer height candidate by dividing total elements by aligned width
         if aligned_w > 0 and (total_elements % aligned_w) == 0:
             aligned_h_from_total = total_elements // aligned_w
             if (
@@ -648,6 +913,8 @@ def _ps5_physical_grid_candidates_for_mode(
                 and (aligned_h_from_total % tile_h) == 0
             ):
                 _push((aligned_w, aligned_h_from_total))
+        # KR: 정렬된 높이로 총 요소 수를 나누어 너비 후보 추론
+        # EN: Infer width candidate by dividing total elements by aligned height
         if aligned_h > 0 and (total_elements % aligned_h) == 0:
             aligned_w_from_total = total_elements // aligned_h
             if (
@@ -656,6 +923,8 @@ def _ps5_physical_grid_candidates_for_mode(
             ):
                 _push((aligned_w_from_total, aligned_h))
 
+    # KR: 약수 기반 물리 그리드 추론 결과 추가
+    # EN: Add divisor-based physical grid inference result
     inferred = _ps5_infer_physical_grid(
         total_elements,
         logical_width,
@@ -664,24 +933,36 @@ def _ps5_physical_grid_candidates_for_mode(
         align_height=align_height,
     )
     _push(inferred)
+    # KR: 최종 폴백: 논리 그리드 자체
+    # EN: Final fallback: the logical grid itself
     _push((logical_width, logical_height))
     return out
 
 
 def _ps5_read_lines(path: Path) -> list[str]:
+    """KR: 파일을 UTF-8로 읽어 줄 단위 리스트로 반환한다.
+    EN: Read a file as UTF-8 and return a list of lines.
+    """
     return path.read_text(encoding="utf-8").splitlines()
 
 
 def _ps5_extract_block(lines: list[str], decl_prefix: str) -> list[str]:
+    """KR: C 헤더 파일에서 선언 접두사로 시작하는 블록의 본문 줄들을 추출한다.
+    EN: Extract body lines of a block starting with a declaration prefix from a C header file.
+    """
     start = None
     for i, line in enumerate(lines):
         if line.strip().startswith(decl_prefix):
+            # KR: 선언부 다음 줄부터 본문 시작
+            # EN: Body starts from the line after the declaration
             start = i + 1
             break
     if start is None:
         raise RuntimeError(f"Declaration not found: {decl_prefix}")
     out: list[str] = []
     for line in lines[start:]:
+        # KR: 닫는 중괄호를 만나면 블록 종료
+        # EN: Block ends at closing brace
         if line.strip().startswith("};"):
             break
         out.append(line)
@@ -689,21 +970,30 @@ def _ps5_extract_block(lines: list[str], decl_prefix: str) -> list[str]:
 
 
 def _ps5_expr_to_mask(expr: str) -> int:
+    """KR: 스위즐 패턴 수식 문자열(예: "X0^Y1^Z2")을 64비트 마스크 정수로 변환한다.
+    EN: Convert a swizzle pattern expression string (e.g. "X0^Y1^Z2") to a 64-bit mask integer.
+
+    각 채널(X/Y/Z/S)은 16비트 영역을 차지하며, XOR로 결합된다.
+    """
     expr = expr.strip()
     if expr == "0":
         return 0
     total = 0
+    # KR: "^"로 분리된 각 토큰을 파싱하여 비트 마스크에 XOR 누적
+    # EN: Parse each token separated by '^' and XOR-accumulate into the bit mask
     for part in expr.split("^"):
         token = part.strip()
         if not token:
             continue
-        ch = token[0]
+        ch = token[0]  # KR: 채널 문자: X, Y, Z, S / EN: Channel character: X, Y, Z, S
         if ch not in "XYZS" or not token[1:].isdigit():
             raise RuntimeError(f"Unexpected token in swizzle expression: {token}")
-        idx = int(token[1:])
+        idx = int(token[1:])  # KR: 비트 인덱스 (0~15) / EN: Bit index (0~15)
         if idx < 0 or idx > 15:
             raise RuntimeError(f"Token bit out of range: {token}")
-        chan = "XYZS".index(ch)
+        chan = "XYZS".index(ch)  # KR: 채널 오프셋 (X=0, Y=1, Z=2, S=3) / EN: Channel offset (X=0, Y=1, Z=2, S=3)
+        # KR: 채널별 16비트 슬롯 내의 해당 비트를 설정
+        # EN: Set the corresponding bit within the channel's 16-bit slot
         total ^= 1 << (chan * 16 + idx)
     return total
 
@@ -711,15 +1001,22 @@ def _ps5_expr_to_mask(expr: str) -> int:
 def _ps5_parse_nibble_array(
     lines: list[str], name: str, row_width: int
 ) -> list[list[int]]:
+    """KR: gfx10SwizzlePattern.h에서 니블(nibble) 배열을 파싱하여 마스크 행렬로 반환한다.
+    EN: Parse a nibble array from gfx10SwizzlePattern.h and return it as a mask matrix.
+    """
     block = _ps5_extract_block(lines, f"const UINT_64 {name}")
     rows: list[list[int]] = []
     for line in block:
         if "{" not in line:
             continue
+        # KR: 중괄호 내부의 수식 항목들을 추출
+        # EN: Extract expression items inside braces
         body = line.split("{", 1)[1].split("}", 1)[0]
         items = [x.strip() for x in body.split(",") if x.strip()]
         if len(items) < row_width:
             continue
+        # KR: 각 수식을 64비트 마스크로 변환
+        # EN: Convert each expression to a 64-bit mask
         rows.append([_ps5_expr_to_mask(items[i]) for i in range(row_width)])
     return rows
 
@@ -727,8 +1024,13 @@ def _ps5_parse_nibble_array(
 def _ps5_parse_patinfo_array(
     lines: list[str], name: str
 ) -> list[tuple[int, int, int, int, int]]:
+    """KR: ADDR_SW_PATINFO 배열을 파싱하여 (maxItemCount, idx01, idx2, idx3, idx4) 튜플 리스트로 반환한다.
+    EN: Parse an ADDR_SW_PATINFO array and return a list of (maxItemCount, idx01, idx2, idx3, idx4) tuples.
+    """
     block = _ps5_extract_block(lines, f"const ADDR_SW_PATINFO {name}")
     rows: list[tuple[int, int, int, int, int]] = []
+    # KR: 5개 정수 필드를 가진 구조체 초기화 패턴 매칭
+    # EN: Pattern matching for struct initializer with 5 integer fields
     pat = re.compile(
         r"\{\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,?\s*\}"
     )
@@ -741,10 +1043,17 @@ def _ps5_parse_patinfo_array(
 
 @lru_cache(maxsize=1)
 def _ps5_resolve_swizzle_pattern_path() -> str | None:
+    """KR: gfx10SwizzlePattern.h 파일 경로를 환경변수 또는 기본 위치에서 탐색하여 반환한다.
+    EN: Search for the gfx10SwizzlePattern.h file path from environment variable or default locations.
+    """
+    # KR: 환경변수 PS5_SWIZZLE_PATTERN_H를 우선 확인
+    # EN: Check PS5_SWIZZLE_PATTERN_H environment variable first
     env_path = os.environ.get("PS5_SWIZZLE_PATTERN_H")
     candidates: list[Path] = []
     if env_path:
         candidates.append(Path(env_path))
+    # KR: 리포지토리 내부의 기본 Addrlib 헤더 경로
+    # EN: Default Addrlib header path inside the repository
     repo_root = Path(__file__).resolve().parent
     candidates.append(
         repo_root
@@ -759,6 +1068,8 @@ def _ps5_resolve_swizzle_pattern_path() -> str | None:
         / "gfx10"
         / "gfx10SwizzlePattern.h"
     )
+    # KR: 후보 경로 중 존재하는 첫 번째 파일 반환
+    # EN: Return the first existing file among candidates
     for path in candidates:
         if path.exists():
             return str(path)
@@ -767,15 +1078,24 @@ def _ps5_resolve_swizzle_pattern_path() -> str | None:
 
 @lru_cache(maxsize=1)
 def _ps5_load_bc_pattern_tables() -> dict[str, Any] | None:
+    """KR: gfx10SwizzlePattern.h에서 모든 니블 및 패턴 정보 테이블을 로드한다.
+    EN: Load all nibble and pattern info tables from gfx10SwizzlePattern.h.
+
+    파일이 없거나 파싱 실패 시 None을 반환한다.
+    """
     pattern_path = _ps5_resolve_swizzle_pattern_path()
     if not pattern_path:
         return None
     try:
         lines = _ps5_read_lines(Path(pattern_path))
+        # KR: 니블 배열 파싱 (nib01은 8열, nib2/3/4는 4열)
+        # EN: Parse nibble arrays (nib01 has 8 columns, nib2/3/4 have 4 columns)
         nib01 = _ps5_parse_nibble_array(lines, "GFX10_SW_PATTERN_NIBBLE01", 8)
         nib2 = _ps5_parse_nibble_array(lines, "GFX10_SW_PATTERN_NIBBLE2", 4)
         nib3 = _ps5_parse_nibble_array(lines, "GFX10_SW_PATTERN_NIBBLE3", 4)
         nib4 = _ps5_parse_nibble_array(lines, "GFX10_SW_PATTERN_NIBBLE4", 4)
+        # KR: 각 스위즐 모드별 PATINFO 배열 파싱
+        # EN: Parse PATINFO array for each swizzle mode
         patinfo_tables = {
             mode_name: _ps5_parse_patinfo_array(lines, info[1])
             for mode_name, info in _PS5_BC_MODE_INFO.items()
@@ -792,16 +1112,21 @@ def _ps5_load_bc_pattern_tables() -> dict[str, Any] | None:
 
 
 def _ps5_compute_thin_block_dim(block_bits: int, bytes_per_block: int) -> tuple[int, int]:
-    # addrlib2.cpp::ComputeThinBlockDimension (numSamples=1)
-    log2_ele = int(math.log2(bytes_per_block))
-    log2_num_ele = block_bits - log2_ele
-    log2_w = (log2_num_ele + 1) // 2
+    """KR: Thin 2D 블록의 너비/높이 차원을 계산한다 (addrlib2.cpp::ComputeThinBlockDimension, numSamples=1).
+    EN: Compute thin 2D block width/height dimensions (addrlib2.cpp::ComputeThinBlockDimension, numSamples=1).
+    """
+    log2_ele = int(math.log2(bytes_per_block))  # KR: 요소당 바이트의 log2 / EN: log2 of bytes per element
+    log2_num_ele = block_bits - log2_ele  # KR: 블록 내 요소 수의 log2 / EN: log2 of number of elements in block
+    log2_w = (log2_num_ele + 1) // 2  # KR: 너비 비트 수 (높이보다 1비트 많거나 같음) / EN: Width bits (equal to or 1 more than height bits)
     w = 1 << log2_w
     h = 1 << (log2_num_ele - log2_w)
     return w, h
 
 
 def _ps5_parity(value: int) -> int:
+    """KR: 정수의 설정된 비트 수의 패리티(홀짝)를 반환한다 (0 또는 1).
+    EN: Return the parity (even/odd) of set bits in an integer (0 or 1).
+    """
     return value.bit_count() & 1
 
 
@@ -809,11 +1134,16 @@ def _ps5_tile_bit_dimensions_for_mode(
     mode_name: str,
     bytes_per_block: int,
 ) -> tuple[int, int] | None:
-    """Resolve thin-2D tile bit dimensions from the layout tables."""
+    """KR: 레이아웃 테이블에서 thin-2D 타일의 비트 차원(x_bits, y_bits)을 조회한다.
+    EN: Look up thin-2D tile bit dimensions (x_bits, y_bits) from the layout table.
+    """
     if mode_name.endswith("_X"):
-        # XOR swizzle variants require additional equation bits not reconstructed here.
+        # KR: XOR 스위즐 변형은 여기서 재구성할 수 없는 추가 방정식 비트가 필요하다.
+        # EN: XOR swizzle variants require additional equation bits that cannot be reconstructed here.
         return None
     table: dict[int, tuple[int, int]] | None = None
+    # KR: 페이지 크기별 레이아웃 테이블 선택
+    # EN: Select layout table by page size
     if mode_name.startswith("256B_"):
         table = _PS5_LAYOUT_BLOCK256_2D_BITS
     elif mode_name.startswith("4KB_"):
@@ -826,13 +1156,15 @@ def _ps5_tile_bit_dimensions_for_mode(
 
 
 def _ps5_tile_bit_order_for_mode(mode_name: str, bytes_per_block: int) -> str:
-    """Select tile-local bit order for the BC layout fallback."""
+    """KR: BC 레이아웃 폴백용 타일 내부 비트 인터리빙 순서를 선택한다.
+    EN: Select the in-tile bit interleaving order for BC layout fallback.
+    """
     if mode_name.startswith("4KB_") or mode_name.startswith("64KB_"):
         if int(bytes_per_block) >= 16:
-            return "yxyx"
+            return "yxyx"  # KR: Y/X 비트 교차 인터리빙 / EN: Y/X bit interleaved alternation
         if int(bytes_per_block) == 8:
-            return "x0_yxyx"
-    return "yx"
+            return "x0_yxyx"  # KR: X의 최하위 비트 선행 후 Y/X 교차 / EN: X LSB precedes, then Y/X alternation
+    return "yx"  # KR: 기본: Y 하위, X 상위 / EN: Default: Y lower, X upper
 
 
 def _ps5_local_swizzle_index(
@@ -842,73 +1174,108 @@ def _ps5_local_swizzle_index(
     y_bits: int,
     order: str,
 ) -> int:
+    """KR: 타일 내부 (local_x, local_y) 좌표를 지정된 비트 순서에 따라 선형 인덱스로 변환한다.
+    EN: Convert tile-local (local_x, local_y) coordinates to a linear index according to the specified bit order.
+    """
     if order == "yx":
+        # KR: 단순 순서: Y가 하위 비트, X가 상위 비트
+        # EN: Simple order: Y is lower bits, X is upper bits
         return local_y + (local_x << y_bits)
     if order == "yxyx":
+        # KR: Y/X 비트를 번갈아 인터리빙
+        # EN: Y/X bits interleaved alternately
         out = 0
         bit_pos = 0
         for bit in range(max(x_bits, y_bits)):
             if bit < y_bits:
+                # KR: Y의 bit번째 비트를 출력 위치에 배치
+                # EN: Place Y's bit-th bit at output position
                 out |= ((local_y >> bit) & 1) << bit_pos
                 bit_pos += 1
             if bit < x_bits:
+                # KR: X의 bit번째 비트를 출력 위치에 배치
+                # EN: Place X's bit-th bit at output position
                 out |= ((local_x >> bit) & 1) << bit_pos
                 bit_pos += 1
         return out
     if order == "x0_yxyx":
+        # KR: X의 최하위 비트가 먼저 오고, 나머지는 Y/X 교차 인터리빙
+        # EN: X's least significant bit comes first, rest are Y/X alternating interleave
         if x_bits <= 0:
             return local_y
-        out = local_x & 1
+        out = local_x & 1  # KR: X의 bit0을 최하위에 배치 / EN: Place X's bit0 at LSB
         bit_pos = 1
         for bit in range(max(x_bits - 1, y_bits)):
             if bit < y_bits:
                 out |= ((local_y >> bit) & 1) << bit_pos
                 bit_pos += 1
             if bit < (x_bits - 1):
+                # KR: X의 bit1 이상을 인터리빙
+                # EN: Interleave X's bit1 and above
                 out |= ((local_x >> (bit + 1)) & 1) << bit_pos
                 bit_pos += 1
         return out
+    # KR: 기본 폴백: yx 순서
+    # EN: Default fallback: yx order
     return local_y + (local_x << y_bits)
 
 
 def _ps5_4kb_s_scalar_mix_bytes1(value: int) -> int:
-    """Scalar mix helper for the 4KB_S path with 1-byte blocks."""
+    """KR: 4KB_S 경로에서 1바이트 블록용 스칼라 믹스 헬퍼.
+    EN: Scalar mix helper for 1-byte blocks in 4KB_S path.
+    """
     v = int(value)
+    # KR: 비트 시프트 후 마스크로 특정 비트 위치만 추출하여 XOR 결합
+    # EN: Extract specific bit positions via shift and mask, then XOR combine
     return ((v << 4) & 0x1F0) ^ ((v << 5) & 0x400)
 
 
 def _ps5_4kb_s_scalar_mix_bytes2_4(value: int) -> int:
-    """Scalar mix helper for the 4KB_S path with 2- or 4-byte blocks."""
+    """KR: 4KB_S 경로에서 2바이트 또는 4바이트 블록용 스칼라 믹스 헬퍼.
+    EN: Scalar mix helper for 2-byte or 4-byte blocks in 4KB_S path.
+    """
     v = int(value)
     return ((v << 4) & 0x70) ^ ((v << 5) & 0x100) ^ ((v << 6) & 0x400)
 
 
 def _ps5_4kb_s_scalar_mix_bytes8_16(value: int) -> int:
-    """Scalar mix helper for the 4KB_S path with 8- or 16-byte blocks."""
+    """KR: 4KB_S 경로에서 8바이트 또는 16바이트 블록용 스칼라 믹스 헬퍼.
+    EN: Scalar mix helper for 8-byte or 16-byte blocks in 4KB_S path.
+    """
     v = int(value)
     return ((v << 4) & 0x30) ^ ((v << 6) & 0x100) ^ ((v << 7) & 0x400)
 
 
 def _ps5_4kb_s_vector_mix_bytes1(value: int) -> int:
-    """Vector mix helper for the 4KB_S path with 1-byte blocks."""
+    """KR: 4KB_S 경로에서 1바이트 블록용 벡터 믹스 헬퍼.
+    EN: Vector mix helper for 1-byte blocks in 4KB_S path.
+    """
     v = int(value)
+    # KR: 하위 4비트 직접 사용 + 상위 비트를 시프트하여 XOR 결합
+    # EN: Use lower 4 bits directly + shift upper bits for XOR combination
     return (v & 0x0F) ^ ((v << 5) & 0x200) ^ ((v << 6) & 0x800)
 
 
 def _ps5_4kb_s_vector_mix_bytes2(value: int) -> int:
-    """Vector mix helper for the 4KB_S path with 2-byte blocks."""
+    """KR: 4KB_S 경로에서 2바이트 블록용 벡터 믹스 헬퍼.
+    EN: Vector mix helper for 2-byte blocks in 4KB_S path.
+    """
     v = int(value)
     return ((v << 1) & 0x0E) ^ ((v << 4) & 0x80) ^ ((v << 5) & 0x200) ^ ((v << 6) & 0x800)
 
 
 def _ps5_4kb_s_vector_mix_bytes4(value: int) -> int:
-    """Vector mix helper for the 4KB_S path with 4-byte blocks."""
+    """KR: 4KB_S 경로에서 4바이트 블록용 벡터 믹스 헬퍼.
+    EN: Vector mix helper for 4-byte blocks in 4KB_S path.
+    """
     v = int(value)
     return ((v << 2) & 0x0C) ^ ((v << 5) & 0x80) ^ ((v << 6) & 0x200) ^ ((v << 7) & 0x800)
 
 
 def _ps5_4kb_s_vector_mix_bytes8(value: int) -> int:
-    """Vector mix helper for the 4KB_S path with 8-byte blocks."""
+    """KR: 4KB_S 경로에서 8바이트 블록용 벡터 믹스 헬퍼.
+    EN: Vector mix helper for 8-byte blocks in 4KB_S path.
+    """
     v = int(value)
     return (
         ((v << 3) & 0x08)
@@ -919,7 +1286,9 @@ def _ps5_4kb_s_vector_mix_bytes8(value: int) -> int:
 
 
 def _ps5_4kb_s_vector_mix_bytes16(value: int) -> int:
-    """Vector mix helper for the 4KB_S path with 16-byte blocks."""
+    """KR: 4KB_S 경로에서 16바이트 블록용 벡터 믹스 헬퍼.
+    EN: Vector mix helper for 16-byte blocks in 4KB_S path.
+    """
     v = int(value)
     return ((v << 6) & 0xC0) ^ ((v << 7) & 0x200) ^ ((v << 8) & 0x800)
 
@@ -929,8 +1298,12 @@ def _ps5_4kb_s_tile_index(
     local_y: int,
     bytes_per_block: int,
 ) -> int | None:
-    """Tile-local index for the 4KB_S path."""
+    """KR: 4KB_S 경로에서 타일 내부 좌표를 스위즐된 인덱스로 변환한다.
+    EN: Convert tile-local coordinates to a swizzled index in 4KB_S path.
+    """
     bpb = int(bytes_per_block)
+    # KR: 블록 크기별로 적절한 스칼라(Y)/벡터(X) 믹스 함수 선택
+    # EN: Select appropriate scalar(Y)/vector(X) mix function by block size
     if bpb == 1:
         base = _ps5_4kb_s_scalar_mix_bytes1(local_y)
         mixed = base ^ _ps5_4kb_s_vector_mix_bytes1(local_x)
@@ -948,6 +1321,8 @@ def _ps5_4kb_s_tile_index(
         mixed = base ^ _ps5_4kb_s_vector_mix_bytes16(local_x)
     else:
         return None
+    # KR: 바이트 오프셋을 요소 인덱스로 변환 (블록 크기만큼 우측 시프트)
+    # EN: Convert byte offset to element index (right shift by block size)
     return mixed >> int(math.log2(bpb))
 
 
@@ -958,7 +1333,11 @@ def _ps5_build_bc_lut_from_layout_rules(
     mode_name: str,
     pipe_bank_xor: int,
 ) -> tuple[int, ...] | None:
-    """Build a BC LUT without the external pattern header."""
+    """KR: 외부 패턴 헤더 없이 레이아웃 규칙만으로 BC LUT를 구축한다.
+    EN: Build a BC LUT using only layout rules without external pattern headers.
+
+    pipe_bank_xor가 0이 아니면 이 경로는 지원하지 않으므로 None을 반환한다.
+    """
     if pipe_bank_xor != 0:
         return None
     bits = _ps5_tile_bit_dimensions_for_mode(mode_name, bytes_per_block)
@@ -968,27 +1347,29 @@ def _ps5_build_bc_lut_from_layout_rules(
     if x_bits <= 0 or y_bits <= 0:
         return None
 
-    tile_w = 1 << x_bits
-    tile_h = 1 << y_bits
+    tile_w = 1 << x_bits  # KR: 타일 너비 (블록 단위) / EN: Tile width (in blocks)
+    tile_h = 1 << y_bits  # KR: 타일 높이 (블록 단위) / EN: Tile height (in blocks)
     if tile_w <= 0 or tile_h <= 0 or block_w <= 0 or block_h <= 0:
         return None
 
     local_order = _ps5_tile_bit_order_for_mode(mode_name, bytes_per_block)
     use_4kb_s_helper_formula = mode_name == "4KB_S"
-    macro_cols = (block_w + tile_w - 1) // tile_w
-    tile_elements = tile_w * tile_h
+    macro_cols = (block_w + tile_w - 1) // tile_w  # KR: 매크로 타일 열 수 / EN: Number of macro tile columns
+    tile_elements = tile_w * tile_h  # KR: 타일 하나의 총 요소 수 / EN: Total elements per tile
     total = block_w * block_h
 
     lut: list[int] = [0] * total
     for y in range(block_h):
-        macro_y = y // tile_h
-        local_y = y & (tile_h - 1)
+        macro_y = y // tile_h  # KR: 매크로 타일 행 인덱스 / EN: Macro tile row index
+        local_y = y & (tile_h - 1)  # KR: 타일 내부 Y 좌표 / EN: Tile-local Y coordinate
         row_base = y * block_w
         macro_row_base = macro_y * macro_cols * tile_elements
         for x in range(block_w):
-            macro_x = x // tile_w
-            local_x = x & (tile_w - 1)
+            macro_x = x // tile_w  # KR: 매크로 타일 열 인덱스 / EN: Macro tile column index
+            local_x = x & (tile_w - 1)  # KR: 타일 내부 X 좌표 / EN: Tile-local X coordinate
             if use_4kb_s_helper_formula:
+                # KR: 4KB_S 모드: 전용 비트 믹스 공식 사용
+                # EN: 4KB_S mode: use dedicated bit mix formula
                 local_off = _ps5_4kb_s_tile_index(
                     local_x,
                     local_y,
@@ -997,6 +1378,8 @@ def _ps5_build_bc_lut_from_layout_rules(
                 if local_off is None:
                     return None
             else:
+                # KR: 일반 모드: 비트 인터리빙 순서에 따라 인덱스 계산
+                # EN: General mode: compute index according to bit interleaving order
                 local_off = _ps5_local_swizzle_index(
                     local_x,
                     local_y,
@@ -1006,6 +1389,8 @@ def _ps5_build_bc_lut_from_layout_rules(
                 )
             if local_off < 0 or local_off >= tile_elements:
                 return None
+            # KR: 매크로 타일 기준 오프셋 + 타일 내 로컬 오프셋 = 스위즐된 인덱스
+            # EN: Macro tile base offset + tile-local offset = swizzled index
             swizzled_idx = macro_row_base + macro_x * tile_elements + local_off
             if swizzled_idx >= total:
                 return None
@@ -1021,22 +1406,31 @@ def _ps5_compute_offset(
     z: int = 0,
     s: int = 0,
 ) -> int:
+    """KR: Addrlib 패턴 비트 배열로부터 (x, y, z, s) 좌표의 블록 내 오프셋을 계산한다.
+    EN: Compute the in-block offset for (x, y, z, s) coordinates from an Addrlib pattern bit array.
+
+    각 출력 비트는 X/Y/Z/S 채널 마스크의 패리티를 XOR 결합하여 결정된다.
+    """
     out = 0
     for i in range(block_bits):
         m = pattern_bits[i]
         if m == 0:
             continue
+        # KR: 64비트 마스크에서 각 채널(X/Y/Z/S)의 16비트 슬롯 추출
+        # EN: Extract 16-bit slot for each channel (X/Y/Z/S) from 64-bit mask
         xmask = m & 0xFFFF
         ymask = (m >> 16) & 0xFFFF
         zmask = (m >> 32) & 0xFFFF
         smask = (m >> 48) & 0xFFFF
+        # KR: 각 채널의 좌표와 마스크를 AND한 뒤 패리티를 XOR 결합
+        # EN: AND coordinate with mask for each channel, then XOR combine parities
         bit = (
             _ps5_parity(x & xmask)
             ^ _ps5_parity(y & ymask)
             ^ _ps5_parity(z & zmask)
             ^ _ps5_parity(s & smask)
         )
-        out |= bit << i
+        out |= bit << i  # KR: 결과 비트를 출력 오프셋의 i번째 위치에 배치 / EN: Place result bit at i-th position of output offset
     return out
 
 
@@ -1047,7 +1441,12 @@ def _ps5_build_full_pattern(
     nib4: list[list[int]],
     patinfo: tuple[int, int, int, int, int],
 ) -> list[int]:
+    """KR: PATINFO 인덱스를 사용하여 니블 테이블 4개를 연결한 완전한 패턴 비트 배열을 구축한다.
+    EN: Build a complete pattern bit array by concatenating 4 nibble tables using PATINFO indices.
+    """
     _, idx01, idx2, idx3, idx4 = patinfo
+    # KR: 각 니블 테이블에 대한 인덱스 범위 검증
+    # EN: Validate index range for each nibble table
     if (
         idx01 >= len(nib01)
         or idx2 >= len(nib2)
@@ -1055,6 +1454,8 @@ def _ps5_build_full_pattern(
         or idx4 >= len(nib4)
     ):
         raise RuntimeError(f"Nibble index out of range: {patinfo}")
+    # KR: nib01(8개) + nib2(4개) + nib3(4개) + nib4(4개) = 20비트 패턴
+    # EN: nib01(8) + nib2(4) + nib3(4) + nib4(4) = 20-bit pattern
     return list(nib01[idx01]) + list(nib2[idx2]) + list(nib3[idx3]) + list(nib4[idx4])
 
 
@@ -1067,8 +1468,13 @@ def _ps5_build_bc_lut_cached(
     pipe_log2: int,
     pipe_bank_xor: int,
 ) -> tuple[int, ...] | None:
+    """KR: 캐시된 BC 스위즐 LUT 구축. 패턴 헤더 파일이 있으면 사용하고, 없으면 레이아웃 규칙으로 폴백한다.
+    EN: Build a cached BC swizzle LUT. Uses pattern header file if available, falls back to layout rules otherwise.
+    """
     tables = _ps5_load_bc_pattern_tables()
     if tables is None:
+        # KR: 패턴 테이블 없음: 레이아웃 규칙 기반 폴백
+        # EN: No pattern tables: fallback to layout-rule based approach
         return _ps5_build_bc_lut_from_layout_rules(
             block_w,
             block_h,
@@ -1081,8 +1487,10 @@ def _ps5_build_bc_lut_cached(
         return None
     _, _, block_bits, is_xor_mode = mode_info
     patinfo_rows = tables["patinfo_tables"].get(mode_name, [])
-    pat_index = int(math.log2(bytes_per_block))
+    pat_index = int(math.log2(bytes_per_block))  # KR: 블록 크기의 log2를 패턴 인덱스로 사용 / EN: Use log2 of block size as pattern index
     if pat_index < 0 or pat_index >= len(patinfo_rows):
+        # KR: 해당 블록 크기에 대한 패턴 정보가 없으면 레이아웃 규칙으로 폴백
+        # EN: No pattern info for this block size; fallback to layout rules
         return _ps5_build_bc_lut_from_layout_rules(
             block_w,
             block_h,
@@ -1090,6 +1498,8 @@ def _ps5_build_bc_lut_cached(
             mode_name,
             pipe_bank_xor,
         )
+    # KR: 니블 테이블 4개를 결합하여 완전한 패턴 비트 배열 생성
+    # EN: Combine 4 nibble tables into a complete pattern bit array
     pattern_bits = _ps5_build_full_pattern(
         tables["nib01"],
         tables["nib2"],
@@ -1101,12 +1511,16 @@ def _ps5_build_bc_lut_cached(
     total = block_w * block_h
     lut: list[int] = [0] * total
 
+    # KR: thin 블록 차원 계산 및 피치 정렬
+    # EN: Compute thin block dimensions and pitch alignment
     blk_w, blk_h = _ps5_compute_thin_block_dim(block_bits, bytes_per_block)
     pitch_aligned = ((block_w + blk_w - 1) // blk_w) * blk_w
     pitch_blocks = pitch_aligned // blk_w
 
+    # KR: pipe/bank XOR 오프셋 계산을 위한 비트 마스크 준비
+    # EN: Prepare bit masks for pipe/bank XOR offset calculation
     blk_mask = (1 << block_bits) - 1
-    pipe_interleave_log2 = 8
+    pipe_interleave_log2 = 8  # KR: Addrlib 파이프 인터리브 기본값: 256바이트 / EN: Addrlib pipe interleave default: 256 bytes
     column_bits = 2
     bank_bits_cap = 4
     bank_xor_bits = max(
@@ -1122,22 +1536,28 @@ def _ps5_build_bc_lut_cached(
         if bank_xor_bits > 0
         else 0
     )
+    # KR: XOR 모드인 경우 pipe_bank_xor를 블록 내 오프셋으로 변환
+    # EN: For XOR mode, convert pipe_bank_xor to in-block offset
     pb_xor_off = 0
     if is_xor_mode:
         pb_xor_off = (
             (pipe_bank_xor & (pipe_mask | bank_mask)) << pipe_interleave_log2
         ) & blk_mask
 
-    elem_log2 = int(math.log2(bytes_per_block))
+    elem_log2 = int(math.log2(bytes_per_block))  # KR: 요소 크기의 log2 / EN: log2 of element size
     for y in range(block_h):
-        yb = y // blk_h
+        yb = y // blk_h  # KR: 블록 행 인덱스 / EN: Block row index
         row_base = y * block_w
         for x in range(block_w):
-            xb = x // blk_w
-            blk_idx = yb * pitch_blocks + xb
+            xb = x // blk_w  # KR: 블록 열 인덱스 / EN: Block column index
+            blk_idx = yb * pitch_blocks + xb  # KR: 선형 블록 인덱스 / EN: Linear block index
+            # KR: 패턴 비트에서 블록 내 오프셋 계산
+            # EN: Compute in-block offset from pattern bits
             blk_off = _ps5_compute_offset(pattern_bits, block_bits, x, y, 0, 0)
+            # KR: 블록 인덱스와 XOR 오프셋을 결합하여 최종 주소 생성
+            # EN: Combine block index and XOR offset to generate final address
             addr = (blk_idx << block_bits) + (blk_off ^ pb_xor_off)
-            swizzled_idx = addr >> elem_log2
+            swizzled_idx = addr >> elem_log2  # KR: 바이트 주소를 요소 인덱스로 변환 / EN: Convert byte address to element index
             linear_idx = row_base + x
             lut[linear_idx] = swizzled_idx % total
 
@@ -1151,12 +1571,17 @@ def _ps5_unswizzle_bc_blocks(
     bytes_per_block: int,
     lut: tuple[int, ...],
 ) -> bytes:
+    """KR: LUT를 사용하여 스위즐된 BC 블록 데이터를 선형 순서로 역스위즐한다.
+    EN: Unswizzle swizzled BC block data to linear order using a LUT.
+    """
     total = block_w * block_h
     src = memoryview(raw[: total * bytes_per_block])
     dst = bytearray(total * bytes_per_block)
+    # KR: LUT의 각 항목: linear_idx -> swizzled_idx 매핑
+    # EN: Each LUT entry: linear_idx -> swizzled_idx mapping
     for linear_idx, swizzled_idx in enumerate(lut):
-        src_off = swizzled_idx * bytes_per_block
-        dst_off = linear_idx * bytes_per_block
+        src_off = swizzled_idx * bytes_per_block  # KR: 스위즐된 소스 오프셋 / EN: Swizzled source offset
+        dst_off = linear_idx * bytes_per_block  # KR: 선형 대상 오프셋 / EN: Linear destination offset
         dst[dst_off : dst_off + bytes_per_block] = src[
             src_off : src_off + bytes_per_block
         ]
@@ -1169,12 +1594,17 @@ def _ps5_decode_bc_to_rgba(
     pixel_height: int,
     texture_format: int,
 ) -> bytes | None:
+    """KR: BC 압축 텍스처 데이터를 RGBA 픽셀 데이터로 디코딩한다.
+    EN: Decode BC-compressed texture data to RGBA pixel data.
+    """
     if texture2ddecoder is None:
         return None
     bc_info = _PS5_BC_FORMATS.get(texture_format)
     if bc_info is None:
         return None
     _, _, _, decoder_name = bc_info
+    # KR: 텍스처 포맷에 해당하는 디코더 함수 조회
+    # EN: Look up decoder function for the texture format
     decoder = getattr(texture2ddecoder, decoder_name, None)
     if not callable(decoder):
         return None
@@ -1185,14 +1615,20 @@ def _ps5_decode_bc_to_rgba(
 
 
 def _ps5_swap_rb_image(image: Image.Image) -> Image.Image:
+    """KR: 이미지의 R(적색)과 B(청색) 채널을 교환한다 (BGR <-> RGB 변환).
+    EN: Swap R (red) and B (blue) channels of an image (BGR <-> RGB conversion).
+    """
     rgba = image.convert("RGBA")
     r, g, b, a = rgba.split()
     return Image.merge("RGBA", (b, g, r, a))
 
 
 def _ps5_should_swap_rb_for_bc_preview(texture_format: int) -> bool:
-    # KR: PS5 BC 표면은 이 경로에서 BGR 성분 순서로 해석되어 R/B 교환이 필요합니다.
-    # EN: PS5 BC surfaces decode as BGR in this path; apply R/B swap consistently.
+    """KR: PS5 BC 텍스처 프리뷰 시 R/B 채널 교환이 필요한지 판별한다.
+    EN: Determine whether R/B channel swap is needed for PS5 BC texture preview.
+
+    PS5 BC 표면은 이 경로에서 BGR 성분 순서로 디코딩되므로 R/B 교환이 필요하다.
+    """
     return int(texture_format) in _PS5_BC_FORMATS
 
 
@@ -1203,6 +1639,12 @@ def _ps5_crop_blocks_top_left(
     logical_block_h: int,
     bytes_per_block: int,
 ) -> bytes:
+    """KR: 물리 블록 그리드에서 논리 블록 영역(좌상단)만 잘라낸다.
+    EN: Crop only the logical block region (top-left) from the physical block grid.
+
+    BC 블록 압축 시 물리 그리드는 타일 정렬 요건에 따라 논리 크기보다 클 수 있다.
+    각 행에서 논리 너비만큼만 복사하여 패딩 블록을 제거한다.
+    """
     if (
         physical_block_w <= 0
         or logical_block_w <= 0
@@ -1229,6 +1671,11 @@ def _ps5_unswizzle_addrlib_uncompressed_candidate(
     height: int,
     bytes_per_element: int,
 ) -> tuple[bytes, float] | None:
+    """KR: 비압축 텍스처에 대해 Addrlib 4KB_S 역스위즐을 시도한다.
+    EN: Attempt Addrlib 4KB_S unswizzle for uncompressed textures.
+
+    물리 그리드 크기를 추론하여 LUT 기반 역스위즐 후 논리 영역만 잘라 반환한다.
+    """
     if bytes_per_element not in {2, 4}:
         return None
     total_elements = width * height
@@ -1291,6 +1738,12 @@ def _ps5_unswizzle_addrlib_uncompressed_candidate(
 def _ps5_pipe_bank_xor_span(
     mode_name: str, bytes_per_block: int, pipe_log2: int
 ) -> int:
+    """KR: 주어진 모드의 pipe/bank XOR 값 범위를 계산한다.
+    EN: Compute the pipe/bank XOR value range for the given mode.
+
+    XOR 모드가 아니면 1을 반환한다. XOR 모드인 경우 pipe 비트와 bank 비트의
+    합으로 가능한 조합 수(2^total_bits)를 계산하여 반환한다.
+    """
     mode_info = _PS5_BC_MODE_INFO.get(mode_name)
     if mode_info is None:
         return 0
@@ -1319,12 +1772,18 @@ def _ps5_iter_pipe_bank_xor_values(
     *,
     exhaustive: bool = False,
 ) -> tuple[int, ...]:
+    """KR: 역스위즐 후보 탐색용 pipe/bank XOR 값 목록을 생성한다.
+    EN: Generate a list of pipe/bank XOR values for unswizzle candidate search.
+
+    exhaustive=True이면 전체 범위를 반환하고, 아니면 빠른 탐색용 축약 목록을 반환한다.
+    """
     span = _ps5_pipe_bank_xor_span(mode_name, bytes_per_block, pipe_log2)
     if span <= 1:
         return (0,)
     if exhaustive:
         return tuple(range(span))
-    # Keep default path fast, then fallback to exhaustive only when needed.
+    # KR: 기본 경로는 빠르게 처리하고, 필요 시에만 전수 탐색으로 전환
+    # EN: Default path handles quickly; switch to exhaustive search only when needed
     quick = tuple(v for v in (0, 1, 2, 3, 4, 7) if v < span)
     return quick if quick else (0,)
 
@@ -1340,6 +1799,12 @@ def _ps5_unswizzle_bc_best_candidate(
     exhaustive: bool = False,
     exhaustive_xor: bool = False,
 ) -> tuple[bytes, str | None, float | None, tuple[int, int], tuple[int, int]] | None:
+    """KR: BC 블록 압축 텍스처의 최적 역스위즐 후보를 점수 기반으로 선택한다.
+    EN: Select the best unswizzle candidate for BC block-compressed textures based on scoring.
+
+    모드/pipe/XOR 조합별로 역스위즐한 뒤 RGBA 디코딩하여 거칠기 점수를 비교한다.
+    가장 낮은 거칠기 점수를 가진 후보의 블록 데이터와 모드 정보를 반환한다.
+    """
     bc_info = _PS5_BC_FORMATS.get(texture_format)
     if bc_info is None:
         return None
@@ -1475,7 +1940,12 @@ def _ps5_try_end_aligned_4kb_s_candidate(
     logical_block_h: int,
     bytes_per_block: int,
 ) -> tuple[bytes, str, tuple[int, int]] | None:
-    """Try a 4KB_S candidate using an end-aligned base window."""
+    """KR: 스트림 끝 정렬 기반 4KB_S 역스위즐 후보를 시도한다.
+    EN: Try a stream end-aligned 4KB_S unswizzle candidate.
+
+    mip 레벨이 여러 개인 경우 mip0 데이터가 스트림 끝에 위치할 수 있으므로,
+    끝 기준 오프셋에서 물리 블록 크기만큼 잘라 4KB_S LUT로 역스위즐한다.
+    """
     bits = _ps5_tile_bit_dimensions_for_mode("4KB_S", bytes_per_block)
     if bits is None:
         return None
@@ -1531,7 +2001,13 @@ def _ps5_unswizzle_bc_best_layout_match(
     *,
     mip_count: int | None = None,
 ) -> tuple[bytes, str | None, float | None, tuple[int, int], tuple[int, int]] | None:
-    """Choose the first valid BC layout variant in fixed order."""
+    """KR: 고정 우선순위로 첫 번째 유효한 BC 레이아웃 변형을 선택한다.
+    EN: Select the first valid BC layout variant using fixed priority.
+
+    mip 레벨 오프셋을 계산하여 mip0 시작 위치를 결정한 뒤, 모드/pipe/XOR
+    조합을 순회하며 첫 번째 유효한 역스위즐 결과를 반환한다.
+    비정방 텍스처의 경우 end-aligned 4KB_S 후보도 추가로 확인한다.
+    """
     bc_info = _PS5_BC_FORMATS.get(texture_format)
     if bc_info is None:
         return None
@@ -1547,8 +2023,8 @@ def _ps5_unswizzle_bc_best_layout_match(
     source_window = usable
     mip0_offset_bytes = 0
     if mip_count is not None and int(mip_count) > 1:
-        # KR: 높은 mip부터 offset이 누적되므로 mip0가 tail 뒤에서 시작할 수 있습니다.
-        # EN: Offsets accumulate from higher mips, so mip0 can start after the tail.
+        # KR: 높은 mip부터 offset이 누적되므로 mip0가 tail 뒤에서 시작할 수 있다
+        # EN: Offset accumulates from higher mips, so mip0 may start after the tail
         lower_tail_sum = 0
         w = max(1, int(pixel_width))
         h = max(1, int(pixel_height))
@@ -1561,16 +2037,16 @@ def _ps5_unswizzle_bc_best_layout_match(
             w = max(1, w >> 1)
             h = max(1, h >> 1)
         if len(levels) > 1:
-            # KR: tail packing은 mip별 256B, tail 2KB 정렬을 사용합니다.
-            # EN: Tail packing uses per-mip 256B alignment and 2KB tail alignment.
+            # KR: tail packing은 mip별 256B, tail 2KB 정렬을 사용한다
+            # EN: Tail packing uses 256B per mip, 2KB tail alignment
             for level_bytes in levels[1:]:
                 lower_tail_sum += _ps5_align_up(level_bytes, 0x100)
             mip0_offset_bytes = _ps5_align_up(lower_tail_sum, 0x800)
             base_alloc = _ps5_align_up(levels[0], 0x800)
             modeled_total = mip0_offset_bytes + base_alloc
             if modeled_total < len(usable):
-                # KR: 비정방 케이스에서는 stream 끝 기준으로 mip0를 다시 맞춥니다.
-                # EN: Re-anchor mip0 against the end of the stream for some non-square cases.
+                # KR: 비정방 케이스에서는 stream 끝 기준으로 mip0를 다시 맞춘다
+                # EN: For non-square cases, re-align mip0 from stream end
                 mip0_offset_bytes += len(usable) - modeled_total
             if mip0_offset_bytes + base_alloc <= len(usable):
                 base_end = mip0_offset_bytes + base_alloc
@@ -1589,7 +2065,8 @@ def _ps5_unswizzle_bc_best_layout_match(
     physical_total_blocks = len(source_window) // bytes_per_block
     align = 16 if bytes_per_block >= 16 else 8
 
-    # Try 4KB_S first.
+    # KR: 4KB_S 모드를 최우선으로 시도한다
+    # EN: Try 4KB_S mode with highest priority
     mode_order: list[str] = ["4KB_S"]
     for mode_name in _PS5_BC_FAST_MODE_NAMES:
         if mode_name not in mode_order:
@@ -1650,8 +2127,8 @@ def _ps5_unswizzle_bc_best_layout_match(
                         and int(mip_count) > 1
                         and mode_name.startswith("256B_")
                     ):
-                        # KR: 일부 비정방 케이스는 end-aligned 4KB_S 레이아웃으로 다시 확인합니다.
-                        # EN: Re-check some non-square cases with an end-aligned 4KB_S layout.
+                        # KR: 일부 비정방 케이스는 end-aligned 4KB_S 레이아웃으로 재확인한다
+                        # EN: Some non-square cases need re-verification with end-aligned 4KB_S layout
                         alt = _ps5_try_end_aligned_4kb_s_candidate(
                             usable,
                             logical_block_w,
@@ -1689,13 +2166,14 @@ def _ps5_unswizzle_bc_best_layout_match(
 
 
 def find_ggm_file(data_path: str) -> str | None:
-    """KR: 데이터 폴더에서 globalgamemanagers 계열 파일 경로를 찾습니다.
-    EN: Find a globalgamemanagers-like file inside the data folder.
+    """KR: 데이터 폴더에서 globalgamemanagers 계열 파일 경로를 찾는다.
+    EN: Find the globalgamemanagers family file path in the data folder.
     """
     candidates = ["globalgamemanagers", "globalgamemanagers.assets", "data.unity3d"]
     candidates_resources = ["unity default resources", "unity_builtin_extra"]
     fls: list[str] = []
-    # Prefer core globalgamemanagers files first.
+    # KR: globalgamemanagers 핵심 파일을 우선 탐색한다
+    # EN: Search for globalgamemanagers core files first
     for candidate in candidates:
         ggm_path = os.path.join(data_path, candidate)
         if os.path.exists(ggm_path):
@@ -1710,8 +2188,8 @@ def find_ggm_file(data_path: str) -> str | None:
 
 
 def resolve_game_path(path: str, lang: Language = "ko") -> tuple[str, str]:
-    """KR: 입력 경로를 게임 루트와 _Data 경로로 정규화합니다.
-    EN: Normalize input path to game root and _Data folder path.
+    """KR: 입력 경로를 게임 루트와 _Data 경로로 정규화한다.
+    EN: Normalize the input path to game root and _Data path.
     """
     path = os.path.normpath(os.path.abspath(path))
 
@@ -1747,8 +2225,8 @@ def resolve_game_path(path: str, lang: Language = "ko") -> tuple[str, str]:
 
 
 def get_data_path(game_path: str, lang: Language = "ko") -> str:
-    """KR: 게임 루트에서 _Data 폴더 경로를 반환합니다.
-    EN: Return _Data folder path from game root.
+    """KR: 게임 루트에서 _Data 폴더 경로를 반환한다.
+    EN: Return the _Data folder path from the game root.
     """
     data_folders = [i for i in os.listdir(game_path) if i.lower().endswith("_data")]
     if not data_folders:
@@ -1759,8 +2237,8 @@ def get_data_path(game_path: str, lang: Language = "ko") -> str:
 
 
 def get_unity_version(game_path: str, lang: Language = "ko") -> str:
-    """KR: 게임 경로에서 Unity 버전을 읽어 반환합니다.
-    EN: Read and return Unity version from the game path.
+    """KR: 게임 경로에서 Unity 버전을 읽어 반환한다.
+    EN: Read and return the Unity version from the game path.
     """
     data_path = get_data_path(game_path, lang=lang)
     candidates = [
@@ -1783,13 +2261,15 @@ def get_unity_version(game_path: str, lang: Language = "ko") -> str:
         try:
             env = UnityPy.load(candidate)
 
-            # 1) Fast path: top-level file may already expose unity_version.
+            # KR: 1) 빠른 경로: 최상위 파일에서 unity_version을 바로 확인한다
+            # EN: 1) Fast path: check unity_version directly on top-level file
             top_file = getattr(env, "file", None)
             top_version = getattr(top_file, "unity_version", None)
             if top_version:
                 return str(top_version)
 
-            # 2) Check loaded files.
+            # KR: 2) 로드된 파일들을 확인한다
+            # EN: 2) Check loaded files
             env_files = getattr(env, "files", None)
             if isinstance(env_files, dict):
                 for loaded in env_files.values():
@@ -1797,7 +2277,8 @@ def get_unity_version(game_path: str, lang: Language = "ko") -> str:
                     if uv:
                         return str(uv)
 
-            # 3) Fallback: inspect parsed objects only when present.
+            # KR: 3) 폴백: 파싱된 오브젝트가 있을 때만 검사한다
+            # EN: 3) Fallback: inspect only when parsed objects exist
             objs = getattr(env, "objects", None)
             if objs:
                 first_obj = objs[0]
@@ -1819,8 +2300,8 @@ def get_unity_version(game_path: str, lang: Language = "ko") -> str:
 
 
 def get_script_dir() -> str:
-    """KR: 실행 기준 디렉터리(스크립트/배포 바이너리)를 반환합니다.
-    EN: Return runtime directory for script or frozen executable.
+    """KR: 실행 기준 디렉터리(스크립트/배포 바이너리)를 반환한다.
+    EN: Return the execution base directory (script/distribution binary).
     """
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
@@ -1828,8 +2309,8 @@ def get_script_dir() -> str:
 
 
 def parse_target_files_arg(target_file_args: list[str] | None) -> set[str]:
-    """KR: --target-file 인자(반복/콤마 구분)를 파일명 집합으로 정규화합니다.
-    EN: Normalize --target-file args (repeatable/comma-separated) into a basename set.
+    """KR: --target-file 인자(반복/콤마 구분)를 파일명 집합으로 정규화한다.
+    EN: Normalize --target-file arguments (repeated/comma-separated) into a filename set.
     """
     selected_files: set[str] = set()
     if not target_file_args:
@@ -1843,8 +2324,8 @@ def parse_target_files_arg(target_file_args: list[str] | None) -> set[str]:
 
 
 def parse_exclude_exts_arg(exclude_ext_args: list[str] | None) -> set[str]:
-    """KR: --exclude-ext 인자(반복/콤마 구분)를 확장자 집합으로 정규화합니다.
-    EN: Normalize --exclude-ext args (repeatable/comma-separated) into extension set.
+    """KR: --exclude-ext 인자(반복/콤마 구분)를 확장자 집합으로 정규화한다.
+    EN: Normalize --exclude-ext arguments (repeated/comma-separated) into an extension set.
     """
     normalized_exts: set[str] = set()
     if not exclude_ext_args:
@@ -1874,6 +2355,9 @@ _PRIMARY_MODE_ARGS: tuple[tuple[str, str], ...] = (
 
 
 def _selected_primary_modes(args: Any) -> list[str]:
+    """KR: CLI 인자에서 활성화된 주요 모드 목록을 반환한다.
+    EN: Return the list of active primary modes from CLI arguments.
+    """
     selected: list[str] = []
     for attr_name, cli_name in _PRIMARY_MODE_ARGS:
         value = getattr(args, attr_name, None)
@@ -1886,10 +2370,16 @@ def _selected_primary_modes(args: Any) -> list[str]:
 
 
 def _mode_uses_scan_jobs(mode: str | None) -> bool:
+    """KR: 해당 모드가 스캔 작업을 사용하는지 여부를 반환한다.
+    EN: Return whether the given mode uses scan jobs.
+    """
     return mode in {"parse", "mulmaru", "nanumgothic", "preview_export"}
 
 
 def _should_pause_before_exit(*, interactive_session: bool = False) -> bool:
+    """KR: 종료 전 일시정지가 필요한지 판별한다.
+    EN: Determine whether a pause is needed before exit.
+    """
     return bool(interactive_session or getattr(sys, "frozen", False))
 
 
@@ -1898,6 +2388,9 @@ def _pause_before_exit(
     *,
     interactive_session: bool = False,
 ) -> None:
+    """KR: 대화형 세션 또는 배포 바이너리 실행 시 종료 전 사용자 입력을 대기한다.
+    EN: Wait for user input before exit in interactive session or distribution binary execution.
+    """
     if not _should_pause_before_exit(interactive_session=interactive_session):
         return
     if lang == "ko":
@@ -1907,8 +2400,8 @@ def _pause_before_exit(
 
 
 def strip_wrapping_quotes_repeated(value: str) -> str:
-    """KR: 앞뒤 따옴표(' 또는 ")를 반복 제거합니다.
-    EN: Repeatedly strip wrapping quotes (' or ") from both ends.
+    """KR: 앞뒤 따옴표(' 또는 ")를 반복 제거한다.
+    EN: Repeatedly strip leading/trailing quotes (' or ").
     """
     text = str(value).strip()
     while True:
@@ -1921,8 +2414,8 @@ def strip_wrapping_quotes_repeated(value: str) -> str:
 def sanitize_filename_component(
     value: str, fallback: str = "unnamed", max_len: int = 96
 ) -> str:
-    """KR: 파일명 구성요소에서 경로/예약 문자를 안전한 문자로 치환합니다.
-    EN: Sanitize filename component by replacing path/reserved characters.
+    """KR: 파일명 구성요소에서 경로/예약 문자를 안전한 문자로 치환한다.
+    EN: Replace path/reserved characters with safe characters in a filename component.
     """
     text = str(value or "").strip()
     invalid_chars = '<>:"/\\|?*'
@@ -1936,8 +2429,8 @@ def sanitize_filename_component(
 
 
 def resolve_output_only_path(source_file: str, data_path: str, output_root: str) -> str:
-    """KR: output-only 저장 시 원본 data_path 기준 상대 경로를 유지한 출력 경로를 계산합니다.
-    EN: Resolve output-only destination path while preserving path relative to data_path.
+    """KR: output-only 저장 시 원본 data_path 기준 상대 경로를 유지한 출력 경로를 계산한다.
+    EN: Compute the output path preserving relative path from original data_path for output-only saves.
     """
     source_abs = os.path.abspath(source_file)
     data_abs = os.path.abspath(data_path)
@@ -1956,8 +2449,8 @@ def prepare_output_only_dependencies(
     output_root: str,
     lang: Language = "ko",
 ) -> None:
-    """KR: output-only 모드에서 핵심 의존 파일을 출력 루트에 미리 복사합니다.
-    EN: Pre-stage core dependency files into output root for output-only mode.
+    """KR: output-only 모드에서 핵심 의존 파일을 출력 루트에 미리 복사한다.
+    EN: Pre-copy essential dependency files to the output root in output-only mode.
     """
     candidate_rel_paths = [
         "globalgamemanagers",
@@ -1992,8 +2485,8 @@ def prepare_output_only_dependencies(
 
 
 def register_temp_dir_for_cleanup(path: str) -> str:
-    """KR: 종료 시 삭제할 임시 디렉터리를 등록하고 정규화 경로를 반환합니다.
-    EN: Register a temp directory for cleanup at exit and return normalized path.
+    """KR: 종료 시 삭제할 임시 디렉터리를 등록하고 정규화 경로를 반환한다.
+    EN: Register a temp directory for cleanup on exit and return the normalized path.
     """
     normalized = os.path.abspath(path)
     _REGISTERED_TEMP_DIRS.add(normalized)
@@ -2001,8 +2494,8 @@ def register_temp_dir_for_cleanup(path: str) -> str:
 
 
 def cleanup_registered_temp_dirs() -> None:
-    """KR: 등록된 임시 디렉터리를 깊은 경로부터 안전하게 삭제합니다.
-    EN: Safely remove registered temp directories from deepest paths first.
+    """KR: 등록된 임시 디렉터리를 깊은 경로부터 안전하게 삭제한다.
+    EN: Safely delete registered temp directories starting from deepest paths.
     """
     if not _REGISTERED_TEMP_DIRS:
         return
@@ -2019,15 +2512,15 @@ atexit.register(cleanup_registered_temp_dirs)
 
 
 def _close_unitypy_reader(obj: Any) -> None:
-    """KR: UnityPy 내부 reader/object를 안전하게 dispose합니다.
-    KR: BundleFile의 mmap/temp 파일과 SerializedFile의 spill store도 정리합니다.
-    EN: Safely dispose UnityPy internal reader/object resources.
-    EN: Also cleans up BundleFile mmap/temp files and SerializedFile spill stores.
+    """KR: UnityPy 내부 reader/object를 안전하게 dispose한다.
+    EN: Safely dispose UnityPy internal reader/object.
+
+    BundleFile의 mmap/temp 파일과 SerializedFile의 spill store도 정리한다.
     """
     if obj is None:
         return
     # KR: BundleFile의 mmap/temp 블록 저장소 정리
-    # EN: Clean up BundleFile mmap/temp block storage
+    # EN: Clean up BundleFile's mmap/temp block storage
     cleanup_fn = getattr(obj, "_cleanup_temp_blocks_storage", None)
     if callable(cleanup_fn):
         try:
@@ -2035,7 +2528,7 @@ def _close_unitypy_reader(obj: Any) -> None:
         except Exception:
             pass
     # KR: SerializedFile의 spill store (temp 파일) 정리
-    # EN: Clean up SerializedFile spill store (temp file)
+    # EN: Clean up SerializedFile's spill store (temp file)
     close_fn = getattr(obj, "close", None)
     if callable(close_fn):
         try:
@@ -2056,8 +2549,8 @@ def _close_unitypy_reader(obj: Any) -> None:
 
 
 def close_unitypy_env(environment: Any) -> None:
-    """KR: Environment에 연결된 UnityPy 파일 리소스를 순회 종료합니다.
-    EN: Walk and close UnityPy file resources attached to environment.
+    """KR: Environment에 연결된 UnityPy 파일 리소스를 순회하며 종료한다.
+    EN: Traverse and close UnityPy file resources connected to the Environment.
     """
     if environment is None:
         return
@@ -2074,8 +2567,8 @@ def close_unitypy_env(environment: Any) -> None:
 
 
 def normalize_font_name(name: str) -> str:
-    """KR: 확장자/SDF 접미사를 제거해 폰트 기본 이름으로 정규화합니다.
-    EN: Normalize font name by removing extension and SDF suffixes.
+    """KR: 확장자/SDF 접미사를 제거해 폰트 기본 이름으로 정규화한다.
+    EN: Normalize to the base font name by removing extensions/SDF suffixes.
     """
     for ext in [".ttf", ".otf", ".json", ".png"]:
         if name.lower().endswith(ext):
@@ -2097,8 +2590,8 @@ def normalize_font_name(name: str) -> str:
 
 
 def parse_bool_flag(value: Any) -> bool:
-    """KR: 문자열/숫자/불리언 입력을 안전하게 bool로 해석합니다.
-    EN: Safely interpret string/number/bool values as bool.
+    """KR: 문자열/숫자/불리언 입력을 안전하게 bool로 해석한다.
+    EN: Safely interpret string/number/boolean input as bool.
     """
     if isinstance(value, bool):
         return value
@@ -2113,8 +2606,8 @@ def parse_bool_flag(value: Any) -> bool:
 def _read_bundle_signature(
     path: str, bundle_signatures: set[str] | None = None
 ) -> str | None:
-    """KR: 파일 헤더에서 Unity 번들 시그니처를 읽습니다.
-    EN: Read Unity bundle signature from file header.
+    """KR: 파일 헤더에서 Unity 번들 시그니처를 읽는다.
+    EN: Read a Unity bundle signature from the file header.
     """
     signatures = bundle_signatures or BUNDLE_SIGNATURES
     try:
@@ -2131,8 +2624,8 @@ def _read_bundle_signature(
 
 
 def _safe_metric_scale(game_point_size: Any, replacement_point_size: Any) -> float:
-    """KR: 게임 pointSize 대비 교체 pointSize 비율을 계산합니다.
-    EN: Compute scaling ratio from game pointSize to replacement pointSize.
+    """KR: 게임 pointSize 대비 교체 pointSize 비율을 계산한다.
+    EN: Compute the ratio of replacement pointSize to game pointSize.
     """
     try:
         game_ps = float(game_point_size)
@@ -2151,7 +2644,7 @@ def _detect_target_texture_swizzle(
     path_id: int,
 ) -> tuple[str | None, str | None]:
     """KR: 타겟 Texture2D의 swizzle 판정 결과를 캐시와 함께 반환합니다.
-    EN: Return cached swizzle verdict for target Texture2D.
+    EN: Return the swizzle detection result for the target Texture2D, with caching.
     """
     cache_key = f"{assets_name}|{path_id}"
     if cache_key in texture_swizzle_state_cache:
@@ -2168,7 +2661,7 @@ def _detect_target_texture_swizzle(
 
 def _preview_visible_image(image: Image.Image) -> Image.Image:
     """KR: RGBA/LA Atlas를 사람이 보기 쉬운 단일 채널 이미지로 정규화합니다.
-    EN: Normalize RGBA/LA atlas into a human-visible single-channel image.
+    EN: Normalize an RGBA/LA atlas to a human-viewable single-channel image.
     """
     try:
         if image.mode == "RGBA":
@@ -2199,7 +2692,7 @@ def _load_target_unswizzled_preview_image(
     preview_rotate: int = PS5_SWIZZLE_ROTATE,
 ) -> Image.Image | None:
     """KR: 대상 게임 Atlas(Texture2D)에서 검증용 unswizzle preview 이미지를 생성합니다.
-    EN: Build an unswizzled preview image from the target in-game Texture2D atlas.
+    EN: Generate an unswizzled preview image from the target game atlas (Texture2D) for verification.
     """
     texture_obj = texture_object_lookup.get((assets_name, int(atlas_path_id)))
     if texture_obj is None:
@@ -2262,8 +2755,8 @@ def _load_target_unswizzled_preview_image(
                         preview_rgba = Image.frombytes("RGBA", (width, height), rgba)
                         if _ps5_should_swap_rb_for_bc_preview(texture_format):
                             preview_rgba = _ps5_swap_rb_image(preview_rgba)
-                        # KR: BC preview는 Unity 좌표계와 일치하도록 상하 반전합니다.
-                        # EN: Flip BC preview vertically to match Unity coordinates.
+                        # KR: BC preview는 Unity 좌표계와 일치하도록 상하 반전
+                        # EN: Flip vertically to match Unity coordinate system for BC preview
                         return ImageOps.flip(preview_rgba)
 
             bpe_hint = _texture_format_bytes_per_element(texture_format)
@@ -2309,19 +2802,19 @@ def _load_target_unswizzled_preview_image(
                     swizzle_verdict == "likely_swizzled_input"
                     and unsw_variant != "already_linear"
                 ):
-                    # KR: rotate는 축-스왑(전치) 된 경우에만 적용 (예: Alpha8).
-                    # EN: Only apply rotation when axes were swapped (transposing bpe).
+                    # KR: 축-스왑(전치)된 경우에만 회전 적용 (예: Alpha8, bpe=1)
+                    # EN: Apply rotation only for axis-swapped (transposed) case (e.g. Alpha8, bpe=1)
                     if unsw_variant == "swapped_axes" and preview_rotate % 360 != 0:
                         preview_image = preview_image.rotate(
                             preview_rotate % 360, expand=True
                         )
                 else:
                     # KR: linear(비-swizzle) 텍스쳐는 Unity 좌표계(Y=0 하단)로 저장되므로 상하 반전 보정
-                    # EN: Linear (non-swizzled) textures are stored in Unity coordinates (Y=0 at bottom); flip vertically
+                    # EN: Linear (non-swizzle) textures are stored in Unity coordinates (Y=0 bottom), so flip vertically
                     preview_image = ImageOps.flip(preview_image)
                 if unsw_variant == "addrlib_4KB_S":
-                    # KR: addrlib 비압축 복원 경로는 Y축이 뒤집힌 사례(ui_button)가 있어 보정합니다.
-                    # EN: addrlib uncompressed path can be vertically inverted (e.g. ui_button); compensate.
+                    # KR: addrlib 비압축 복원 경로는 Y축이 뒤집힌 사례(ui_button)가 있어 보정
+                    # EN: Addrlib uncompressed restore path has cases with flipped Y-axis (ui_button), so correct it
                     preview_image = ImageOps.flip(preview_image)
                 return preview_image
 
@@ -2356,6 +2849,9 @@ def _save_swizzle_preview(
     target_swizzled: bool,
     lang: Language,
 ) -> None:
+    """KR: swizzle 상태 확인용 preview 이미지를 PNG로 저장합니다.
+    EN: Save a preview image for swizzle state verification as PNG.
+    """
     if not (preview_enabled and preview_root):
         return
     try:
@@ -2392,6 +2888,9 @@ def _save_glyph_crop_previews(
     sdf_data: JsonDict,
     lang: Language,
 ) -> None:
+    """KR: 글리프 테이블에서 개별 문자 crop preview를 PNG로 저장합니다.
+    EN: Save individual character crop previews from the glyph table as PNG.
+    """
     if not (preview_enabled and preview_root):
         return
     glyph_table = sdf_data.get("m_GlyphTable")
@@ -2452,8 +2951,8 @@ def _save_glyph_crop_previews(
                 continue
 
             x, y, w, h = rect
-            # KR: TMP new glyphRect.y는 bottom-origin이므로 top-origin 이미지(PIL) crop 좌표로 변환합니다.
-            # EN: TMP new glyphRect.y is bottom-origin; convert to top-origin image(PIL) crop coordinates.
+            # KR: TMP new GlyphRect.y는 bottom-origin이므로 PIL(top-origin) crop 좌표로 변환
+            # EN: TMP new GlyphRect.y is bottom-origin, so convert to PIL (top-origin) crop coordinates
             y = int(round(_tmp_flip_y_between_old_new(y, h, visible.height)))
             x0 = max(0, min(visible.width, x))
             y0 = max(0, min(visible.height, y))
@@ -2507,6 +3006,9 @@ def _prepare_texture_replacement_for_target(
     preview_root: str | None,
     lang: Language,
 ) -> JsonDict | None:
+    """KR: 교체 Atlas의 swizzle 상태를 타겟에 맞추고 preview를 생성합니다.
+    EN: Match the replacement atlas swizzle state to the target and generate previews.
+    """
     source_atlas = _load_spilled_plan_image(
         texture_plan,
         image_key="source_atlas",
@@ -2722,7 +3224,7 @@ def _prepare_texture_replacement_for_target(
 
 def _image_to_alpha8_bytes(image: Image.Image) -> tuple[bytes, int, int]:
     """KR: Pillow 이미지를 Alpha8 raw bytes로 변환합니다.
-    EN: Convert Pillow image into Alpha8 raw bytes.
+    EN: Convert a Pillow image to Alpha8 raw bytes.
     """
     if image.mode in {"RGBA", "LA"}:
         alpha = image.getchannel("A")
@@ -2739,6 +3241,9 @@ def _encode_alpha8_replacement_bytes(
     ps5_swizzle: bool,
     target_swizzled_state: bool | None,
 ) -> tuple[bytes, int, int, str]:
+    """KR: Alpha8 교체 바이트를 타겟 swizzle 상태에 맞게 인코딩합니다.
+    EN: Encode Alpha8 replacement bytes to match the target swizzle state.
+    """
     if ps5_swizzle and target_swizzled_state is True:
         alpha_linear, aw, ah = _image_to_alpha8_bytes(alpha_source)
         alpha_linear_img = Image.frombytes("L", (int(aw), int(ah)), alpha_linear)
@@ -2756,11 +3261,17 @@ def _encode_alpha8_replacement_bytes(
 
 @lru_cache(maxsize=128)
 def _ps5_bit_positions(mask: int) -> tuple[int, ...]:
+    """KR: 마스크에서 세트된 비트 위치 목록을 반환합니다.
+    EN: Return a list of set bit positions in a mask.
+    """
     return tuple(i for i in range(max(mask.bit_length(), 0)) if (mask >> i) & 1)
 
 
 @lru_cache(maxsize=128)
 def _ps5_axis_tile_size(mask: int) -> int:
+    """KR: 마스크의 세트된 비트 수로부터 축별 타일 크기를 계산합니다.
+    EN: Compute axis tile size from the number of set bits in a mask.
+    """
     positions = _ps5_bit_positions(mask)
     return 1 << len(positions) if positions else 1
 
@@ -2768,7 +3279,7 @@ def _ps5_axis_tile_size(mask: int) -> int:
 @lru_cache(maxsize=128)
 def _ps5_deposit_table(mask: int) -> tuple[int, ...]:
     """KR: 마스크 비트폭(타일 기준) pdep 유사 배치 테이블을 생성합니다.
-    EN: Build a pdep-like deposit table using mask bit-width (tile-local axis).
+    EN: Generate a pdep-like deposit table for the mask bit width (tile-based).
     """
     positions = _ps5_bit_positions(mask)
     axis_size = _ps5_axis_tile_size(mask)
@@ -2785,6 +3296,9 @@ def _ps5_deposit_table(mask: int) -> tuple[int, ...]:
 def _ps5_validate_texture_shape(
     data: bytes, width: int, height: int, bytes_per_element: int
 ) -> int:
+    """KR: 텍스처 크기/데이터 길이를 검증하고 총 요소 수를 반환합니다.
+    EN: Validate texture dimensions/data length and return the total element count.
+    """
     if width <= 0 or height <= 0 or bytes_per_element <= 0:
         raise ValueError(
             f"Invalid texture shape for swizzle: width={width}, height={height}, bpe={bytes_per_element}"
@@ -2805,6 +3319,9 @@ def _ps5_clip_to_base_level(
     height: int,
     bytes_per_element: int,
 ) -> tuple[bytes, int]:
+    """KR: mip0 기본 레벨만 남기고 초과 바이트를 잘라냅니다.
+    EN: Clip to mip0 base level only, trimming excess bytes.
+    """
     total_elements = _ps5_validate_texture_shape(data, width, height, bytes_per_element)
     expected_size = total_elements * bytes_per_element
     if len(data) > expected_size:
@@ -2813,6 +3330,9 @@ def _ps5_clip_to_base_level(
 
 
 def _texture_format_enum_name(texture_format: int) -> str:
+    """KR: 텍스처 포맷 정수를 UnityPy enum 이름 문자열로 변환합니다.
+    EN: Convert a texture format integer to a UnityPy enum name string.
+    """
     value = int(texture_format)
     if _UnityTextureFormatEnum is not None:
         try:
@@ -2823,6 +3343,9 @@ def _texture_format_enum_name(texture_format: int) -> str:
 
 
 def _texture_format_layout_details(texture_format: int) -> dict[str, Any] | None:
+    """KR: 텍스처 포맷의 PS5 레이아웃 메타데이터(블록 크기, 디코더 등)를 반환합니다.
+    EN: Return PS5 layout metadata (block size, decoder, etc.) for a texture format.
+    """
     value = int(texture_format)
     meta = _PS5_LAYOUT_FORMAT_META.get(value)
     if meta is None:
@@ -2850,8 +3373,11 @@ def _texture_format_layout_details(texture_format: int) -> dict[str, Any] | None
 
 
 def _texture_format_bytes_per_element(texture_format: int) -> int | None:
-    # KR: 가능한 경우 UnityPy enum 이름 기준으로 BPE를 해석합니다.
-    # EN: Prefer UnityPy enum names when available to avoid numeric drift by version.
+    """KR: 텍스처 포맷에서 픽셀당 바이트 수(BPE)를 반환합니다.
+    EN: Return bytes per pixel (BPE) for a texture format.
+    """
+    # KR: 가능한 경우 UnityPy enum 이름 기준으로 BPE를 해석 (버전별 숫자 변동 방지)
+    # EN: Interpret BPE by UnityPy enum name when possible (prevents version-specific number changes)
     bpe_by_name = {
         "Alpha8": 1,
         "ARGB4444": 2,
@@ -2871,7 +3397,7 @@ def _texture_format_bytes_per_element(texture_format: int) -> int | None:
         value = bpe_by_name.get(enum_name)
 
     # KR: enum 해석 실패 시 최소 숫자 fallback.
-    # EN: Minimal numeric fallback for environments without enum resolution.
+    # EN: Minimal numeric fallback when enum interpretation fails.
     if value is None:
         format_to_bpe = {
             1: 1,  # Alpha8
@@ -2892,10 +3418,16 @@ def _texture_format_bytes_per_element(texture_format: int) -> int | None:
 
 
 def _texture_format_is_bc(texture_format: int) -> bool:
+    """KR: BC(블록 압축) 포맷 여부를 반환합니다.
+    EN: Return whether the format is BC (block compressed).
+    """
     return int(texture_format) in _PS5_BC_FORMATS
 
 
 def _texture_format_is_crunched(texture_format: int) -> bool:
+    """KR: Crunched(크런치 압축) 포맷 여부를 반환합니다.
+    EN: Return whether the format is Crunched (crunch compressed).
+    """
     value = int(texture_format)
     if value in {28, 29}:  # DXT1Crunched / DXT5Crunched
         return True
@@ -2916,10 +3448,10 @@ def ps5_unswizzle_bytes(
     mask_x: int | None = None,
     mask_y: int | None = None,
 ) -> bytes:
-    """KR: PS5 swizzled 바이트 배열을 선형 순서로 변환합니다.
-    EN: Convert PS5-swizzled bytes into linear row-major bytes.
+    """KR: PS5 swizzled 바이트 배열을 선형(행 우선) 순서로 변환합니다.
     mask_x/mask_y가 None이면 width/height에서 자동 계산합니다.
-    When mask_x/mask_y are None they are computed from width/height.
+    EN: Convert a PS5 swizzled byte array to linear (row-major) order.
+    Automatically computes mask_x/mask_y from width/height if None.
     """
     if not _ps5_dimensions_supported(width, height, bytes_per_element):
         clipped, _ = _ps5_clip_to_base_level(data, width, height, bytes_per_element)
@@ -2969,10 +3501,10 @@ def ps5_swizzle_bytes(
     mask_x: int | None = None,
     mask_y: int | None = None,
 ) -> bytes:
-    """KR: 선형 순서 바이트 배열을 PS5 swizzle 순서로 변환합니다.
-    EN: Convert linear row-major bytes into PS5-swizzled order.
+    """KR: 선형(행 우선) 바이트 배열을 PS5 swizzle 순서로 변환합니다.
     mask_x/mask_y가 None이면 width/height에서 자동 계산합니다.
-    When mask_x/mask_y are None they are computed from width/height.
+    EN: Convert a linear (row-major) byte array to PS5 swizzle order.
+    Automatically computes mask_x/mask_y from width/height if None.
     """
     if not _ps5_dimensions_supported(width, height, bytes_per_element):
         clipped, _ = _ps5_clip_to_base_level(data, width, height, bytes_per_element)
@@ -3015,6 +3547,9 @@ def ps5_swizzle_bytes(
 
 
 def _ps5_mode_for_swizzle(image: Image.Image) -> str:
+    """KR: swizzle 처리에 적합한 PIL 모드를 결정합니다.
+    EN: Determine the PIL mode suitable for swizzle processing.
+    """
     mode = image.mode
     if mode in {"L", "LA", "RGB", "RGBA"}:
         return mode
@@ -3024,6 +3559,9 @@ def _ps5_mode_for_swizzle(image: Image.Image) -> str:
 
 
 def _ps5_prepare_image(image: Image.Image) -> Image.Image:
+    """KR: swizzle 처리 전 이미지를 적합한 모드로 변환합니다.
+    EN: Convert image to a suitable mode before swizzle processing.
+    """
     mode = _ps5_mode_for_swizzle(image)
     if image.mode == mode:
         return image
@@ -3037,28 +3575,26 @@ def _ps5_roughness_score(
     bytes_per_element: int,
 ) -> float:
     """KR: 로컬 픽셀 변화량 기반 거칠기 점수를 계산합니다.
-    EN: Compute a local variation roughness score.
-
-    Always compares **adjacent** pixels (step=1) to accurately detect swizzle
-    vs linear data.  Previous versions used a ``max_axis_samples`` parameter
-    that inflated the comparison step (e.g. step=16 for 4096-wide textures),
-    which caused dense CJK font atlases at 4096×4096 to be mis-classified as
-    'already linear'.
-
-    For performance, a subset of rows (for dx) and columns (for dy) are sampled
-    instead of iterating over every pixel.  This keeps accuracy while staying
-    fast in pure Python.
+    낮을수록 부드러움 = linear 가능성 높음; swizzled 데이터는 노이즈처럼 보입니다.
+    항상 인접 픽셀(step=1)을 비교하여 swizzle/linear를 정확히 판별합니다.
+    성능을 위해 전체 픽셀 대신 행/열 서브셋을 샘플링합니다.
+    EN: Compute a roughness score based on local pixel variation.
+    Lower means smoother = likely linear; swizzled data looks like noise.
+    Always compares adjacent pixels (step=1) to accurately distinguish swizzle/linear.
+    Samples row/column subsets instead of all pixels for performance.
     """
     data, _ = _ps5_clip_to_base_level(data, width, height, bytes_per_element)
     _ps5_validate_texture_shape(data, width, height, bytes_per_element)
     view = memoryview(data)
     bpe = bytes_per_element
 
-    # --- Determine which channel to measure ---
+    # KR: --- 측정할 채널 결정 ---
+    # EN: --- Determine channel to measure ---
     max_sample_lines = 256
     channel_index = 0
     if bpe > 1:
-        # Pick channel with highest variance (most information).
+        # KR: 분산이 가장 높은(정보량이 가장 많은) 채널을 선택
+        # EN: Select the channel with highest variance (most information)
         row_step = max(1, height // max_sample_lines)
         col_step = max(1, width // max_sample_lines)
         sums = [0.0] * bpe
@@ -3082,7 +3618,8 @@ def _ps5_roughness_score(
                     best_var = variance
                     channel_index = ch
 
-    # --- Measure dx (horizontal): sample rows, but always compare adjacent pixels ---
+    # KR: --- dx(수평) 측정: 행 샘플링, 항상 인접 픽셀 비교 ---
+    # EN: --- dx (horizontal) measurement: row sampling, always comparing adjacent pixels ---
     dx_sum = 0.0
     dx_count = 0
     row_step = max(1, height // max_sample_lines)
@@ -3091,11 +3628,12 @@ def _ps5_roughness_score(
             row_base = y * width * bpe
             for x in range(width - 1):
                 left_idx = row_base + x * bpe + channel_index
-                right_idx = left_idx + bpe          # step=1, always adjacent
+                right_idx = left_idx + bpe          # step=1, KR: 항상 인접 / EN: always adjacent
                 dx_sum += abs(float(view[right_idx]) - float(view[left_idx]))
                 dx_count += 1
 
-    # --- Measure dy (vertical): sample columns, but always compare adjacent pixels ---
+    # KR: --- dy(수직) 측정: 열 샘플링, 항상 인접 픽셀 비교 ---
+    # EN: --- dy (vertical) measurement: column sampling, always comparing adjacent pixels ---
     dy_sum = 0.0
     dy_count = 0
     col_step = max(1, width // max_sample_lines)
@@ -3105,7 +3643,7 @@ def _ps5_roughness_score(
             col_base = x * bpe + channel_index
             for y in range(height - 1):
                 up_idx = col_base + y * row_stride
-                down_idx = up_idx + row_stride      # step=1, always adjacent
+                down_idx = up_idx + row_stride      # step=1, KR: 항상 인접 / EN: always adjacent
                 dy_sum += abs(float(view[down_idx]) - float(view[up_idx]))
                 dy_count += 1
 
@@ -3123,7 +3661,7 @@ def detect_ps5_swizzle_state(
     mask_y: int | None = None,
 ) -> tuple[str, float, float, float, bytes, bytes]:
     """KR: 입력 바이트가 swizzled인지 휴리스틱으로 판별합니다.
-    EN: Heuristically detect whether input bytes are likely swizzled.
+    EN: Heuristically determine whether input bytes are swizzled.
     """
     data, _ = _ps5_clip_to_base_level(data, width, height, bytes_per_element)
     if not _ps5_dimensions_supported(width, height, bytes_per_element):
@@ -3162,20 +3700,22 @@ def _ps5_unswizzle_best_variant(
     roughness_guard: bool = False,
 ) -> tuple[bytes, int, int, str, float]:
     """KR: bpe별 축-전치 규칙에 따라 unswizzle 후보를 선택합니다.
-    KR: roughness_guard=True이면, unswizzle 결과가 원본보다 거칠 경우 원본을 반환합니다.
-    EN: Pick the correct unswizzle variant based on per-bpe axis transposition rules.
-    EN: When roughness_guard=True, returns raw data if unswizzle makes it rougher (already linear).
-
-    Axis transposition depends on bpe:
-      bpe=1 (Alpha8): always transpose → unswizzle at (H,W), rotate 90° to restore.
-      bpe=4 (RGBA32): never transpose → unswizzle at (W,H) directly.
+    roughness_guard=True이면, unswizzle 결과가 원본보다 거칠 경우 원본을 반환합니다.
+    축 전치는 bpe에 따라 달라집니다:
+      bpe=1 (Alpha8): 항상 전치 -> (H,W)로 unswizzle 후 90도 회전으로 복원.
+      bpe=4 (RGBA32): 전치 안 함 -> (W,H)로 직접 unswizzle.
+    EN: Select an unswizzle candidate according to per-bpe axis-transpose rules.
+    If roughness_guard=True, returns original when unswizzle result is rougher.
+    Axis transposition varies by bpe:
+      bpe=1 (Alpha8): always transpose -> unswizzle as (H,W) then restore via 90-degree rotation.
+      bpe=4 (RGBA32): no transpose -> unswizzle directly as (W,H).
     """
     logical_bytes = width * height * bytes_per_element
     usable = data[: (len(data) // bytes_per_element) * bytes_per_element]
     clipped = usable[:logical_bytes]
 
     # KR: roughness guard를 위해 원본 roughness를 미리 계산합니다.
-    # EN: Pre-compute raw roughness for the safety check.
+    # EN: Pre-compute original roughness for roughness guard.
     raw_score = (
         _ps5_roughness_score(clipped, width, height, bytes_per_element)
         if roughness_guard
@@ -3183,7 +3723,7 @@ def _ps5_unswizzle_best_variant(
     )
 
     # KR: bpe별 축 전치 규칙 결정.
-    # EN: Determine whether this bpe uses axis transposition.
+    # EN: Determine axis transpose rule by bpe.
     should_transpose = _PS5_AXIS_TRANSPOSE.get(bytes_per_element, False)
 
     if (
@@ -3193,9 +3733,10 @@ def _ps5_unswizzle_best_variant(
         and mask_y is None
         and _ps5_dimensions_supported(height, width, bytes_per_element)
     ):
-        # KR: 전치 bpe (예: Alpha8): 종횡비와 무관하게 (H,W)로 unswizzle 후 회전 후보로 취급.
-        # EN: Transposing bpe (e.g. Alpha8): always treat (H,W) unswizzle as the primary
-        #     candidate regardless of aspect ratio (including square textures).
+        # KR: 전치 bpe (예: Alpha8): 종횡비와 무관하게 (H,W)로 unswizzle 후 회전 후보로 취급합니다
+        #     (정사각형 텍스처 포함).
+        # EN: Transposed bpe (e.g. Alpha8): unswizzle as (H,W) regardless of aspect ratio, treated as rotation candidate
+        #     (including square textures).
         try:
             swapped = ps5_unswizzle_bytes(
                 clipped,
@@ -3213,7 +3754,8 @@ def _ps5_unswizzle_best_variant(
                 swapped, height, width, bytes_per_element
             )
         except Exception:
-            # Fallback to normal
+            # KR: 일반 모드로 폴백
+            # EN: Fallback to normal mode
             normal = ps5_unswizzle_bytes(
                 clipped, width, height, bytes_per_element,
                 mask_x=mask_x, mask_y=mask_y,
@@ -3224,8 +3766,8 @@ def _ps5_unswizzle_best_variant(
             best_variant = "normal"
             best_score = _ps5_roughness_score(normal, width, height, bytes_per_element)
     else:
-        # KR: 비전치 bpe (예: RGBA32) 또는 정사각형: (W,H)로 unswizzle.
-        # EN: Non-transposing bpe (e.g. RGBA32) or square texture: unswizzle at (W,H).
+        # KR: 비전치 bpe (예: RGBA32) 또는 정사각형: (W,H)로 unswizzle합니다.
+        # EN: Non-transposed bpe (e.g. RGBA32) or square: unswizzle as (W,H).
         normal = ps5_unswizzle_bytes(
             clipped, width, height, bytes_per_element,
             mask_x=mask_x, mask_y=mask_y,
@@ -3237,7 +3779,7 @@ def _ps5_unswizzle_best_variant(
         best_score = _ps5_roughness_score(normal, width, height, bytes_per_element)
 
     # KR: 일부 RGBA/LA 텍스처는 addrlib 기반 4KB_S 경로가 더 정확합니다.
-    # EN: Some RGBA/LA textures are better reconstructed by addrlib 4KB_S mapping.
+    # EN: Some RGBA/LA textures are more accurate with addrlib-based 4KB_S path.
     if (
         best_width == width
         and best_height == height
@@ -3256,7 +3798,7 @@ def _ps5_unswizzle_best_variant(
                 best_score = addrlib_score
 
     # KR: Roughness guard – unswizzle 결과가 원본보다 거칠면, 원본이 이미 linear입니다.
-    # EN: Roughness guard – if unswizzle made data rougher, input is already linear.
+    # EN: Roughness guard - if unswizzle result is rougher than original, original is already linear.
     if roughness_guard and raw_score is not None and best_score >= raw_score * 0.92:
         return clipped, width, height, "already_linear", raw_score
 
@@ -3270,7 +3812,7 @@ def detect_ps5_swizzle_state_from_image(
     rotate: int = PS5_SWIZZLE_ROTATE,
 ) -> tuple[str, float, float, float]:
     """KR: Pillow 이미지의 swizzle 상태를 판별합니다.
-    EN: Detect swizzle state from a Pillow image.
+    EN: Determine the swizzle state of a Pillow image.
     """
     prepared = _ps5_prepare_image(image)
 
@@ -3301,7 +3843,7 @@ def apply_ps5_swizzle_to_image(
     if not _ps5_dimensions_supported(prepared.width, prepared.height, bytes_per_element):
         return prepared
     # KR: 전치 bpe (예: Alpha8)에만 역방향 회전을 적용합니다.
-    # EN: Only apply inverse rotation for transposing bpe (e.g. Alpha8).
+    # EN: Apply inverse rotation only for transposed bpe (e.g. Alpha8).
     should_transpose = _PS5_AXIS_TRANSPOSE.get(bytes_per_element, False)
     if should_transpose and rotate % 360 != 0:
         prepared = prepared.rotate((-rotate) % 360, expand=True)
@@ -3329,9 +3871,8 @@ def apply_ps5_unswizzle_to_image(
     roughness_guard: bool = False,
 ) -> Image.Image:
     """KR: swizzled 이미지에 PS5 unswizzle 변환을 적용합니다.
-    KR: roughness_guard=True이면, 이미 linear인 입력은 변환하지 않습니다.
     EN: Apply PS5 unswizzle transform to a swizzled image.
-    EN: When roughness_guard=True, skips unswizzle if input is already linear.
+    roughness_guard=True이면, 이미 linear인 입력은 변환하지 않습니다.
     """
     prepared = _ps5_prepare_image(image)
     bytes_per_element = len(prepared.getbands())
@@ -3351,8 +3892,8 @@ def apply_ps5_unswizzle_to_image(
     if variant == "already_linear":
         return prepared
     output = Image.frombytes(prepared.mode, (out_width, out_height), unswizzled)
-    # KR: rotate는 축-스왑(전치) 된 경우에만 적용 (예: Alpha8).
-    # EN: Only apply rotation when axes were swapped (transposing bpe).
+    # KR: rotate는 축-스왑(전치) 된 경우에만 적용합니다 (예: Alpha8).
+    # EN: Rotation is applied only when axis-swap (transpose) occurred (e.g. Alpha8).
     if variant == "swapped_axes" and rotate % 360 != 0:
         output = output.rotate(rotate % 360, expand=True)
     return output
@@ -3365,7 +3906,7 @@ def detect_texture_object_ps5_swizzle(
     rotate: int = PS5_SWIZZLE_ROTATE,
 ) -> str | None:
     """KR: Texture2D 오브젝트의 swizzle 상태를 판별합니다.
-    EN: Detect swizzle state for a Texture2D object.
+    EN: Determines the swizzle state of a Texture2D object.
     """
     verdict, _ = detect_texture_object_ps5_swizzle_detail(
         texture_obj,
@@ -3383,9 +3924,9 @@ def detect_texture_object_ps5_swizzle_detail(
     rotate: int = PS5_SWIZZLE_ROTATE,
 ) -> tuple[str | None, str | None]:
     """KR: Texture2D 오브젝트의 swizzle 상태를 판별합니다.
-    KR: 반환값은 (판정값, 판정근거)입니다.
-    EN: Detect swizzle state for a Texture2D object.
-    EN: Returns (verdict, source).
+    반환값은 (판정값, 판정근거)입니다.
+    EN: Determines the swizzle state of a Texture2D object.
+    Returns (verdict, reason).
     """
     try:
         texture = texture_obj.parse_as_object()
@@ -3409,13 +3950,13 @@ def detect_texture_object_ps5_swizzle_detail(
             image_data_len = 0
 
         # KR: 포맷/메타데이터 기반 공용 규칙:
-        # KR:  - BC: stream+non-readable => swizzled, inline+readable => linear
-        # KR:  - Crunched: UnityPy decode 경로 기준 linear 취급
-        # KR:  - Uncompressed: stream/inline 메타 + bpe 일치 여부로 판정
-        # EN: Format/metadata-based common rules:
-        # EN:  - BC: stream+non-readable => swizzled, inline+readable => linear
-        # EN:  - Crunched: treat as linear via UnityPy decode path
-        # EN:  - Uncompressed: use stream/inline metadata + bpe consistency
+        #  - BC: stream+non-readable => swizzled, inline+readable => linear
+        #  - Crunched: UnityPy decode 경로 기준 linear 취급
+        #  - Uncompressed: stream/inline 메타 + bpe 일치 여부로 판정
+        # EN: Common rules based on format/metadata:
+        #  - BC: stream+non-readable => swizzled, inline+readable => linear
+        #  - Crunched: treated as linear per UnityPy decode path
+        #  - Uncompressed: determined by stream/inline meta + bpe match
         meta_hint: str | None = None
         meta_source: str | None = None
         if width > 0 and height > 0:
@@ -3447,7 +3988,7 @@ def detect_texture_object_ps5_swizzle_detail(
                 meta_source = "meta-inline"
 
         # KR: 메타 기준이 확실하면 유사도보다 우선합니다.
-        # EN: Prefer metadata verdict when it is available.
+        # EN: If metadata criteria are definitive, they take priority over similarity.
         if meta_hint is not None:
             return meta_hint, meta_source or "meta"
 
@@ -3469,9 +4010,9 @@ def detect_texture_object_ps5_swizzle_detail(
             if raw_data:
                 if _texture_format_is_bc(texture_format):
                     # KR: BC 포맷은 descriptor 비트(타일모드/selector)가 핵심이며
-                    # KR: 현재 자산 API에서 직접 노출되지 않으므로, 휴리스틱 점수 판별을 피합니다.
-                    # EN: BC formats depend on descriptor bits (tile mode/selectors) not exposed
-                    # EN: by current asset APIs; avoid roughness-based heuristics in this branch.
+                    # 현재 자산 API에서 직접 노출되지 않으므로, 휴리스틱 점수 판별을 피합니다.
+                    # EN: BC format relies on descriptor bits (tile mode/selector) which
+                    # are not directly exposed by the current asset API, so heuristic scoring is avoided.
                     if stream_size > 0 and not is_readable:
                         return "likely_swizzled_input", "bc-meta-stream"
                     if stream_size == 0 and is_readable and image_data_len > 0:
@@ -3519,7 +4060,9 @@ def build_replacement_lookup(
     replacements: dict[str, JsonDict],
 ) -> tuple[dict[tuple[str, str, str, int], str], set[str]]:
     """KR: 교체 JSON을 빠른 조회용 룩업 테이블로 변환합니다.
-    EN: Build fast lookup structures from replacement JSON data.
+    (Type, File, assets_name, Path_ID) → font_name 매핑을 생성합니다.
+    EN: Converts the replacement JSON into a fast-lookup table.
+    Builds a (Type, File, assets_name, Path_ID) → font_name mapping.
     """
     lookup: dict[tuple[str, str, str, int], str] = {}
     files_to_process: set[str] = set()
@@ -3559,14 +4102,14 @@ def build_replacement_lookup(
 
 def debug_parse_enabled() -> bool:
     """KR: 디버그 파싱 로그 활성화 여부를 반환합니다.
-    EN: Return whether parse debug logging is enabled.
+    EN: Returns whether debug parse logging is enabled.
     """
     return os.environ.get("UFR_DEBUG_PARSE", "").strip() == "1"
 
 
 def debug_parse_log(message: str) -> None:
     """KR: 디버그 모드일 때만 파싱 로그를 출력합니다.
-    EN: Print parsing debug message only when enabled.
+    EN: Outputs parse logs only when debug mode is active.
     """
     if debug_parse_enabled():
         _log_console(message)
@@ -3576,7 +4119,7 @@ def _log_scan_result_details(
     file_name: str, scanned: dict[str, list[JsonDict]]
 ) -> None:
     """KR: 스캔 결과를 파일/폰트 단위 DEBUG 로그로 남깁니다.
-    EN: Emit file/font-level DEBUG logs for scan results.
+    EN: Logs scan results at file/font level as DEBUG output.
     """
     ttf_entries = list(scanned.get("ttf", []))
     sdf_entries = list(scanned.get("sdf", []))
@@ -3608,7 +4151,7 @@ def _is_scan_retry_candidate(
     worker_error: str | None,
 ) -> bool:
     """KR: 최종 순차 재시도 대상(실패/빈 결과)을 판정합니다.
-    EN: Decide whether this scan result should be retried sequentially at the end.
+    EN: Determines if a scan result qualifies for final sequential retry (failure/empty results).
     """
     if not isinstance(worker_error, str) or not worker_error.strip():
         return False
@@ -3627,7 +4170,7 @@ def _log_replacement_plan_details(
     replacement_mapping: dict[str, JsonDict],
 ) -> None:
     """KR: 파일별 교체 계획을 DEBUG 로그로 기록합니다.
-    EN: Emit file-level replacement plan as DEBUG logs.
+    EN: Records the per-file replacement plan as DEBUG log.
     """
     if not replacement_mapping:
         _log_debug(f"[replace_plan] file={file_name} targets=0")
@@ -3671,7 +4214,7 @@ def _log_replacement_plan_details(
 
 def ensure_int(data: JsonDict | None, keys: Iterable[str]) -> None:
     """KR: 딕셔너리의 지정 키 값을 int로 강제 변환합니다.
-    EN: Force-convert specified dictionary keys to integers.
+    EN: Force-converts the specified key values in a dictionary to int.
     """
     if not data:
         return
@@ -3694,7 +4237,7 @@ def _parse_unity_version_triplet(version_text: str) -> tuple[int, int, int] | No
 @lru_cache(maxsize=1)
 def _load_tmp_info_unity_field_index() -> dict[tuple[int, int, int], set[str]]:
     """KR: TMP_Info의 Unity 축 스냅샷에서 버전별 최상위 필드 인덱스를 로드합니다.
-    EN: Load per-version top-level field index from TMP_Info unity snapshots.
+    EN: Loads per-version top-level field index from TMP_Info Unity axis snapshots.
     """
     try:
         path = os.path.join(
@@ -3738,7 +4281,7 @@ def _load_tmp_info_unity_field_index() -> dict[tuple[int, int, int], set[str]]:
 @lru_cache(maxsize=256)
 def _get_tmp_info_fields_for_unity(unity_version: str | None) -> set[str]:
     """KR: Unity 버전에 가장 가까운 TMP_Info 스냅샷 필드 집합을 반환합니다.
-    EN: Return TMP_Info field set from the nearest Unity version snapshot.
+    EN: Returns the TMP_Info snapshot field set closest to the given Unity version.
     """
     if not unity_version:
         return set()
@@ -3760,7 +4303,7 @@ def _resolve_creation_settings_key(
     data: JsonDict, unity_version: str | None = None
 ) -> str | None:
     """KR: 타겟 딕셔너리에서 creation settings 키를 판별합니다.
-    EN: Resolve creation-settings key from target dict.
+    EN: Identifies the creation settings key in the target dictionary.
     """
     for key in _TMP_CREATION_SETTINGS_KEYS:
         if isinstance(data.get(key), dict):
@@ -3780,7 +4323,7 @@ def _sync_creation_settings_payload(
     point_size: int,
 ) -> None:
     """KR: creation settings 내부 키 패턴을 감지해 atlas/pointSize를 동기화합니다.
-    EN: Detect key patterns in creation settings and sync atlas/pointSize values.
+    EN: Detects key patterns inside creation settings and syncs atlas/pointSize.
     """
     for key in list(creation_settings.keys()):
         normalized = key.replace("_", "").lower()
@@ -3808,10 +4351,16 @@ def _tmp_version_hint(unity_version: str | None) -> Literal["new", "old"] | None
 
 
 def _safe_list_len(value: Any) -> int:
+    """KR: 리스트이면 길이를 반환하고, 아니면 0을 반환합니다.
+    EN: Returns the length if it is a list, otherwise returns 0.
+    """
     return len(value) if isinstance(value, list) else 0
 
 
 def _first_atlas_ref(value: Any) -> JsonDict | None:
+    """KR: 아틀라스 텍스처 리스트에서 첫 번째 딕셔너리 참조를 반환합니다.
+    EN: Returns the first dictionary reference from the atlas texture list.
+    """
     if not isinstance(value, list):
         return None
     for item in value:
@@ -3821,6 +4370,9 @@ def _first_atlas_ref(value: Any) -> JsonDict | None:
 
 
 def _atlas_ref_ids(ref: Any) -> tuple[int, int]:
+    """KR: 아틀라스 참조 딕셔너리에서 (m_FileID, m_PathID) 튜플을 추출합니다.
+    EN: Extracts the (m_FileID, m_PathID) tuple from an atlas reference dictionary.
+    """
     if not isinstance(ref, dict):
         return 0, 0
     try:
@@ -3835,6 +4387,9 @@ def _atlas_ref_ids(ref: Any) -> tuple[int, int]:
 
 
 def _normalize_assets_basename(value: Any) -> str | None:
+    """KR: 에셋 경로에서 파일명(basename)만 정규화하여 반환합니다.
+    EN: Normalizes and returns only the filename (basename) from an asset path.
+    """
     text = str(value).strip() if value is not None else ""
     if not text:
         return None
@@ -3844,6 +4399,9 @@ def _normalize_assets_basename(value: Any) -> str | None:
 
 
 def _normalize_asset_lookup_path(value: Any) -> str | None:
+    """KR: 에셋 조회용 경로를 정규화합니다. archive://, file:// 접두사를 제거하고 소문자로 변환합니다.
+    EN: Normalizes the asset lookup path. Strips archive://, file:// prefixes and converts to lowercase.
+    """
     text = str(value).strip() if value is not None else ""
     if not text:
         return None
@@ -3863,6 +4421,9 @@ def _normalize_asset_lookup_path(value: Any) -> str | None:
 
 
 def _normalize_asset_file_key(path: Any) -> str | None:
+    """KR: 에셋 파일 경로를 절대경로 기반의 정규화된 키로 변환합니다.
+    EN: Converts an asset file path to a normalized key based on its absolute path.
+    """
     text = str(path).strip() if path is not None else ""
     if not text:
         return None
@@ -3873,6 +4434,9 @@ def _build_asset_file_index(
     all_assets_files: list[str],
     data_path: str,
 ) -> dict[str, Any]:
+    """KR: 모든 에셋 파일 목록으로부터 상대경로/basename 기반 인덱스를 구축합니다.
+    EN: Builds a relative-path/basename-based index from the full list of asset files.
+    """
     data_root = os.path.abspath(data_path)
     path_by_key: dict[str, str] = {}
     relpath_to_keys: dict[str, list[str]] = {}
@@ -3904,6 +4468,9 @@ def _build_asset_file_index(
 
 
 def _extract_external_assets_name(external_ref: Any) -> str | None:
+    """KR: 외부 참조 객체에서 에셋 이름(basename)을 추출합니다.
+    EN: Extracts the asset name (basename) from an external reference object.
+    """
     if external_ref is None:
         return None
 
@@ -3938,6 +4505,9 @@ def _extract_external_assets_name(external_ref: Any) -> str | None:
 
 
 def _extract_external_assets_candidates(external_ref: Any) -> list[str]:
+    """KR: 외부 참조 객체에서 가능한 모든 에셋 경로/이름 후보를 추출합니다.
+    EN: Extracts all possible asset path/name candidates from an external reference object.
+    """
     if external_ref is None:
         return []
 
@@ -3981,6 +4551,9 @@ def _extract_external_assets_candidates(external_ref: Any) -> list[str]:
 
 
 def _resolve_external_ref(source_assets_file: Any, file_id: int) -> Any:
+    """KR: FileID를 사용하여 소스 에셋 파일의 externals 목록에서 외부 참조를 조회합니다. FileID=0은 같은 파일, FileID>0은 externals 리스트의 1-based 인덱스입니다.
+    EN: Looks up an external reference from the source asset file's externals list using FileID. FileID=0 means the same file; FileID>0 is a 1-based index into the externals list.
+    """
     try:
         resolved_file_id = int(file_id or 0)
     except Exception:
@@ -4007,6 +4580,9 @@ def _resolve_external_ref(source_assets_file: Any, file_id: int) -> Any:
 
 
 def _resolve_assets_name_from_file_id(source_assets_file: Any, file_id: int) -> str | None:
+    """KR: FileID로부터 대상 에셋 파일 이름을 확인합니다. FileID=0이면 현재 파일 이름을 반환합니다.
+    EN: Resolves the target asset file name from a FileID. Returns the current file name if FileID=0.
+    """
     try:
         resolved_file_id = int(file_id or 0)
     except Exception:
@@ -4030,6 +4606,9 @@ def _resolve_target_assets_name(
     current_assets_name: str,
     file_id: int,
 ) -> str | None:
+    """KR: FileID 기반으로 대상 에셋 이름을 결정합니다. FileID=0이면 현재 에셋 이름을 그대로 반환합니다.
+    EN: Determines the target asset name based on FileID. Returns the current asset name as-is if FileID=0.
+    """
     try:
         resolved_file_id = int(file_id or 0)
     except Exception:
@@ -4043,6 +4622,9 @@ def _collect_asset_file_index_matches(
     asset_file_index: dict[str, Any] | None,
     reference: Any,
 ) -> list[str]:
+    """KR: 에셋 파일 인덱스에서 참조 문자열과 일치하는 모든 키를 수집합니다.
+    EN: Collects all keys from the asset file index that match the reference string.
+    """
     if not isinstance(asset_file_index, dict):
         return []
 
@@ -4095,6 +4677,9 @@ def _choose_asset_file_match(
     current_file_key: str | None,
     reference_desc: str,
 ) -> str | None:
+    """KR: 여러 일치 항목 중 하나를 선택합니다. 같은 디렉토리의 형제 파일을 우선하고, 모호하면 정렬 후 첫 번째를 사용합니다.
+    EN: Selects one match from multiple candidates. Prefers sibling files in the same directory; if ambiguous, sorts and uses the first.
+    """
     if not matches:
         return None
     if len(matches) == 1:
@@ -4128,6 +4713,9 @@ def _resolve_target_outer_file_key(
     source_bundle_signature: str | None,
     asset_file_index: dict[str, Any] | None,
 ) -> str | None:
+    """KR: FileID와 에셋 이름을 조합하여 대상 외부 파일의 정규화된 키를 확인합니다. 번들 서명이 있으면 현재 파일 키를 반환합니다.
+    EN: Resolves the normalized key of the target external file by combining FileID and asset name. Returns the current file key if a bundle signature is present.
+    """
     if source_bundle_signature in BUNDLE_SIGNATURES:
         return str(current_file_key)
     try:
@@ -4158,10 +4746,16 @@ def _resolve_target_outer_file_key(
 
 
 def _make_assets_object_key(assets_name: str, path_id: int) -> str:
+    """KR: 에셋 이름과 PathID를 결합하여 고유 객체 키 문자열을 생성합니다.
+    EN: Creates a unique object key string by combining the asset name and PathID.
+    """
     return f"{str(assets_name)}|{int(path_id)}"
 
 
 def _lookup_patch_value(mapping: dict[str, Any], key: str) -> Any | None:
+    """KR: 패치 맵에서 키를 조회합니다. 대소문자 구분 후 소문자 폴백을 시도합니다.
+    EN: Looks up a key in the patch map. Tries case-sensitive first, then falls back to lowercase.
+    """
     if key in mapping:
         return mapping[key]
     lowered = key.lower()
@@ -4171,6 +4765,9 @@ def _lookup_patch_value(mapping: dict[str, Any], key: str) -> Any | None:
 
 
 def _store_patch_value(mapping: dict[str, Any], key: str, value: Any) -> None:
+    """KR: 패치 맵에 값을 저장합니다. 원본 키와 소문자 키 양쪽에 동시 저장합니다.
+    EN: Stores a value in the patch map. Saves to both the original key and its lowercase variant.
+    """
     mapping[key] = value
     lowered = key.lower()
     if lowered != key:
@@ -4181,6 +4778,9 @@ def _copy_patch_bucket(
     patch_map: dict[str, dict[str, Any]] | None,
     file_key: str,
 ) -> dict[str, Any]:
+    """KR: 패치 맵에서 파일 키에 해당하는 버킷을 복사하여 반환합니다.
+    EN: Copies and returns the bucket corresponding to the file key from the patch map.
+    """
     if not isinstance(patch_map, dict):
         return {}
     bucket = patch_map.get(str(file_key), {})
@@ -4193,6 +4793,9 @@ def _spill_image_to_temp_file(
     *,
     prefix: str,
 ) -> str:
+    """KR: PIL 이미지를 임시 PNG 파일로 저장하고 경로를 반환합니다. 메모리 절감을 위한 디스크 스필 처리입니다.
+    EN: Saves a PIL image to a temporary PNG file and returns the path. This is a disk spill operation for memory savings.
+    """
     os.makedirs(deferred_dir, exist_ok=True)
     fd, spill_path = tempfile.mkstemp(
         prefix=prefix,
@@ -4208,6 +4811,9 @@ def _spill_deferred_texture_plan_to_disk(
     texture_plan: JsonDict,
     deferred_dir: str,
 ) -> JsonDict:
+    """KR: 지연 텍스처 계획의 이미지 데이터를 디스크 임시 파일로 스필합니다. 2패스 메커니즘에서 메모리를 절감합니다.
+    EN: Spills image data from a deferred texture plan to temporary disk files. Saves memory in the 2-pass mechanism.
+    """
     source_atlas = texture_plan.get("source_atlas")
     if not isinstance(source_atlas, Image.Image):
         return texture_plan
@@ -4246,6 +4852,9 @@ def _load_spilled_plan_image(
     image_key: str,
     path_key: str,
 ) -> Image.Image | None:
+    """KR: 디스크에 스필된 이미지 경로로부터 PIL 이미지를 다시 로드합니다.
+    EN: Reloads a PIL image from a spilled image path on disk.
+    """
     image = payload.get(image_key)
     if isinstance(image, Image.Image):
         return image
@@ -4258,6 +4867,9 @@ def _load_spilled_plan_image(
 
 
 def _cleanup_deferred_patch_bucket(bucket: dict[str, Any] | None) -> None:
+    """KR: 지연 패치 버킷에서 사용된 임시 스필 파일들을 정리합니다.
+    EN: Cleans up temporary spill files used in the deferred patch bucket.
+    """
     if not isinstance(bucket, dict):
         return
     seen_payloads: set[int] = set()
@@ -4291,6 +4903,9 @@ def _register_deferred_patch(
     pending_files: set[str] | None,
     patch_kind: str,
 ) -> None:
+    """KR: 지연 패치(deferred patch)를 패치 맵에 등록합니다. 1패스에서 변경사항을 수집하고 2패스에서 적용하는 구조입니다. 충돌 시 경고를 기록합니다.
+    EN: Registers a deferred patch in the patch map. Changes are collected in pass 1 and applied in pass 2. Logs a warning on conflicts.
+    """
     normalized_file = _normalize_asset_file_key(target_file_key)
     if not (isinstance(patch_map, dict) and normalized_file and object_key):
         return
@@ -4334,6 +4949,9 @@ def _register_deferred_patch(
 
 
 def _unitypy_supports_streaming_save() -> bool:
+    """KR: 현재 UnityPy가 메모리 절감용 save_to() 스트리밍 저장 API를 지원하는지 확인합니다.
+    EN: Checks whether the current UnityPy supports the memory-saving save_to() streaming save API.
+    """
     try:
         from UnityPy.files.BundleFile import BundleFile as _BundleFile
         from UnityPy.files.SerializedFile import SerializedFile as _SerializedFile
@@ -4345,6 +4963,9 @@ def _unitypy_supports_streaming_save() -> bool:
 
 
 def _ensure_custom_unitypy_streaming_save(lang: Language = "ko") -> None:
+    """KR: 스트리밍 저장을 지원하지 않으면 RuntimeError를 발생시킵니다.
+    EN: Raises RuntimeError if streaming save is not supported.
+    """
     if _unitypy_supports_streaming_save():
         return
     unitypy_path = getattr(UnityPy, "__file__", "")
@@ -4362,11 +4983,17 @@ def _ensure_custom_unitypy_streaming_save(lang: Language = "ko") -> None:
 
 
 def _has_real_atlas_path(ref: Any) -> bool:
+    """KR: 아틀라스 참조의 PathID가 0보다 큰지(실제 유효한 경로인지) 확인합니다.
+    EN: Checks whether the atlas reference PathID is greater than 0 (i.e. actually valid).
+    """
     _, path_id = _atlas_ref_ids(ref)
     return path_id > 0
 
 
 def _first_valid_atlas_ref(value: Any) -> JsonDict | None:
+    """KR: 아틀라스 텍스처 리스트에서 유효한 PathID를 가진 첫 번째 참조를 반환합니다.
+    EN: Returns the first reference with a valid PathID from the atlas texture list.
+    """
     if not isinstance(value, list):
         return None
     for item in value:
@@ -4380,6 +5007,9 @@ def _best_atlas_ref(
     *,
     prefer_new: bool,
 ) -> JsonDict | None:
+    """KR: 신형/구형 아틀라스 참조 중 가장 적합한 것을 선택합니다. prefer_new에 따라 우선순위가 달라집니다.
+    EN: Selects the best atlas reference from new/old variants. Priority changes based on prefer_new.
+    """
     new_any = _first_atlas_ref(data.get("m_AtlasTextures"))
     new_valid = _first_valid_atlas_ref(data.get("m_AtlasTextures"))
     old_any = (
@@ -4401,6 +5031,9 @@ def _best_atlas_ref(
 
 
 def _apply_color_override(current_value: Any, override: JsonDict) -> Any:
+    """KR: RGBA 색상 오버라이드를 현재 값에 적용합니다. dict와 객체 속성 모두 처리합니다.
+    EN: Applies RGBA color overrides to the current value. Handles both dict and object attributes.
+    """
     for attr, key in (("r", "r"), ("g", "g"), ("b", "b"), ("a", "a")):
         if key not in override:
             continue
@@ -4419,6 +5052,9 @@ def _apply_color_override(current_value: Any, override: JsonDict) -> Any:
 
 
 def _texture_ref_to_dict(texture_ref: Any) -> JsonDict:
+    """KR: 텍스처 참조를 m_FileID/m_PathID 딕셔너리로 변환합니다.
+    EN: Converts a texture reference to an m_FileID/m_PathID dictionary.
+    """
     if isinstance(texture_ref, dict):
         file_id = int(texture_ref.get("m_FileID", 0) or 0)
         path_id = int(texture_ref.get("m_PathID", 0) or 0)
@@ -4429,6 +5065,9 @@ def _texture_ref_to_dict(texture_ref: Any) -> JsonDict:
 
 
 def _extract_texture_ref_from_tex_env(env_value: Any) -> JsonDict:
+    """KR: TexEnv 항목에서 m_Texture 참조를 딕셔너리로 추출합니다.
+    EN: Extracts the m_Texture reference as a dictionary from a TexEnv entry.
+    """
     if isinstance(env_value, dict):
         return _texture_ref_to_dict(env_value.get("m_Texture"))
     tex = getattr(env_value, "m_Texture", None)
@@ -4436,6 +5075,9 @@ def _extract_texture_ref_from_tex_env(env_value: Any) -> JsonDict:
 
 
 def _color_value_to_dict(value: Any, default: JsonDict) -> JsonDict:
+    """KR: 색상 값을 RGBA 딕셔너리로 변환합니다. 누락된 채널은 기본값으로 채웁니다.
+    EN: Converts a color value to an RGBA dictionary. Missing channels are filled with defaults.
+    """
     if isinstance(value, dict):
         return {
             "r": float(value.get("r", default["r"])),
@@ -4455,6 +5097,9 @@ def _color_value_to_dict(value: Any, default: JsonDict) -> JsonDict:
 
 
 def _build_tex_env_entry(texture_ref: JsonDict) -> JsonDict:
+    """KR: 텍스처 참조로부터 TexEnv 항목을 구성합니다. Scale=(1,1), Offset=(0,0) 기본값을 사용합니다.
+    EN: Builds a TexEnv entry from a texture reference. Uses defaults Scale=(1,1), Offset=(0,0).
+    """
     return {
         "m_Texture": {
             "m_FileID": int(texture_ref.get("m_FileID", 0) or 0),
@@ -4469,6 +5114,9 @@ def _prune_material_saved_properties_for_raster(
     parse_dict: Any,
     color_overrides: dict[str, JsonDict],
 ) -> bool:
+    """KR: 래스터 폰트용으로 머티리얼의 SavedProperties를 최소 속성 세트로 정리합니다.
+    EN: Prunes material SavedProperties to a minimal property set for raster fonts.
+    """
     saved_props = getattr(parse_dict, "m_SavedProperties", None)
     if saved_props is None:
         return False
@@ -4542,6 +5190,9 @@ def _prune_material_saved_properties_for_raster(
 
 
 def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -> bool:
+    """KR: 머티리얼 교체 정보를 파싱된 객체에 적용합니다. float/color 오버라이드, 외곽선 비율, 스타일 보존 등을 처리합니다.
+    EN: Applies material replacement info to the parsed object. Handles float/color overrides, outline ratio, style preservation, etc.
+    """
     changed = False
     float_overrides_raw = mat_info.get("float_overrides", {})
     float_overrides = (
@@ -4621,9 +5272,9 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                             candidate = None
                     if candidate is not None:
                         # KR: _GradientScale은 교체 아틀라스의 padding 기반 값을 강제 적용합니다.
-                        # KR: preserve_gradient_floor 로직은 교체 아틀라스와 불일치를 유발하므로 제거되었습니다.
-                        # EN: _GradientScale must match the replacement atlas padding.
-                        # EN: preserve_gradient_floor was removed as it causes atlas mismatch.
+                        # preserve_gradient_floor 로직은 교체 아틀라스와 불일치를 유발하므로 제거되었습니다.
+                        # EN: _GradientScale is force-set to the padding-based value of the replacement atlas.
+                        # The preserve_gradient_floor logic was removed as it caused mismatch with the replacement atlas.
                         float_props[i] = ("_GradientScale", candidate)
                         has_gradient_scale = True
                         changed = True
@@ -4710,7 +5361,7 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                         changed = True
                 elif prop_name == "_TextureHeight" and texture_h is not None:
                     # KR: _TextureHeight는 실제 아틀라스 크기가 float_overrides보다 우선합니다.
-                    # EN: _TextureHeight uses actual atlas size, overriding float_overrides.
+                    # EN: For _TextureHeight, the actual atlas size takes priority over float_overrides.
                     float_props[i] = ("_TextureHeight", texture_h)
                     has_texture_height = True
                     changed = True
@@ -4738,9 +5389,9 @@ def _apply_material_replacement_to_object(parse_dict: Any, mat_info: JsonDict) -
                 changed = True
 
             # KR: _ScaleRatioA를 교체 아틀라스의 padding/GradientScale로 재계산합니다.
-            # KR: TMP에서 ScaleRatioA = padding / GradientScale이며, 이 값이 불일치하면 외곽선/그림자 크기가 틀어집니다.
-            # EN: Recalculate _ScaleRatioA = replacement_padding / GradientScale.
-            # EN: TMP uses this ratio for outline/shadow sizing; mismatch causes visual artifacts.
+            # TMP에서 ScaleRatioA = padding / GradientScale이며, 이 값이 불일치하면 외곽선/그림자 크기가 틀어집니다.
+            # EN: Recalculates _ScaleRatioA using the replacement atlas padding/GradientScale.
+            # In TMP, ScaleRatioA = padding / GradientScale; mismatch causes incorrect outline/shadow sizes.
             if replacement_padding > 0:
                 final_gs = None
                 for _fp in float_props:
@@ -4806,7 +5457,7 @@ def detect_tmp_version(
     data: JsonDict, unity_version: str | None = None
 ) -> Literal["new", "old"]:
     """KR: SDF TMP 데이터가 신형/구형 포맷인지 판별합니다.
-    EN: Detect whether SDF TMP data uses new or old schema.
+    EN: Determines whether SDF TMP data uses the new or old format.
     """
     new_glyph_count = _safe_list_len(data.get("m_GlyphTable"))
     old_glyph_count = _safe_list_len(data.get("m_glyphInfoList"))
@@ -4819,27 +5470,27 @@ def detect_tmp_version(
     has_old_atlas = isinstance(data.get("atlas"), dict)
 
     # KR: 두 포맷 키가 동시에 있어도 실제 글리프가 있는 쪽을 우선합니다.
-    # EN: When both schema keys exist, prefer the side that has real glyph data.
+    # EN: Even if both format keys exist, the side with actual glyphs takes priority.
     if has_new_glyphs != has_old_glyphs:
         return "new" if has_new_glyphs else "old"
     if new_glyph_count != old_glyph_count:
         return "new" if new_glyph_count > old_glyph_count else "old"
 
     # KR: 글리프가 비슷하면 face/atlas 신호를 비교합니다.
-    # EN: When glyph evidence is ambiguous, compare face/atlas signals.
+    # EN: If glyph counts are similar, compare face/atlas signals.
     if has_new_face != has_old_face:
         return "new" if has_new_face else "old"
     if has_new_atlas != has_old_atlas:
         return "new" if has_new_atlas else "old"
 
     # KR: Unity-Runtime-Libraries 기준 버전 힌트(2018.3.14 / 2018.4.2)를 사용합니다.
-    # EN: Use Unity-Runtime-Libraries version boundaries (2018.3.14 / 2018.4.2).
+    # EN: Uses version hints based on Unity-Runtime-Libraries (2018.3.14 / 2018.4.2).
     hint = _tmp_version_hint(unity_version)
     if hint is not None:
         return hint
 
     # KR: 최종 폴백은 신형 우선입니다.
-    # EN: Final fallback prefers new schema.
+    # EN: Final fallback prefers the new format.
     if has_new_face or has_new_atlas or "m_CharacterTable" in data:
         return "new"
     if has_old_face or has_old_atlas:
@@ -4853,7 +5504,7 @@ def inspect_tmp_font_schema(
     unity_version: str | None = None,
 ) -> dict[str, Any]:
     """KR: TMP 스키마 판별과 glyph/atlas 핵심 메타를 공통 형태로 반환합니다.
-    EN: Return unified TMP schema classification and glyph/atlas metadata.
+    EN: Returns TMP schema detection and core glyph/atlas metadata in a common format.
     """
     target_version = detect_tmp_version(data, unity_version=unity_version)
 
@@ -4899,6 +5550,9 @@ def extract_tmp_atlas_padding(
     data: JsonDict,
     unity_version: str | None = None,
 ) -> float:
+    """KR: TMP 에셋 데이터에서 아틀라스 패딩 값을 추출합니다. m_AtlasPadding, CreationSettings, m_fontInfo 순으로 탐색합니다.
+    EN: Extracts the atlas padding value from TMP asset data. Searches m_AtlasPadding, CreationSettings, m_fontInfo in order.
+    """
     candidates: list[Any] = [data.get("m_AtlasPadding")]
     creation_settings_key = _resolve_creation_settings_key(
         data,
@@ -4926,7 +5580,7 @@ def convert_face_info_new_to_old(
     atlas_height: int = 0,
 ) -> JsonDict:
     """KR: 신형 m_FaceInfo를 구형 m_fontInfo 구조로 변환합니다.
-    EN: Convert new m_FaceInfo to old m_fontInfo schema.
+    EN: Converts new-format m_FaceInfo to old-format m_fontInfo structure.
     """
     return {
         "Name": face_info.get("m_FamilyName", ""),
@@ -4955,7 +5609,7 @@ def convert_face_info_new_to_old(
 
 def convert_face_info_old_to_new(font_info: JsonDict) -> JsonDict:
     """KR: 구형 m_fontInfo를 신형 m_FaceInfo 구조로 변환합니다.
-    EN: Convert old m_fontInfo to new m_FaceInfo schema.
+    EN: Converts old-format m_fontInfo to new-format m_FaceInfo structure.
     """
     return {
         "m_FaceIndex": 0,
@@ -4984,7 +5638,7 @@ def convert_face_info_old_to_new(font_info: JsonDict) -> JsonDict:
 
 def _new_glyph_rect_to_int(rect: JsonDict) -> tuple[int, int, int, int]:
     """KR: 신형 TMP glyph rect를 정수 좌표/크기로 정규화합니다.
-    EN: Normalize new TMP glyph rect to integer coordinates/sizes.
+    EN: Normalizes a new-format TMP glyph rect to integer coordinates/dimensions.
     """
     x = int(round(float(rect.get("m_X", 0))))
     y = int(round(float(rect.get("m_Y", 0))))
@@ -4997,7 +5651,7 @@ def _tmp_flip_y_between_old_new(
     y_value: float, glyph_height: float, atlas_height: int | float | None
 ) -> float:
     """KR: TMP old(top-origin) <-> new(bottom-origin) Y 변환 공식을 적용합니다.
-    EN: Apply TMP old(top-origin) <-> new(bottom-origin) Y conversion formula.
+    EN: Applies the TMP old(top-origin) <-> new(bottom-origin) Y conversion formula.
     """
     if atlas_height is None:
         return float(y_value)
@@ -5016,7 +5670,7 @@ def convert_glyphs_new_to_old(
     atlas_height: int | None = None,
 ) -> list[JsonDict]:
     """KR: 신형 글리프/문자 테이블을 구형 m_glyphInfoList로 변환합니다.
-    EN: Convert new glyph/character tables into old m_glyphInfoList.
+    EN: Converts new-format glyph/character tables to old-format m_glyphInfoList.
     """
     glyph_by_index: dict[int, JsonDict] = {}
     for g in glyph_table:
@@ -5055,7 +5709,7 @@ def convert_glyphs_old_to_new(
     atlas_height: int | None = None,
 ) -> tuple[list[JsonDict], list[JsonDict]]:
     """KR: 구형 m_glyphInfoList를 신형 테이블 구조로 변환합니다.
-    EN: Convert old m_glyphInfoList into new glyph/character tables.
+    EN: Converts old-format m_glyphInfoList to new-format table structure.
     """
     glyph_table: list[JsonDict] = []
     char_table: list[JsonDict] = []
@@ -5100,9 +5754,9 @@ def convert_glyphs_old_to_new(
 
 def normalize_sdf_data(data: JsonDict, deep_copy: bool = True) -> JsonDict:
     """KR: SDF 교체 데이터를 신형 TMP 형식으로 정규화해 반환합니다.
-    KR: deep_copy=True면 입력 데이터를 복사해 원본 변형을 방지합니다.
-    EN: Normalize SDF replacement data into the new TMP schema.
-    EN: With deep_copy=True, clone input data to avoid mutating the original.
+    deep_copy=True면 입력 데이터를 복사해 원본 변형을 방지합니다.
+    EN: Normalizes SDF replacement data to new-format TMP and returns it.
+    deep_copy=True copies input data to prevent mutation of the original.
     """
     result: JsonDict = copy.deepcopy(data) if deep_copy else data
     version = detect_tmp_version(result)
@@ -5115,7 +5769,7 @@ def normalize_sdf_data(data: JsonDict, deep_copy: bool = True) -> JsonDict:
         atlas_height = font_info.get("AtlasHeight", 0)
 
         # KR: 구형 face/glyph 구조를 신형 TMP 필드로 승격합니다.
-        # EN: Upgrade old face/glyph structures to new TMP fields.
+        # EN: Promotes old-format face/glyph structures to new-format TMP fields.
         result["m_FaceInfo"] = convert_face_info_old_to_new(font_info)
 
         try:
@@ -5130,7 +5784,7 @@ def normalize_sdf_data(data: JsonDict, deep_copy: bool = True) -> JsonDict:
         result["m_CharacterTable"] = char_table
 
         # KR: 구형 atlas 참조를 신형 atlas 배열 필드로 보정합니다.
-        # EN: Normalize old atlas reference into new atlas-list field.
+        # EN: Adjusts old-format atlas references to new-format atlas array fields.
         if "m_AtlasTextures" not in result or not result["m_AtlasTextures"]:
             atlas_ref = result.get("atlas", {"m_FileID": 0, "m_PathID": 0})
             result["m_AtlasTextures"] = [atlas_ref]
@@ -5142,13 +5796,13 @@ def normalize_sdf_data(data: JsonDict, deep_copy: bool = True) -> JsonDict:
         result.setdefault("m_FreeGlyphRects", [])
 
         # KR: 구형 데이터에 누락된 weight table은 기본값으로 채웁니다.
-        # EN: Fill missing weight table in old data with a safe default.
+        # EN: Fills missing weight tables in old-format data with defaults.
         if "m_FontWeightTable" not in result:
             font_weights = result.get("fontWeights", [])
             result["m_FontWeightTable"] = font_weights if font_weights else []
 
     # KR: 정규화 후 반복 사용을 위해 숫자 타입/기본값을 한 번만 정리합니다.
-    # EN: Canonicalize numeric fields/defaults once for repeated reuse.
+    # EN: Cleans up numeric types/defaults once after normalization for repeated use.
     try:
         result["m_AtlasWidth"] = int(result.get("m_AtlasWidth", 0) or 0)
         result["m_AtlasHeight"] = int(result.get("m_AtlasHeight", 0) or 0)
@@ -5165,7 +5819,7 @@ def normalize_sdf_data(data: JsonDict, deep_copy: bool = True) -> JsonDict:
         ensure_int(face_info, ["m_PointSize", "m_AtlasWidth", "m_AtlasHeight"])
 
     # KR: Atlas 참조 목록은 공유 변형을 피하기 위해 독립 딕셔너리로 재구성합니다.
-    # EN: Rebuild atlas references as standalone dicts to avoid shared mutations.
+    # EN: Atlas reference list is rebuilt as independent dicts to avoid shared mutation.
     atlas_textures_raw = result.get("m_AtlasTextures", [])
     atlas_textures: list[JsonDict] = []
     if isinstance(atlas_textures_raw, list):
@@ -5227,11 +5881,11 @@ def find_assets_files(
     exclude_exts: set[str] | None = None,
 ) -> list[str]:
     """KR: 게임에서 처리 대상 에셋 파일 목록을 수집합니다.
-    KR: target_files가 있으면 해당 파일명으로 스캔 대상을 제한합니다.
-    KR: exclude_exts가 있으면 해당 확장자를 추가 제외합니다.
-    EN: Collect candidate asset files from the game.
-    EN: If target_files is provided, limit candidates to those basenames.
-    EN: If exclude_exts is provided, skip files with those extensions.
+    target_files가 있으면 해당 파일명으로 스캔 대상을 제한합니다.
+    exclude_exts가 있으면 해당 확장자를 추가 제외합니다.
+    EN: Collects the list of asset files to process from the game.
+    If target_files is provided, limits scan targets to those filenames.
+    If exclude_exts is provided, additionally excludes those extensions.
     """
     data_path = get_data_path(game_path, lang=lang)
     assets_files: list[str] = []
@@ -5299,7 +5953,7 @@ def find_assets_files(
 
 def get_compile_method(datapath: str) -> str:
     """KR: 데이터 폴더의 컴파일 방식을 Mono/Il2cpp로 판별합니다.
-    EN: Detect compile method as Mono or Il2cpp.
+    EN: Determines the compile method (Mono/Il2cpp) of the data folder.
     """
     if "Managed" in os.listdir(datapath):
         return "Mono"
@@ -5315,7 +5969,7 @@ def _create_generator(
     lang: Language = "ko",
 ) -> TypeTreeGenerator:
     """KR: 타입트리 생성기를 구성하고 Mono/Il2cpp 메타데이터를 로드합니다.
-    EN: Build typetree generator and load Mono/Il2cpp metadata.
+    EN: Configures the TypeTree generator and loads Mono/Il2cpp metadata.
     """
     generator = TypeTreeGenerator(unity_version)
     if compile_method == "Mono":
@@ -5351,7 +6005,7 @@ def _scan_fonts_from_env(
     detect_ps5_swizzle: bool = False,
 ) -> dict[str, list[JsonDict]]:
     """KR: 로드된 UnityPy env에서 TTF/SDF 폰트 정보를 추출합니다.
-    EN: Extract TTF/SDF font entries from a loaded UnityPy env.
+    EN: Extracts TTF/SDF font information from a loaded UnityPy env.
     """
     scanned: dict[str, list[JsonDict]] = {"ttf": [], "sdf": []}
     texture_lookup: dict[tuple[str, int], Any] = {}
@@ -5415,7 +6069,7 @@ def _scan_fonts_from_env(
                     atlas_file_id = int(tmp_info.get("atlas_file_id", 0) or 0)
                     atlas_path_id = int(tmp_info.get("atlas_path_id", 0) or 0)
                     # KR: 외부 참조 stub(FileID!=0, PathID=0)은 실제 교체 대상이 아닙니다.
-                    # EN: External stubs (FileID!=0, PathID=0) are not valid replacement targets.
+                    # EN: External reference stubs (FileID!=0, PathID=0) are not actual replacement targets.
                     if atlas_file_id != 0 and atlas_path_id == 0:
                         continue
                     if glyph_count == 0:
@@ -5478,7 +6132,7 @@ def _scan_fonts_in_asset_file(
     detect_ps5_swizzle: bool = False,
 ) -> tuple[dict[str, list[JsonDict]], str | None]:
     """KR: 단일 에셋 파일을 로드해 폰트 정보를 추출합니다.
-    EN: Load one asset file and extract font entries.
+    EN: Loads a single asset file and extracts font information.
     """
     file_name = os.path.basename(assets_file)
     scanned: dict[str, list[JsonDict]] = {"ttf": [], "sdf": []}
@@ -5511,7 +6165,7 @@ def _scan_fonts_via_worker(
     detect_ps5_swizzle: bool = False,
 ) -> tuple[dict[str, list[JsonDict]], str | None]:
     """KR: 파일 단위 서브프로세스 워커로 스캔해 크래시를 격리합니다.
-    EN: Scan using a per-file subprocess worker to isolate hard crashes.
+    EN: Scans via a per-file subprocess worker to isolate crashes.
     """
     fd, output_path = tempfile.mkstemp(prefix="scan_worker_", suffix=".json")
     os.close(fd)
@@ -5632,7 +6286,7 @@ def _scan_fonts_via_worker(
             return scanned, worker_error
 
         # KR: ACCESS_VIOLATION은 일시적인 경우가 있어 full 모드 1회 재시도합니다.
-        # EN: ACCESS_VIOLATION can be transient, so retry full mode once.
+        # EN: ACCESS_VIOLATION can be transient, so retry once in full mode.
         if full_returncode in access_violation_codes:
             retry_scanned, retry_worker_error, retry_error, _ = _run_worker()
             if retry_error is None:
@@ -5666,15 +6320,17 @@ def scan_fonts(
     ps5_swizzle: bool = False,
 ) -> dict[str, list[JsonDict]]:
     """KR: 게임 에셋을 스캔해 TTF/SDF 폰트 목록을 반환합니다.
-    KR: target_files가 있으면 해당 파일만 스캔합니다.
-    KR: exclude_exts가 있으면 해당 확장자는 스캔에서 제외합니다.
-    KR: isolate_files=True면 파일 단위 워커 프로세스로 스캔해 크래시를 격리합니다.
-    KR: scan_jobs>1이면 isolate_files 경로에서 워커를 병렬 실행합니다.
-    EN: Scan game assets and return TTF/SDF font entries.
-    EN: If target_files is provided, only scan those files.
-    EN: If exclude_exts is provided, skip files with those extensions.
-    EN: If isolate_files=True, scan each file via worker subprocess to isolate hard crashes.
-    EN: If scan_jobs>1, worker subprocesses are executed in parallel for isolate_files mode.
+
+    target_files가 있으면 해당 파일만 스캔합니다.
+    exclude_exts가 있으면 해당 확장자는 스캔에서 제외합니다.
+    isolate_files=True면 파일 단위 워커 프로세스로 스캔해 크래시를 격리합니다.
+    scan_jobs>1이면 isolate_files 경로에서 워커를 병렬 실행합니다.
+    EN: Scans game assets and returns a list of TTF/SDF fonts.
+
+    If target_files is provided, only those files are scanned.
+    If exclude_exts is provided, those extensions are excluded from scanning.
+    If isolate_files=True, scans via per-file worker processes to isolate crashes.
+    If scan_jobs>1, runs workers in parallel on the isolate_files path.
     """
     data_path = get_data_path(game_path, lang=lang)
     unity_version = get_unity_version(game_path, lang=lang)
@@ -5875,14 +6531,16 @@ def parse_fonts(
     ps5_swizzle: bool = False,
 ) -> str:
     """KR: 스캔한 폰트를 JSON으로 저장하고 결과 파일 경로를 반환합니다.
-    KR: target_files가 있으면 해당 파일만 파싱합니다.
-    KR: exclude_exts가 있으면 해당 확장자는 스캔에서 제외합니다.
-    EN: Save scanned fonts to JSON and return output file path.
-    EN: If target_files is provided, parse only those files.
-    EN: If exclude_exts is provided, skip files with those extensions.
+
+    target_files가 있으면 해당 파일만 파싱합니다.
+    exclude_exts가 있으면 해당 확장자는 스캔에서 제외합니다.
+    EN: Saves scanned fonts as JSON and returns the result file path.
+
+    If target_files is provided, only those files are parsed.
+    If exclude_exts is provided, those extensions are excluded from scanning.
     """
     # KR: parse 모드는 파일 단위 워커로 스캔해 UnityPy 하드 크래시를 격리합니다.
-    # EN: Parse mode scans via per-file workers to isolate hard UnityPy crashes.
+    # EN: Parse mode scans via per-file workers to isolate UnityPy hard crashes.
     fonts = scan_fonts(
         game_path,
         lang=lang,
@@ -6143,7 +6801,7 @@ def _load_font_assets_cached(
     padding_variant: int | None = None,
 ) -> JsonDict:
     """KR: KR_ASSETS에서 폰트 리소스를 읽어 캐시에 저장합니다.
-    EN: Load and cache font resources from KR_ASSETS.
+    EN: Reads font resources from KR_ASSETS and stores them in cache.
     """
     kr_assets = os.path.join(script_dir, "KR_ASSETS")
     asset_roots = _iter_kr_asset_roots(kr_assets, padding_variant=padding_variant)
@@ -6230,7 +6888,7 @@ def load_font_assets(
     padding_variant: int | None = None,
 ) -> JsonDict:
     """KR: 지정 폰트명의 교체용 리소스(TTF/SDF/Atlas/Material)를 로드합니다.
-    EN: Load replacement assets (TTF/SDF/Atlas/Material) for a font name.
+    EN: Loads replacement resources (TTF/SDF/Atlas/Material) for the specified font name.
     """
     normalized = normalize_font_name(font_name)
     cached_assets = _load_font_assets_cached(
@@ -6244,7 +6902,8 @@ def load_font_assets(
         "ttf_data": cached_assets["ttf_data"],
         "sdf_data": cached_assets["sdf_data"],
         "sdf_data_normalized": cached_assets.get("sdf_data_normalized"),
-        # Reuse cached atlas object to avoid per-replacement image duplication.
+        # KR: 캐시된 atlas 객체를 재사용하여 교체 시 이미지 중복 생성을 방지합니다.
+    # EN: Reuses cached atlas objects to prevent duplicate image creation during replacement.
         "sdf_atlas": atlas,
         "sdf_materials": cached_assets["sdf_materials"],
         "sdf_swizzle": cached_assets.get("sdf_swizzle"),
@@ -6254,13 +6913,13 @@ def load_font_assets(
 
 
 # KR: TypeTree에 정의되지 않은 trailing bytes를 ObjectReader path_id 기준으로 보존합니다.
-# EN: Store trailing bytes (not covered by TypeTree) keyed by ObjectReader path_id.
+# EN: Preserves trailing bytes not defined in TypeTree, keyed by ObjectReader path_id.
 _trailing_bytes_store: dict[int, bytes] = {}
 
 
 def _capture_trailing_bytes(obj: Any) -> bytes:
     """KR: TypeTree 파싱 후 읽히지 않은 trailing bytes를 캡처합니다.
-    EN: Capture unread trailing bytes after TypeTree parsing.
+    EN: Captures unread trailing bytes after TypeTree parsing.
     """
     pos = obj.reader.Position
     end = obj.byte_start + obj.byte_size
@@ -6273,10 +6932,11 @@ def _capture_trailing_bytes(obj: Any) -> bytes:
 
 def _safe_parse_as_object(obj: Any, **kwargs: Any) -> Any:
     """KR: parse_as_object()를 check_read=True로 먼저 시도하고,
-    KR: 바이트 크기 불일치(중국판 Unity 등)로 실패하면 check_read=False로 재시도하고
-    KR: trailing bytes를 별도 저장소에 보존합니다.
-    EN: Try parse_as_object(check_read=True) first; on byte-size mismatch
-    EN: retry with check_read=False and preserve trailing bytes in a side store.
+    바이트 크기 불일치(중국판 Unity 등)로 실패하면 check_read=False로 재시도하고
+    trailing bytes를 별도 저장소에 보존합니다.
+    EN: Tries parse_as_object() with check_read=True first.
+    On byte size mismatch (e.g. China Unity), retries with check_read=False
+    and preserves trailing bytes in a separate store.
     """
     obj_id = id(obj)
     try:
@@ -6297,10 +6957,11 @@ def _safe_parse_as_object(obj: Any, **kwargs: Any) -> Any:
 
 def _safe_parse_as_dict(obj: Any, **kwargs: Any) -> dict[str, Any]:
     """KR: parse_as_dict()를 check_read=True로 먼저 시도하고,
-    KR: 바이트 크기 불일치로 실패하면 check_read=False로 재시도하고
-    KR: trailing bytes를 별도 저장소에 보존합니다.
-    EN: Try parse_as_dict(check_read=True) first; on byte-size mismatch
-    EN: retry with check_read=False and preserve trailing bytes in a side store.
+    바이트 크기 불일치로 실패하면 check_read=False로 재시도하고
+    trailing bytes를 별도 저장소에 보존합니다.
+    EN: Tries parse_as_dict() with check_read=True first.
+    On byte size mismatch, retries with check_read=False
+    and preserves trailing bytes in a separate store.
     """
     obj_id = id(obj)
     try:
@@ -6321,7 +6982,7 @@ def _safe_parse_as_dict(obj: Any, **kwargs: Any) -> dict[str, Any]:
 
 def _safe_save(obj: Any, parse_dict: Any) -> None:
     """KR: save() 후 trailing bytes가 있으면 raw data에 append합니다.
-    EN: After save(), append any trailing bytes to the raw data.
+    EN: After save(), appends trailing bytes to raw data if present.
     """
     parse_dict.save()
     obj_id = id(obj)
@@ -6333,16 +6994,16 @@ def _safe_save(obj: Any, parse_dict: Any) -> None:
 
 def _has_trailing_bytes(obj: Any) -> bool:
     """KR: 이 오브젝트에 TypeTree로 읽히지 않는 trailing bytes가 있는지 확인합니다.
-    EN: Check if this object has trailing bytes not covered by TypeTree.
+    EN: Checks whether this object has trailing bytes not read by TypeTree.
     """
     return id(obj) in _trailing_bytes_store
 
 
 def _detect_typetree_size_mismatch(obj: Any) -> bool:
     """KR: TypeTree로 읽은 후 다시 쓰면 원본보다 작아지는지 감지합니다.
-    KR: 중국판 Unity 등에서 TypeTree에 없는 추가 필드가 있으면 True를 반환합니다.
-    EN: Detect if TypeTree write produces fewer bytes than the original raw data.
-    EN: Returns True if extra fields exist outside TypeTree (e.g. China Unity builds).
+    중국판 Unity 등에서 TypeTree에 없는 추가 필드가 있으면 True를 반환합니다.
+    EN: Detects if re-writing after TypeTree read produces smaller output than the original.
+    Returns True if extra fields not in TypeTree exist (e.g. China Unity).
     """
     try:
         from UnityPy.helpers.TypeTreeHelper import write_typetree
@@ -6368,9 +7029,9 @@ def _binary_patch_texture2d(
     lang: str = "ko",
 ) -> bool:
     """KR: Texture2D를 TypeTree 재직렬화 없이 바이너리 패치합니다.
-    KR: 중국판 Unity 등에서 TypeTree가 커버하지 못하는 extra bytes가 있을 때 사용합니다.
-    EN: Binary-patch a Texture2D without TypeTree re-serialization.
-    EN: Used when extra bytes exist that TypeTree cannot cover (e.g. China Unity builds).
+    중국판 Unity 등에서 TypeTree가 커버하지 못하는 extra bytes가 있을 때 사용합니다.
+    EN: Binary-patches Texture2D without TypeTree re-serialization.
+    Used when extra bytes not covered by TypeTree exist (e.g. China Unity).
     """
     import struct as _struct
 
@@ -6379,19 +7040,22 @@ def _binary_patch_texture2d(
         return False
 
     # KR: 원본 raw에서 스트림 경로 문자열을 찾아 필드 위치를 역추적합니다.
-    # EN: Locate field positions by finding the stream path string in raw bytes.
     # 스트리밍 경로 문자열 검색 (.resS 또는 .resource)
+    # EN: Finds stream path strings in the original raw data to trace back field positions.
+    # Searches for streaming path strings (.resS or .resource)
     stream_path_marker = None
     for marker in [b".resS", b".resource"]:
         idx = original_raw.find(marker)
         if idx >= 0:
-            # 문자열 시작 위치를 찾기 위해 앞쪽으로 탐색
+            # KR: 문자열 시작 위치를 찾기 위해 앞쪽으로 탐색
+            # EN: Scan backwards to find the start position of the string
             str_start = idx
             while str_start > 0 and original_raw[str_start - 1:str_start] not in (b"\x00",):
                 str_start -= 1
                 if idx - str_start > 200:
                     break
-            # string length prefix는 str_start - 4 위치
+            # KR: string length prefix는 str_start - 4 위치
+            # EN: The string length prefix is at position str_start - 4
             path_len_pos = str_start - 4
             if path_len_pos < 0:
                 continue
@@ -6404,7 +7068,7 @@ def _binary_patch_texture2d(
                 continue
 
     # KR: TypeTree로 파싱하여 image data 위치와 trailing bytes를 정확히 파악합니다.
-    # EN: Use TypeTree parse to accurately locate image data and trailing bytes.
+    # EN: Parses with TypeTree to precisely identify image data position and trailing bytes.
     try:
         d_temp = obj.read_typetree(check_read=False)
         orig_w = int(d_temp.get("m_Width", 0))
@@ -6417,7 +7081,7 @@ def _binary_patch_texture2d(
 
     if stream_path_marker is not None:
         # KR: 스트리밍 모드 — 경로 문자열 기준으로 필드 위치를 역추적합니다.
-        # EN: Streaming mode — locate fields by stream path string position.
+        # EN: Streaming mode -- traces back field positions based on the path string.
         path_len_pos, path_len, path_str_start = stream_path_marker
         stream_size_pos = path_len_pos - 4
         stream_offset_pos = stream_size_pos - 8
@@ -6426,24 +7090,29 @@ def _binary_patch_texture2d(
         orig_stream_end += (4 - orig_stream_end % 4) % 4
     else:
         # KR: 이미 인라인 모드 (이전 교체로 .resS 참조가 제거됨) —
-        # KR: raw 끝에서 trailing + empty StreamData + image data 역순으로 위치를 계산합니다.
-        # EN: Already inline mode (stream path removed by previous patch) —
-        # EN: Calculate positions backwards from raw end: trailing + empty StreamData + image data.
+        # raw 끝에서 trailing + empty StreamData + image data 역순으로 위치를 계산합니다.
+        # EN: Already inline mode (.resS reference removed by previous replacement) --
+        # Calculates positions in reverse from raw end: trailing + empty StreamData + image data.
         #
-        # Layout (inline, empty StreamData):
+        # KR: 레이아웃 (인라인, 빈 StreamData):
+        #   ... 메타데이터 ...
+        # EN: Layout (inline, empty StreamData):
         #   ... metadata ...
         #   int image_data_size
-        #   byte[] image_data (+ align to 4)
+        #   byte[] image_data (+ 4바이트 정렬)
         #   uint64 stream_offset = 0
         #   uint32 stream_size = 0
         #   int path_len = 0
-        #   (align to 4)
+        #   (4바이트 정렬)
         #   [trailing bytes]
         #
-        # StreamData (empty) = 8 + 4 + 4 = 16 bytes (already aligned)
-        # Image data block = 4 (size int) + orig_img_len + align
+        # KR: StreamData (빈 상태) = 8 + 4 + 4 = 16바이트 (이미 정렬됨)
+        # Image data 블록 = 4 (크기 prefix) + orig_img_len + 정렬 패딩
+        # EN: StreamData (empty) = 8 + 4 + 4 = 16 bytes (already aligned)
+        # Image data block = 4 (size prefix) + orig_img_len + alignment padding
 
-        # TypeTree가 읽은 바이트 수를 계산합니다
+        # KR: TypeTree가 읽은 바이트 수를 계산합니다
+        # EN: Calculates the number of bytes read by TypeTree
         obj.reset()
         pos0 = obj.reader.Position
         obj.read_typetree(check_read=False)
@@ -6451,16 +7120,19 @@ def _binary_patch_texture2d(
         typetree_bytes = pos1 - pos0
 
         trailing_size = len(original_raw) - typetree_bytes
-        # StreamData (empty) 크기: uint64(8) + uint32(4) + int32(4) = 16
+        # KR: StreamData (빈 상태) 크기: uint64(8) + uint32(4) + int32(4) = 16
+        # EN: StreamData (empty state) size: uint64(8) + uint32(4) + int32(4) = 16
         empty_stream_data_size = 16
-        # image data block: 4 (size prefix) + data + padding
+        # KR: image data 블록: 4 (크기 prefix) + 데이터 + 패딩
+        # EN: image data block: 4 (size prefix) + data + padding
         img_block_size = 4 + orig_img_len
         img_block_padded = img_block_size + (4 - img_block_size % 4) % 4
 
         image_data_size_pos = typetree_bytes - trailing_size - empty_stream_data_size - img_block_padded
         if image_data_size_pos < 0:
             # KR: 위치 계산 실패 — 대안: metadata 크기를 직접 계산
-            # EN: Position calc failed — fallback: directly compute metadata size
+            # 메타데이터 = total_raw - trailing - empty_stream - img_block
+            # EN: Position calculation failed -- fallback: compute metadata size directly
             # metadata = total_raw - trailing - empty_stream - img_block
             image_data_size_pos = len(original_raw) - trailing_size - empty_stream_data_size - img_block_padded
         orig_stream_end = len(original_raw) - trailing_size
@@ -6469,7 +7141,7 @@ def _binary_patch_texture2d(
         return False
 
     # KR: TypeTree 파싱으로 정확한 필드 오프셋을 구하고, 원본 raw를 직접 패치합니다.
-    # EN: Get exact field offsets via TypeTree parse, then patch original raw directly.
+    # EN: Obtains exact field offsets via TypeTree parsing and directly patches the original raw data.
     from UnityPy.helpers.TypeTreeHelper import TypeTreeConfig as _TTC, read_value as _rv
     from UnityPy.streams import EndianBinaryReader as _EBR
     field_offsets: dict[str, int] = {}
@@ -6485,14 +7157,14 @@ def _binary_patch_texture2d(
         pass
 
     # KR: image data 필드의 시작 오프셋 = image_data_size_pos (TypeTree 기준)
-    # EN: Use TypeTree-derived offset for image data field start
+    # EN: Start offset of the image data field = image_data_size_pos (TypeTree basis)
     if "image data" in field_offsets:
         image_data_size_pos = field_offsets["image data"]
 
     part1 = bytearray(original_raw[:image_data_size_pos])
 
     # KR: 정확한 오프셋으로 필드 패치 (패턴 검색 대신 직접 오프셋 사용)
-    # EN: Patch fields at exact offsets (no pattern search needed)
+    # EN: Patches fields at exact offsets (uses direct offsets instead of pattern search)
     if "m_Width" in field_offsets and field_offsets["m_Width"] + 4 <= len(part1):
         _struct.pack_into("<i", part1, field_offsets["m_Width"], width)
     if "m_Height" in field_offsets and field_offsets["m_Height"] + 4 <= len(part1):
@@ -6503,7 +7175,7 @@ def _binary_patch_texture2d(
     part1 = bytes(part1)
 
     # KR: Part 2+3 — inline image data + 빈 StreamingInfo
-    # EN: Part 2+3 — inline image data + empty StreamingInfo
+    # EN: Part 2+3 -- inline image data + empty StreamingInfo
     from UnityPy.streams import EndianBinaryWriter
     w = EndianBinaryWriter(endian="<")
     w.write_int(len(image_data))
@@ -6512,7 +7184,8 @@ def _binary_patch_texture2d(
     pad = (4 - pos % 4) % 4
     if pad:
         w.write(b"\x00" * pad)
-    # Empty StreamingInfo
+    # KR: 빈 StreamingInfo
+    # EN: Empty StreamingInfo
     w.write_u_long(0)   # offset
     w.write_u_int(0)    # size
     w.write_int(0)      # empty path (length=0)
@@ -6524,9 +7197,10 @@ def _binary_patch_texture2d(
     w.dispose()
 
     # KR: Part 4 — trailing bytes (TypeTree가 읽은 이후의 바이트)
-    # EN: Part 4 — trailing bytes (after what TypeTree read)
+    # EN: Part 4 -- trailing bytes (bytes after what TypeTree read)
     if "image data" in field_offsets and _tmp_reader is not None:
-        # TypeTree가 읽은 총 바이트 수를 사용
+        # KR: TypeTree가 읽은 총 바이트 수를 사용
+        # EN: Uses the total number of bytes read by TypeTree
         typetree_end = _tmp_reader.Position
         part4 = original_raw[typetree_end:]
     else:
@@ -6574,30 +7248,31 @@ def replace_fonts_in_file(
     lang: Language = "ko",
 ) -> bool:
     """KR: 단일 assets 파일의 TTF/SDF 폰트를 교체하고 저장합니다.
-    KR: 기본 모드는 줄 간격 관련 메트릭(LineHeight/Ascender/Descender 등)을 게임 원본 비율로 보정해
-    KR: 교체 pointSize에 맞춰 적용합니다.
-    KR: use_game_line_metrics=True면 게임 원본 줄 간격 메트릭을 그대로 사용합니다.
-    KR: pointSize는 옵션과 무관하게 교체 폰트 값을 유지합니다.
-    KR: material_scale_by_padding=True면 SDF 머티리얼 float를 (게임 padding / 교체 padding) 비율로 보정합니다.
-    KR: outline_ratio는 현재 선택된 Material 기준(_OutlineWidth/_OutlineSoftness)에 배율로 적용합니다.
-    KR: prefer_original_compress=True면 원본 압축 우선, False면 무압축 계열 우선 저장 전략을 사용합니다.
-    KR: ps5_swizzle=True면 대상 Atlas의 swizzle 상태를 판별해 교체 Atlas를 자동 swizzle/unswizzle합니다.
-    KR: preview_export=True면 preview 폴더에 Atlas/Glyph crop 미리보기를 저장합니다.
-    KR: ps5_swizzle=True일 때는 unswizzle 기준으로 저장합니다.
-    KR: temp_root_dir가 지정되면 임시 저장 디렉터리 루트로 사용합니다.
-    EN: Replace TTF/SDF fonts in one assets file and save changes.
-    EN: By default, line-related metrics (LineHeight/Ascender/Descender, etc.) are adjusted from in-game ratios
-    EN: and scaled to match replacement pointSize.
-    EN: With use_game_line_metrics=True, original in-game line metrics are used directly.
-    EN: pointSize still follows replacement font data regardless of this option.
-    EN: If material_scale_by_padding=True, SDF material floats are adjusted by (game padding / replacement padding).
-    EN: outline_ratio multiplies the selected Material baseline for _OutlineWidth/_OutlineSoftness.
-    EN: When prefer_original_compress=True, original compression is tried first; otherwise uncompressed-family is preferred.
-    EN: If ps5_swizzle=True, auto-detect target atlas swizzle state and swizzle/unswizzle replacement atlas.
-    EN: If preview_export=True, save Atlas/Glyph crop previews into preview folder.
-    EN: With ps5_swizzle=True, previews are saved in unswizzled view.
-    EN: When prefer_builtin_padding_variants=True, batch replacements prefer the nearest built-in padding preset.
-    EN: If temp_root_dir is set, it is used as the root directory for temporary save files.
+
+    기본 모드는 줄 간격 관련 메트릭(LineHeight/Ascender/Descender 등)을 게임 원본 비율로 보정해
+    교체 pointSize에 맞춰 적용합니다.
+    use_game_line_metrics=True면 게임 원본 줄 간격 메트릭을 그대로 사용합니다.
+    pointSize는 옵션과 무관하게 교체 폰트 값을 유지합니다.
+    material_scale_by_padding=True면 SDF 머티리얼 float를 (게임 padding / 교체 padding) 비율로 보정합니다.
+    outline_ratio는 현재 선택된 Material 기준(_OutlineWidth/_OutlineSoftness)에 배율로 적용합니다.
+    prefer_original_compress=True면 원본 압축 우선, False면 무압축 계열 우선 저장 전략을 사용합니다.
+    ps5_swizzle=True면 대상 Atlas의 swizzle 상태를 판별해 교체 Atlas를 자동 swizzle/unswizzle합니다.
+    preview_export=True면 preview 폴더에 Atlas/Glyph crop 미리보기를 저장합니다.
+    ps5_swizzle=True일 때는 unswizzle 기준으로 저장합니다.
+    temp_root_dir가 지정되면 임시 저장 디렉터리 루트로 사용합니다.
+    EN: Replaces TTF/SDF fonts in a single assets file and saves it.
+
+    Default mode adjusts line-spacing metrics (LineHeight/Ascender/Descender etc.) by the game's original ratio
+    and applies them scaled to the replacement pointSize.
+    use_game_line_metrics=True uses the game's original line-spacing metrics as-is.
+    pointSize always retains the replacement font's value regardless of options.
+    material_scale_by_padding=True adjusts SDF material floats by (game padding / replacement padding) ratio.
+    outline_ratio applies as a multiplier to the selected Material's _OutlineWidth/_OutlineSoftness.
+    prefer_original_compress=True uses original compression first; False uses uncompressed-first strategy.
+    ps5_swizzle=True detects target Atlas swizzle state and auto-swizzles/unswizzles the replacement Atlas.
+    preview_export=True saves Atlas/Glyph crop previews to the preview folder.
+    When ps5_swizzle=True, saves based on unswizzle.
+    temp_root_dir, if specified, is used as the temp storage directory root.
     """
     fn_without_path = os.path.basename(assets_file)
     current_file_key = _normalize_asset_file_key(assets_file) or os.path.abspath(
@@ -6831,7 +7506,7 @@ def replace_fonts_in_file(
             atlas_path_id = int(tmp_info.get("atlas_path_id", 0) or 0)
 
             # KR: 외부 참조 stub만 제외하고 실제 TMP 폰트만 처리합니다.
-            # EN: Skip external stubs and process only concrete TMP font assets.
+            # EN: Excludes only external reference stubs and processes actual TMP fonts.
             if atlas_file_id != 0 and atlas_path_id == 0:
                 continue
             if glyph_count == 0:
@@ -6974,7 +7649,7 @@ def replace_fonts_in_file(
                     target_is_swizzled: bool | None = None
 
                     # KR: 입력 JSON이 신형/구형이어도 내부 교체는 신형 TMP 스키마로 통일합니다.
-                    # EN: Normalize replacement JSON to the new TMP schema regardless of input format.
+                    # EN: Regardless of whether input JSON uses new or old format, internal replacement is unified to the new TMP schema.
                     replace_data = assets.get("sdf_data_normalized")
                     if not isinstance(replace_data, dict):
                         replace_data = normalize_sdf_data(assets["sdf_data"])
@@ -6990,7 +7665,7 @@ def replace_fonts_in_file(
                     game_padding_for_material = 0.0
 
                     # KR: GameObject/Script/Material/Atlas 참조는 기존 PathID를 유지해야 런타임 연결이 깨지지 않습니다.
-                    # EN: Preserve original GameObject/Script/Material/Atlas references to keep runtime links intact.
+                    # EN: GameObject/Script/Material/Atlas references must keep existing PathIDs to avoid breaking runtime linkage.
                     m_GameObject_FileID = parse_dict["m_GameObject"]["m_FileID"]
                     m_GameObject_PathID = parse_dict["m_GameObject"]["m_PathID"]
                     m_Script_FileID = parse_dict["m_Script"]["m_FileID"]
@@ -7297,7 +7972,7 @@ def replace_fonts_in_file(
                         )
 
                     # KR: 신형/구형 필드가 공존하면 신형 face 기준으로 legacy face도 동기화합니다.
-                    # EN: If both schemas exist, keep legacy face in sync from new face.
+                    # EN: When both new and old fields coexist, synchronize the legacy face based on the new face info.
                     if target_has_new_face and target_has_old_face:
                         parse_dict["m_fontInfo"] = convert_face_info_new_to_old(
                             parse_dict["m_FaceInfo"],
@@ -7328,7 +8003,7 @@ def replace_fonts_in_file(
                             parse_dict[dirty_key] = True
 
                     # KR: 포맷 분기 후 공통 참조를 원래 값으로 되돌립니다.
-                    # EN: Restore shared references to original values after schema-specific patching.
+                    # EN: After format branching, restore common references to their original values.
                     parse_dict["m_GameObject"]["m_FileID"] = m_GameObject_FileID
                     parse_dict["m_GameObject"]["m_PathID"] = m_GameObject_PathID
                     parse_dict["m_Script"]["m_FileID"] = m_Script_FileID
@@ -7559,12 +8234,12 @@ def replace_fonts_in_file(
                                         )
                             gradient_scale = float_overrides.get("_GradientScale")
                         # KR: 교체 material에 _GradientScale이 없으면 m_AtlasPadding+1로 자동 추론합니다.
-                        # EN: If replacement material lacks _GradientScale, infer from m_AtlasPadding+1.
+                        # EN: If _GradientScale is missing from replacement material, auto-infer it as m_AtlasPadding+1.
                         if gradient_scale is None and replacement_is_sdf and replacement_padding > 0:
                             gradient_scale = float(replacement_padding + 1)
                         if apply_replacement_material and effective_force_raster:
                             # KR: Raster 모드에서는 SDF 계열 필드 0 덮기 대신 최소 필드만 남깁니다.
-                            # EN: In raster mode, prune to minimal fields instead of zero-overriding SDF properties.
+                            # EN: In Raster mode, keep only minimal fields instead of zeroing out SDF-related fields.
                             reset_keywords = True
                             prune_raster_material = True
                             gradient_scale = 1.0
@@ -7763,9 +8438,9 @@ def replace_fonts_in_file(
                             else replacement_image
                         )
                         # KR: Alpha8은 반드시 bpe=1 경로로 인코딩해야 합니다.
-                        # KR: RGBA 기준 swizzle 후 알파만 추출하면 바이트 순서가 깨질 수 있습니다.
-                        # EN: Alpha8 must be encoded via bpe=1 path.
-                        # EN: Swizzling as RGBA then extracting alpha can corrupt byte order.
+                        #     RGBA 기준 swizzle 후 알파만 추출하면 바이트 순서가 깨질 수 있습니다.
+                        # EN: Alpha8 must be encoded via the bpe=1 path.
+                        #     Extracting only the alpha channel after RGBA-based swizzle can corrupt byte order.
                         alpha_raw, aw, ah, alpha_mode = _encode_alpha8_replacement_bytes(
                             alpha_source,
                             ps5_swizzle=ps5_swizzle,
@@ -7830,8 +8505,8 @@ def replace_fonts_in_file(
 
                 # KR: TypeTree 재직렬화 시 원본보다 작아지는 Texture2D (중국판 Unity 등)는
                 # KR: 바이너리 패치를 사용하여 extra bytes를 보존합니다.
-                # EN: For Texture2D where TypeTree re-serialization loses bytes (China Unity etc.),
-                # EN: use binary patch to preserve extra bytes.
+                # EN: For Texture2D that becomes smaller than original on TypeTree re-serialization (e.g. China Unity),
+                # EN: use binary patching to preserve extra bytes.
                 if _has_trailing_bytes(obj) or _detect_typetree_size_mismatch(obj):
                     tex_w = int(getattr(parse_dict, "m_Width", 0) or 0)
                     tex_h = int(getattr(parse_dict, "m_Height", 0) or 0)
@@ -7938,14 +8613,15 @@ def replace_fonts_in_file(
             use_save_to: bool = False,
         ) -> bytes | int:
             """KR: 지정 packer로 기본 파일 객체의 save/save_to를 호출합니다.
-            KR: save_path가 주어지면 save_to()로 파일에 직접 기록하여 메모리를 절약합니다.
-            KR: 반환값은 bytes(legacy) 또는 저장된 파일 크기(int)입니다.
-            EN: Call save/save_to on the primary file object with an optional packer.
-            EN: If save_path is provided, it writes via save_to() to reduce memory usage.
-            EN: Returns bytes (legacy path) or written file size as int (save_to path).
+            save_path가 주어지면 save_to()로 파일에 직접 기록하여 메모리를 절약합니다.
+            반환값은 bytes(legacy) 또는 저장된 파일 크기(int)입니다.
+
+            EN: Invokes save/save_to on the base file object with the given packer.
+            If save_path is given, writes directly to file via save_to() to save memory.
+            Returns bytes (legacy) or the saved file size (int).
             """
             # KR: use_save_to=True 이고 save_to()가 존재하면 파일에 직접 저장합니다.
-            # EN: When use_save_to=True and save_to() exists, save directly to file.
+            # EN: If use_save_to=True and save_to() exists, save directly to file.
             save_to_fn = getattr(env_file, "save_to", None)
             if use_save_to and save_path and callable(save_to_fn):
                 try:
@@ -7959,7 +8635,7 @@ def replace_fonts_in_file(
                 return save_to_fn(save_path, packer=packer)
 
             # KR: 기존 bytes 반환 방식 폴백
-            # EN: Fallback to legacy bytes-returning save()
+            # EN: Fallback to legacy bytes-returning approach
             save_fn = getattr(env_file, "save", None)
             if not callable(save_fn):
                 raise AttributeError(
@@ -7967,7 +8643,7 @@ def replace_fonts_in_file(
                 )
             typed_save = cast(Callable[..., bytes], save_fn)
             # KR: save() 시그니처를 기준으로 packer 지원 여부를 판별해 내부 TypeError를 가리지 않도록 합니다.
-            # EN: Detect packer support from save() signature so we don't swallow internal TypeError.
+            # EN: Check packer support based on save() signature to avoid masking internal TypeErrors.
             try:
                 supports_packer = "packer" in inspect.signature(typed_save).parameters
             except (TypeError, ValueError):
@@ -7979,7 +8655,7 @@ def replace_fonts_in_file(
 
         def _validate_saved_file(saved_path: str) -> tuple[bool, str | None]:
             """KR: 저장 결과 파일이 Unity bundle로 다시 열리는지 검증합니다.
-            EN: Validate saved output by attempting to reload from file path.
+            EN: Validates that the saved file can be re-opened as a Unity bundle.
             """
             signature = source_bundle_signature or getattr(env_file, "signature", None)
             if signature not in bundle_signatures:
@@ -8076,7 +8752,7 @@ def replace_fonts_in_file(
 
         def _try_save(packer_label: Any, log_label: str) -> bool:
             """KR: 단일 저장 전략을 시도하고 성공 여부를 반환합니다.
-            EN: Try one save strategy and return success status.
+            EN: Attempts a single save strategy and returns whether it succeeded.
             """
             nonlocal save_success, last_save_failure_reason
             tmp_file = os.path.join(tmp_path, fn_without_path)
@@ -8094,9 +8770,9 @@ def replace_fonts_in_file(
                 use_stream_fallback = False
                 if has_save_to and source_bundle_signature in bundle_signatures:
                     # KR: 번들은 기본적으로 save_to()를 우선 사용해 최종 bytes blob 생성을 피합니다.
-                    # KR: save_to() 실패 시에만 legacy save()로 폴백합니다.
-                    # EN: For bundles, prefer save_to() first to avoid materializing the final bytes blob.
-                    # EN: Fall back to legacy save() only if save_to() fails.
+                    #     save_to() 실패 시에만 legacy save()로 폴백합니다.
+                    # EN: Bundles prefer save_to() by default to avoid creating a final bytes blob.
+                    #     Fall back to legacy save() only when save_to() fails.
                     try:
                         _save_env_file(
                             packer_label, save_path=tmp_file, use_save_to=True
@@ -8121,15 +8797,16 @@ def replace_fonts_in_file(
                         saved_blob = None
                 elif has_save_to:
                     # KR: save_to()로 파일에 직접 저장 — bytes 중간 변수 없음 (메모리 절약)
-                    # EN: save_to() writes directly to file — no intermediate bytes blob (memory-efficient)
+                    # EN: Save directly to file via save_to() — no intermediate bytes variable (saves memory)
                     _save_env_file(packer_label, save_path=tmp_file, use_save_to=True)
                 else:
                     # KR: 기존 bytes 반환 방식 폴백
-                    # EN: Legacy bytes-returning fallback
+                    # EN: Fallback to legacy bytes-returning approach
                     saved_blob = _save_env_file(packer_label, use_save_to=False)
                     with open(tmp_file, "wb") as f:
                         f.write(cast(bytes, saved_blob))
-                    # Release large in-memory blob before optional validation to lower peak memory.
+                    # KR: 검증 전에 큰 메모리 블록을 해제하여 피크 메모리 사용량을 낮춥니다.
+                    # EN: Free large memory blocks before validation to reduce peak memory usage.
                     saved_blob = None
                 gc.collect()
                 is_valid, validation_reason = _validate_saved_file(tmp_file)
@@ -8227,7 +8904,7 @@ def replace_fonts_in_file(
 
         if prefer_original_compress:
             # KR: 옵션이 있으면 원본 압축 우선으로 저장합니다.
-            # EN: With option enabled, keep original compression as first choice.
+            # EN: If the option is set, save with original compression first.
             if not _try_save("original", "1"):
                 if lang == "ko":
                     _log_console("  lz4 압축 모드로 재시도...")
@@ -8249,7 +8926,7 @@ def replace_fonts_in_file(
                         _try_save(legacy_none_packer, "4")
         else:
             # KR: 기본은 무압축 계열 우선으로 저장해 시간을 줄이고, 실패 시 압축 모드로 폴백합니다.
-            # EN: Default prefers uncompressed-family save for speed, then falls back to compressed modes.
+            # EN: By default, save with uncompressed-family first to reduce time; fall back to compressed mode on failure.
             if not _try_save(safe_none_packer, "1"):
                 if legacy_none_packer is not None:
                     if lang == "ko":
@@ -8358,11 +9035,12 @@ def create_batch_replacements(
     ps5_swizzle: bool = False,
 ) -> dict[str, JsonDict]:
     """KR: 게임 내 모든 폰트를 지정 폰트로 치환하는 배치 매핑을 생성합니다.
-    KR: target_files가 있으면 해당 파일만 대상으로 매핑을 생성합니다.
-    KR: exclude_exts가 있으면 해당 확장자는 스캔에서 제외합니다.
-    EN: Create batch replacement mapping for all fonts in a game.
-    EN: If target_files is provided, build mapping only for those files.
-    EN: If exclude_exts is provided, skip files with those extensions.
+    target_files가 있으면 해당 파일만 대상으로 매핑을 생성합니다.
+    exclude_exts가 있으면 해당 확장자는 스캔에서 제외합니다.
+
+    EN: Creates a batch mapping to replace all fonts in the game with the specified font.
+    If target_files is provided, only those files are included in the mapping.
+    If exclude_exts is provided, those extensions are excluded from scanning.
     """
     fonts = scan_fonts(
         game_path,
@@ -8431,9 +9109,10 @@ def create_preview_export_targets(
     ps5_swizzle: bool = False,
 ) -> dict[str, JsonDict]:
     """KR: preview-export 전용 SDF 대상 매핑(Replace_to 비어 있음)을 생성합니다.
-    KR: scan_jobs/target_files/exclude_exts 조건을 그대로 반영합니다.
-    EN: Build preview-export-only SDF mapping (Replace_to left empty).
-    EN: scan_jobs/target_files/exclude_exts are applied as-is.
+    scan_jobs/target_files/exclude_exts 조건을 그대로 반영합니다.
+
+    EN: Creates an SDF target mapping for preview-export (Replace_to left empty).
+    Honors scan_jobs/target_files/exclude_exts conditions as-is.
     """
     fonts = scan_fonts(
         game_path,
@@ -8473,7 +9152,7 @@ def exit_with_error(
     pause: bool | None = None,
 ) -> NoReturn:
     """KR: 로컬라이즈된 오류 메시지를 출력하고 종료합니다.
-    EN: Print localized error message and terminate the process.
+    EN: Prints a localized error message and exits.
     """
     if lang == "ko":
         _log_console(f"오류: {message}")
@@ -8488,7 +9167,7 @@ def exit_with_error(
 
 def exit_with_error_en(message: str) -> NoReturn:
     """KR: 영문 오류 메시지를 출력하고 종료합니다.
-    EN: Print English error message and terminate the process.
+    EN: Prints an English error message and exits.
     """
     exit_with_error(message, lang="en")
 
@@ -8853,7 +9532,7 @@ def run_validation_worker(
     inner_names: list[str] | None = None,
 ) -> int:
     """KR: 저장 검증 전용 워커입니다. 가능한 경우 경량 structural 검증을 수행합니다.
-    EN: Validation worker that prefers lightweight structural validation when possible.
+    EN: Dedicated save-validation worker. Performs lightweight structural validation when possible.
     """
     try:
         if not os.path.exists(bundle_path):
@@ -8916,7 +9595,7 @@ def run_scan_file_worker(
     detect_ps5_swizzle: bool = False,
 ) -> int:
     """KR: 단일 파일 파싱 워커입니다. 결과를 JSON 파일로 저장합니다.
-    EN: Single-file scan worker. Writes results to a JSON file.
+    EN: Single-file parsing worker. Saves results to a JSON file.
     """
     try:
         game_path, data_path = resolve_game_path(game_path, lang=lang)
@@ -8951,7 +9630,7 @@ def run_scan_file_worker(
 
 def main_cli(lang: Language = "ko") -> None:
     """KR: 언어별 공통 CLI 진입점입니다.
-    EN: Shared CLI entrypoint parameterized by language.
+    EN: Common CLI entry point per language.
     """
     is_ko = lang == "ko"
 
@@ -9154,19 +9833,19 @@ Examples:
     )
 
     # KR: 이전 옵션(--use-game-mat) 호환을 위해 새 옵션에 병합합니다.
-    # EN: Merge legacy flag (--use-game-mat) into the new option for compatibility.
+    # EN: Merge the legacy option (--use-game-mat) into the new option for backward compatibility.
     args.use_game_material = bool(
         getattr(args, "use_game_material", False)
         or getattr(args, "use_game_mat", False)
     )
     # KR: 오타/레거시 옵션(--use-game-line-matrics)도 동일 동작으로 병합합니다.
-    # EN: Merge typo/legacy option (--use-game-line-matrics) into the canonical flag.
+    # EN: Also merge the typo/legacy option (--use-game-line-matrics) with the same behavior.
     args.use_game_line_metrics = bool(
         getattr(args, "use_game_line_metrics", False)
         or getattr(args, "use_game_line_matrics", False)
     )
     # KR: 레거시 옵션(--preview)도 새 옵션(--preview-export)으로 병합합니다.
-    # EN: Merge legacy --preview into the canonical --preview-export flag.
+    # EN: Also merge the legacy option (--preview) into the new option (--preview-export).
     args.preview_export = bool(
         getattr(args, "preview_export", False) or getattr(args, "preview", False)
     )
@@ -9209,7 +9888,7 @@ Examples:
             )
 
     # KR: 기본은 split-save 폴백을 활성화합니다.
-    # EN: Split-save fallback is enabled by default.
+    # EN: By default, enable split-save fallback.
     args.split_save = not args.oneshot_save_force
     if args.scan_jobs < 1:
         if is_ko:
@@ -9962,7 +10641,7 @@ Examples:
             else:
                 _log_console(f"\nProcessing: {fn}")
             # KR: 기본은 split-save 폴백을 사용하고, --oneshot-save-force일 때만 비활성화합니다.
-            # EN: Split-save fallback is enabled by default and disabled only by --oneshot-save-force.
+            # EN: By default, use split-save fallback; only disable when --oneshot-save-force is set.
             file_replacements = {
                 key: value
                 for key, value in replacements.items()
@@ -9998,7 +10677,7 @@ Examples:
                     )
 
                 # KR: 먼저 한 번에 저장을 시도하고, 실패 시에만 적응형 분할 저장으로 폴백합니다.
-                # EN: Try one-shot save first, then fall back to adaptive split save on failure.
+                # EN: First attempt a one-shot save; fall back to adaptive split save only on failure.
                 file_lookup, _ = build_replacement_lookup(file_replacements)
                 one_shot_ok = False
                 if args.split_save_force:
@@ -10218,7 +10897,7 @@ Examples:
                                                 )
                                         else:
                                             # KR: 성공하면 배치를 키워 쓰기 횟수를 줄입니다.
-                                            # EN: Grow batch size after success to reduce write count.
+                                            # EN: On success, increase batch size to reduce the number of writes.
                                             batch_size = min(
                                                 sdf_total - idx,
                                                 max(
@@ -10366,21 +11045,21 @@ Examples:
 
 def main() -> None:
     """KR: 한국어 CLI 진입점입니다.
-    EN: Korean CLI entrypoint.
+    EN: Korean CLI entry point.
     """
     main_cli(lang="ko")
 
 
 def main_en() -> None:
     """KR: 영어 CLI 진입점입니다.
-    EN: English CLI entrypoint.
+    EN: English CLI entry point.
     """
     main_cli(lang="en")
 
 
 def run_main_ko() -> None:
     """KR: 한국어 실행 진입점을 예외 처리와 함께 실행합니다.
-    EN: Run Korean entrypoint with top-level exception handling.
+    EN: Runs the Korean entry point with exception handling.
     """
     try:
         main()
@@ -10395,7 +11074,7 @@ def run_main_ko() -> None:
 
 def run_main_en() -> None:
     """KR: 영어 실행 진입점을 예외 처리와 함께 실행합니다.
-    EN: Run English entrypoint with top-level exception handling.
+    EN: Runs the English entry point with exception handling.
     """
     try:
         main_en()
