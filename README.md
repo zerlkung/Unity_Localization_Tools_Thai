@@ -189,33 +189,54 @@ Select a task:
 
 อ่านและแก้ไข Unity Addressables catalog files (`catalog.json`, `catalog.bin`, `catalog.bundle`)
 
-### ตัวอย่างการใช้งาน / Examples
+### CLI
 
-**ดู summary ของ catalog:**
-```bash
-python addressables_catalog.py catalog.json
-```
+| คำสั่ง | ผลลัพธ์ |
+|---|---|
+| `python addressables_catalog.py catalog.json` | แสดง summary |
+| `python addressables_catalog.py catalog.json --fonts` | แสดง font ทั้งหมด |
+| `python addressables_catalog.py catalog.json <pattern>` | ค้นหาด้วย regex |
+| `python addressables_catalog.py catalog.json --patch-crc out.json` | Patch CRC แล้วบันทึก |
 
-**ค้นหา asset:**
-```bash
-python addressables_catalog.py catalog.json font
-```
+เพิ่ม `--output <file>` เพื่อเซฟผลลัพธ์เป็นไฟล์ (สร้างโฟลเดอร์อัตโนมัติ):
 
-**Patch CRC** (จำเป็นหลังแก้ไข bundle เพื่อป้องกัน integrity check พัง):
 ```bash
+# แสดง font ทั้งหมด พร้อมชื่อ bundle ที่อยู่ แล้วเซฟเป็นไฟล์
+python addressables_catalog.py catalog.json --fonts --output result/fonts.txt
+
+# ค้นหาไฟล์ .otf และ .ttf ทั้งหมด
+python addressables_catalog.py catalog.json "\.otf|\.ttf" --output result/fonts.txt
+
+# Patch CRC หลังแก้ไข bundle
 python addressables_catalog.py catalog.json --patch-crc catalog_patched.json
 ```
 
-**ใช้ใน Python script:**
+**ตัวอย่าง output:**
+```
+[Assets/Resources_moved/Fonts/Headings/6092-Reg.otf]  Assets/.../6092-Reg.otf  →  000f31824b70d0c577402a06d3c2cb8c.bundle
+[Assets/Resources_moved/Fonts/Body/NotoSans.ttf]  Assets/.../NotoSans.ttf  →  0a1d5db632cad408c6acb9f588cfc39c.bundle
+```
+
+### ใช้ใน Python script
+
 ```python
-from addressables_catalog import read_catalog, patch_crc, find_font_resources, write_catalog_json
+from addressables_catalog import (
+    read_catalog, patch_crc, find_font_resources,
+    find_resources, get_bundle_for_location, write_catalog_json
+)
 
 cat = read_catalog("catalog.json")   # รองรับ .json / .bin / .bundle
 
+# หา font ทั้งหมดพร้อม bundle ที่อยู่
 fonts = find_font_resources(cat)
 for loc in fonts:
-    print(loc.primary_key, "→", loc.internal_id)
+    bundle = get_bundle_for_location(loc)
+    print(f"{loc.primary_key}  →  {bundle}")
 
+# ค้นหาด้วย pattern
+results = find_resources(cat, r"\.otf|\.ttf")
+
+# Patch CRC แล้วบันทึก
 n = patch_crc(cat)
 write_catalog_json(cat, "catalog_patched.json")
 print(f"Patched {n} bundle CRC(s)")
