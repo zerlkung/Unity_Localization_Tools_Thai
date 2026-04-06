@@ -690,6 +690,13 @@ def _read_json(json_text: str) -> ContentCatalogData:
         resources[keys[i]] = [locations[e] for e in entries]
 
     ccd.resources = resources
+
+    # Resolve dependency_key -> dependencies list so get_bundle_for_location works
+    for locs_list in resources.values():
+        for loc in locs_list:
+            if loc.dependency_key is not None and not loc.dependencies:
+                loc.dependencies = resources.get(loc.dependency_key, [])
+
     return ccd
 
 
