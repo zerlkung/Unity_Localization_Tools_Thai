@@ -1140,8 +1140,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--charset",
-        default="./CharList_3911.txt",
-        help="Charset file path or literal characters.",
+        default="./CharList_Thai.txt",
+        help="Charset file path or literal characters (default: CharList_Thai.txt for Thai support).",
     )
     parser.add_argument(
         "--rendermode",

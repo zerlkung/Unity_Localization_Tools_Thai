@@ -2349,6 +2349,8 @@ _PRIMARY_MODE_ARGS: tuple[tuple[str, str], ...] = (
     ("parse", "--parse"),
     ("mulmaru", "--mulmaru"),
     ("nanumgothic", "--nanumgothic"),
+    ("sarabun", "--sarabun"),
+    ("notosansthai", "--notosansthai"),
     ("list", "--list"),
     ("preview_export", "--preview-export"),
 )
@@ -2373,7 +2375,7 @@ def _mode_uses_scan_jobs(mode: str | None) -> bool:
     """KR: 해당 모드가 스캔 작업을 사용하는지 여부를 반환한다.
     EN: Return whether the given mode uses scan jobs.
     """
-    return mode in {"parse", "mulmaru", "nanumgothic", "preview_export"}
+    return mode in {"parse", "mulmaru", "nanumgothic", "sarabun", "notosansthai", "preview_export"}
 
 
 def _should_pause_before_exit(*, interactive_session: bool = False) -> bool:
@@ -6677,7 +6679,7 @@ def _select_builtin_bulk_padding_variant(
     source_padding: float | int | None,
 ) -> int | None:
     base_name = normalize_font_name(normalized).strip().lower()
-    if base_name not in {"nanumgothic", "mulmaru"}:
+    if base_name not in {"nanumgothic", "mulmaru", "sarabun", "notosansthai"}:
         return None
     try:
         numeric_padding = float(source_padding) if source_padding is not None else 0.0
@@ -6707,14 +6709,16 @@ def _find_replacement_sdf_atlas_path(
     normalized: str,
     prefer_raster: bool = False,
 ) -> str | None:
+    th_assets = os.path.join(script_dir, "TH_ASSETS")
     kr_assets = os.path.join(script_dir, "KR_ASSETS")
     _, name_candidates = _build_font_asset_name_candidates(
         normalized, bool(prefer_raster)
     )
-    for name_candidate in name_candidates:
-        atlas_path = os.path.join(kr_assets, f"{name_candidate} Atlas.png")
-        if os.path.exists(atlas_path):
-            return atlas_path
+    for asset_dir in (th_assets, kr_assets):
+        for name_candidate in name_candidates:
+            atlas_path = os.path.join(asset_dir, f"{name_candidate} Atlas.png")
+            if os.path.exists(atlas_path):
+                return atlas_path
     return None
 
 
@@ -6800,11 +6804,16 @@ def _load_font_assets_cached(
     prefer_raster: bool = False,
     padding_variant: int | None = None,
 ) -> JsonDict:
-    """KR: KR_ASSETS에서 폰트 리소스를 읽어 캐시에 저장합니다.
-    EN: Reads font resources from KR_ASSETS and stores them in cache.
+    """KR: TH_ASSETS(우선) 또는 KR_ASSETS에서 폰트 리소스를 읽어 캐시에 저장합니다.
+    EN: Reads font resources from TH_ASSETS (preferred) or KR_ASSETS and stores them in cache.
     """
+    th_assets = os.path.join(script_dir, "TH_ASSETS")
     kr_assets = os.path.join(script_dir, "KR_ASSETS")
-    asset_roots = _iter_kr_asset_roots(kr_assets, padding_variant=padding_variant)
+    # Prefer TH_ASSETS; fall back to KR_ASSETS if not found
+    if os.path.isdir(th_assets):
+        asset_roots = _iter_kr_asset_roots(th_assets, padding_variant=padding_variant)
+    else:
+        asset_roots = _iter_kr_asset_roots(kr_assets, padding_variant=padding_variant)
     font_name_candidates, name_candidates = _build_font_asset_name_candidates(
         normalized,
         bool(prefer_raster),
@@ -9635,11 +9644,13 @@ def main_cli(lang: Language = "ko") -> None:
     is_ko = lang == "ko"
 
     if is_ko:
-        description = "Unity 게임의 폰트를 한글 폰트로 교체합니다."
+        description = "Unity 게임의 폰트를 태국어 폰트로 교체합니다."
         epilog = """
 예시:
   %(prog)s --gamepath "C:/path/to/game" --parse
   %(prog)s --gamepath "C:/path/to/game" --preview-export
+  %(prog)s --gamepath "C:/path/to/game" --sarabun
+  %(prog)s --gamepath "C:/path/to/game" --notosansthai --sdfonly
   %(prog)s --gamepath "C:/path/to/game" --mulmaru
   %(prog)s --gamepath "C:/path/to/game" --nanumgothic --sdfonly
   %(prog)s --gamepath "C:/path/to/game" --list font_map.json
@@ -9648,6 +9659,8 @@ def main_cli(lang: Language = "ko") -> None:
         parse_help = "폰트 정보를 JSON으로 출력"
         mulmaru_help = "모든 폰트를 Mulmaru로 일괄 교체"
         nanum_help = "모든 폰트를 NanumGothic으로 일괄 교체"
+        sarabun_help = "모든 폰트를 Sarabun(태국어)으로 일괄 교체"
+        notosansthai_help = "모든 폰트를 Noto Sans Thai(태국어)로 일괄 교체"
         sdf_help = "SDF 폰트만 교체"
         ttf_help = "TTF 폰트만 교체"
         list_help = "JSON 파일을 읽어서 폰트 교체"
@@ -9679,11 +9692,13 @@ def main_cli(lang: Language = "ko") -> None:
         ps5_swizzle_help = "PS5 swizzle 자동 판별/변환 모드 (mask_x=0x385F0, mask_y=0x07A0F, rotate=90 보정)"
         verbose_help = "콘솔 로그는 유지하고, 상세 DEBUG 로그(파일/폰트/경로/버전)를 verbose.txt에 저장"
     else:
-        description = "Replace Unity game fonts with Korean fonts."
+        description = "Replace Unity game fonts with Thai fonts."
         epilog = """
 Examples:
   %(prog)s --gamepath "C:/path/to/game" --parse
   %(prog)s --gamepath "C:/path/to/game" --preview-export
+  %(prog)s --gamepath "C:/path/to/game" --sarabun
+  %(prog)s --gamepath "C:/path/to/game" --notosansthai --sdfonly
   %(prog)s --gamepath "C:/path/to/game" --mulmaru
   %(prog)s --gamepath "C:/path/to/game" --nanumgothic --sdfonly
   %(prog)s --gamepath "C:/path/to/game" --list font_map.json
@@ -9692,6 +9707,8 @@ Examples:
         parse_help = "Export font info to JSON"
         mulmaru_help = "Replace all fonts with Mulmaru"
         nanum_help = "Replace all fonts with NanumGothic"
+        sarabun_help = "Replace all fonts with Sarabun (Thai)"
+        notosansthai_help = "Replace all fonts with Noto Sans Thai"
         sdf_help = "Replace SDF fonts only"
         ttf_help = "Replace TTF fonts only"
         list_help = "Replace fonts using a JSON file"
@@ -9726,6 +9743,8 @@ Examples:
     parser.add_argument("--parse", action="store_true", help=parse_help)
     parser.add_argument("--mulmaru", action="store_true", help=mulmaru_help)
     parser.add_argument("--nanumgothic", action="store_true", help=nanum_help)
+    parser.add_argument("--sarabun", action="store_true", help=sarabun_help)
+    parser.add_argument("--notosansthai", action="store_true", help=notosansthai_help)
     parser.add_argument("--sdfonly", action="store_true", help=sdf_help)
     parser.add_argument("--ttfonly", action="store_true", help=ttf_help)
     parser.add_argument("--list", type=str, metavar="JSON_FILE", help=list_help)
@@ -10095,6 +10114,10 @@ Examples:
     interactive_session = False
     if args.parse:
         mode = "parse"
+    elif args.sarabun:
+        mode = "sarabun"
+    elif args.notosansthai:
+        mode = "notosansthai"
     elif args.mulmaru:
         mode = "mulmaru"
     elif args.nanumgothic:
@@ -10110,12 +10133,14 @@ Examples:
                 _log_console("작업을 선택하세요:")
                 _log_console("  1. 폰트 정보 추출 (JSON 파일 생성)")
                 _log_console("  2. JSON 파일로 폰트 교체")
-                _log_console("  3. Mulmaru(물마루체)로 일괄 교체")
-                _log_console("  4. NanumGothic(나눔고딕)으로 일괄 교체")
-                _log_console("  5. Preview export (Atlas/Glyph crop 추출)")
+                _log_console("  3. Sarabun(태국어)으로 일괄 교체")
+                _log_console("  4. Noto Sans Thai(태국어)로 일괄 교체")
+                _log_console("  5. Mulmaru(물마루체)로 일괄 교체")
+                _log_console("  6. NanumGothic(나눔고딕)으로 일괄 교체")
+                _log_console("  7. Preview export (Atlas/Glyph crop 추출)")
                 _log_console()
-                choice = input("선택 (1-5): ").strip()
-                if choice in {"1", "2", "3", "4", "5"}:
+                choice = input("선택 (1-7): ").strip()
+                if choice in {"1", "2", "3", "4", "5", "6", "7"}:
                     break
                 _log_console("잘못된 선택입니다. 다시 입력해주세요.")
         else:
@@ -10123,12 +10148,14 @@ Examples:
                 _log_console("Select a task:")
                 _log_console("  1. Export font info (create JSON)")
                 _log_console("  2. Replace fonts using JSON")
-                _log_console("  3. Bulk replace with Mulmaru")
-                _log_console("  4. Bulk replace with NanumGothic")
-                _log_console("  5. Preview export (Atlas/Glyph crops)")
+                _log_console("  3. Bulk replace with Sarabun (Thai)")
+                _log_console("  4. Bulk replace with Noto Sans Thai")
+                _log_console("  5. Bulk replace with Mulmaru")
+                _log_console("  6. Bulk replace with NanumGothic")
+                _log_console("  7. Preview export (Atlas/Glyph crops)")
                 _log_console()
-                choice = input("Choose (1-5): ").strip()
-                if choice in {"1", "2", "3", "4", "5"}:
+                choice = input("Choose (1-7): ").strip()
+                if choice in {"1", "2", "3", "4", "5", "6", "7"}:
                     break
                 _log_console("Invalid selection. Please try again.")
 
@@ -10156,10 +10183,14 @@ Examples:
                 else:
                     _log_console(f"File not found: '{entered}'")
         elif choice == "3":
-            mode = "mulmaru"
+            mode = "sarabun"
         elif choice == "4":
-            mode = "nanumgothic"
+            mode = "notosansthai"
         elif choice == "5":
+            mode = "mulmaru"
+        elif choice == "6":
+            mode = "nanumgothic"
+        elif choice == "7":
             mode = "preview_export"
 
     args.preview_export = mode == "preview_export"
@@ -10266,7 +10297,7 @@ Examples:
     replace_ttf = not args.sdfonly
     replace_sdf = not args.ttfonly
     material_scale_by_padding = not args.use_game_material
-    prefer_builtin_padding_variants = mode in {"mulmaru", "nanumgothic"}
+    prefer_builtin_padding_variants = mode in {"mulmaru", "nanumgothic", "sarabun", "notosansthai"}
     if args.sdfonly and args.ttfonly:
         if is_ko:
             exit_with_error(
@@ -10457,6 +10488,50 @@ Examples:
         replacements = create_batch_replacements(
             game_path,
             "NanumGothic",
+            replace_ttf,
+            replace_sdf,
+            target_files=selected_files if selected_files else None,
+            exclude_exts=excluded_exts if excluded_exts else None,
+            scan_jobs=args.scan_jobs,
+            lang=lang,
+            ps5_swizzle=args.ps5_swizzle,
+        )
+        ttf_count = sum(1 for v in replacements.values() if v["Type"] == "TTF")
+        sdf_count = sum(1 for v in replacements.values() if v["Type"] == "SDF")
+        if is_ko:
+            _log_console(f"발견된 폰트: TTF {ttf_count}개, SDF {sdf_count}개")
+        else:
+            _log_console(f"Found fonts: TTF {ttf_count}, SDF {sdf_count}")
+    elif mode == "sarabun":
+        if is_ko:
+            _log_console("Sarabun 폰트로 일괄 교체합니다...")
+        else:
+            _log_console("Bulk replacing with Sarabun (Thai)...")
+        replacements = create_batch_replacements(
+            game_path,
+            "Sarabun",
+            replace_ttf,
+            replace_sdf,
+            target_files=selected_files if selected_files else None,
+            exclude_exts=excluded_exts if excluded_exts else None,
+            scan_jobs=args.scan_jobs,
+            lang=lang,
+            ps5_swizzle=args.ps5_swizzle,
+        )
+        ttf_count = sum(1 for v in replacements.values() if v["Type"] == "TTF")
+        sdf_count = sum(1 for v in replacements.values() if v["Type"] == "SDF")
+        if is_ko:
+            _log_console(f"발견된 폰트: TTF {ttf_count}개, SDF {sdf_count}개")
+        else:
+            _log_console(f"Found fonts: TTF {ttf_count}, SDF {sdf_count}")
+    elif mode == "notosansthai":
+        if is_ko:
+            _log_console("Noto Sans Thai 폰트로 일괄 교체합니다...")
+        else:
+            _log_console("Bulk replacing with Noto Sans Thai...")
+        replacements = create_batch_replacements(
+            game_path,
+            "NotoSansThai",
             replace_ttf,
             replace_sdf,
             target_files=selected_files if selected_files else None,
