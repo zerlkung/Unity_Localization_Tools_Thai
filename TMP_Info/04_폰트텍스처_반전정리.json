@@ -1,0 +1,90 @@
+{
+  "report_type": "font_texture_orientation_summary",
+  "generated_at": "2026-02-24T23:00:34+09:00",
+  "target_file": "C:\\Users\\USER\\Documents\\GitHub\\Unity_Font_Replacer\\unity_font_replacer_core.py",
+  "cases": [
+    {
+      "id": "glyph_y_flip_new_to_old",
+      "affects": "serialized_font_data",
+      "description": "신형 TMP 글리프를 구형 m_glyphInfoList로 변환할 때 Y축 반전 여부를 자동 판정 후 필요 시 y를 변환",
+      "detection": {
+        "function": "detect_new_glyph_y_flip",
+        "scoring": "alpha non-zero rect count + mean intensity 비교",
+        "thresholds": {
+          "non_zero_margin": "max(2, valid_count // 20)",
+          "mean_factor": "flipped_mean > direct_mean * 1.2"
+        },
+        "formula": "yy = atlas_h - y - h"
+      },
+      "apply": {
+        "function": "convert_glyphs_new_to_old",
+        "formula": "rect_y = atlas_height - rect_y - rect_h (flip_y=True)"
+      },
+      "code_refs": [
+        "unity_font_replacer_core.py:1184",
+        "unity_font_replacer_core.py:1241",
+        "unity_font_replacer_core.py:1268",
+        "unity_font_replacer_core.py:1295",
+        "unity_font_replacer_core.py:2898"
+      ]
+    },
+    {
+      "id": "preview_linear_flip_only",
+      "affects": "preview_only",
+      "description": "타겟 atlas 프리뷰 생성 시 linear(non-swizzled) 텍스처를 사람이 보기 쉬운 좌표계로 상하 반전",
+      "apply": {
+        "operation": "ImageOps.flip(preview_image)",
+        "note": "실제 저장 atlas 바이트는 직접 flip하지 않음"
+      },
+      "code_refs": [
+        "unity_font_replacer_core.py:2424",
+        "unity_font_replacer_core.py:2425"
+      ]
+    },
+    {
+      "id": "ps5_swizzle_orientation",
+      "affects": "atlas_write_state_and_preview",
+      "description": "PS5 swizzle/unswizzle 처리 시 rotate=90 규칙과 상태 판정 결과에 따라 방향/회전 체감이 달라질 수 있음",
+      "detection": {
+        "function": "detect_texture_object_ps5_swizzle_detail",
+        "hints": [
+          "stream>0 and non-readable -> likely_swizzled_input",
+          "stream==0 and readable and inline image_data>0 -> likely_linear_input",
+          "texture_format==1(alpha8) 특화 힌트"
+        ]
+      },
+      "apply": {
+        "functions": [
+          "apply_ps5_swizzle_to_image",
+          "apply_ps5_unswizzle_to_image"
+        ],
+        "rotate": "PS5_SWIZZLE_ROTATE=90",
+        "decision_point": "desired_swizzle_state != source_swizzled 일 때 변환"
+      },
+      "code_refs": [
+        "unity_font_replacer_core.py:30",
+        "unity_font_replacer_core.py:704",
+        "unity_font_replacer_core.py:732",
+        "unity_font_replacer_core.py:772",
+        "unity_font_replacer_core.py:806",
+        "unity_font_replacer_core.py:2964",
+        "unity_font_replacer_core.py:3014",
+        "unity_font_replacer_core.py:3016"
+      ]
+    }
+  ],
+  "troubleshooting": [
+    {
+      "step": 1,
+      "check": "로그에 \"구형 TMP 좌표계 보정(Y-flip) 적용\" 출력 여부 확인"
+    },
+    {
+      "step": 2,
+      "check": "로그의 PS5 swizzle 판정(swizzled/linear/inconclusive) 확인"
+    },
+    {
+      "step": 3,
+      "check": "preview 이미지와 실제 저장 atlas 상태를 분리해서 검증"
+    }
+  ]
+}

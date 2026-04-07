@@ -1,0 +1,1482 @@
+"""KR: Unity 게임 데이터에서 TextMeshPro SDF 폰트 에셋을 추출하는 핵심 모듈.
+
+동작 흐름:
+  1. globalgamemanagers 로드 → Unity 버전 감지
+  2. TypeTreeGenerator 초기화 (Mono DLL 또는 Il2cpp 메타데이터)
+  3. 전체 에셋 파일 순회 → MonoBehaviour 중 TMP_FontAsset 판별
+  4. TMP 스키마 판별 (신형 m_GlyphTable / 구형 m_glyphInfoList)
+  5. atlas Texture2D, Material 참조 해석 → JSON/PNG 추출
+
+TMP 스키마 경계 (TMP_Info 기준):
+  구형 전용 마지막 : Unity 2018.3.14 (TMP git 1.3.0 이하)
+  신형 시작         : Unity 2018.4.2  (TMP git 1.4.0 이상)
+  구형은 m_glyphInfoList + m_fontInfo + atlas(단일 참조),
+  신형은 m_GlyphTable + m_CharacterTable + m_FaceInfo + m_AtlasTextures(리스트).
+
+UnityPy 연동:
+  UnityPy.load()로 에셋 파일을 열고, TypeTreeGenerator로 MonoBehaviour를
+  딕셔너리로 역직렬화한다. Texture2D는 parse_as_object()로 이미지를 추출.
+  UnityPy의 externals 리스트로 FileID → 외부 에셋 파일명을 해석한다.
+
+EN: Core module for extracting TextMeshPro SDF font assets from Unity game data.
+
+Workflow:
+  1. Load globalgamemanagers -> detect Unity version
+  2. Initialize TypeTreeGenerator (Mono DLL or Il2cpp metadata)
+  3. Iterate all asset files -> identify TMP_FontAsset among MonoBehaviours
+  4. Determine TMP schema (new m_GlyphTable / old m_glyphInfoList)
+  5. Resolve atlas Texture2D and Material references -> extract JSON/PNG
+
+TMP schema boundary (per TMP_Info):
+  Last old-only  : Unity 2018.3.14 (TMP git <= 1.3.0)
+  First new      : Unity 2018.4.2  (TMP git >= 1.4.0)
+  Old uses m_glyphInfoList + m_fontInfo + atlas (single ref),
+  New uses m_GlyphTable + m_CharacterTable + m_FaceInfo + m_AtlasTextures (list).
+
+UnityPy integration:
+  Opens asset files with UnityPy.load() and deserializes MonoBehaviours into
+  dicts via TypeTreeGenerator. Extracts Texture2D images with parse_as_object().
+  Resolves FileID -> external asset file names using UnityPy's externals list.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import logging
+import os
+import re
+import sys
+from functools import lru_cache
+from typing import Any, Literal, NoReturn, cast
+
+import UnityPy
+from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
+
+logger = logging.getLogger(__name__)
+
+
+def _close_env(environment: Any) -> None:
+    """KR: UnityPy Environment가 보유한 리소스(mmap, 임시 블록 파일)를 정리한다.
+    UnityPy는 BundleFile 내부에 mmap이나 임시 파일을 보유할 수 있으며,
+    이를 명시적으로 해제하지 않으면 파일 핸들 누수가 발생한다.
+    스택 기반 DFS로 중첩된 files 딕셔너리까지 순회한다.
+
+    EN: Clean up resources (mmap, temp block files) held by a UnityPy Environment.
+    UnityPy may hold mmaps or temp files inside BundleFile objects;
+    failing to release them explicitly causes file handle leaks.
+    Uses stack-based DFS to traverse nested files dicts."""
+    if environment is None:
+        return
+    stack: list[Any] = []
+    files = getattr(environment, "files", None)
+    if isinstance(files, dict):
+        stack.extend(files.values())
+    while stack:
+        item = stack.pop()
+        for attr in ("_cleanup_temp_blocks_storage", "close"):
+            fn = getattr(item, attr, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+        sub_files = getattr(item, "files", None)
+        if isinstance(sub_files, dict):
+            stack.extend(sub_files.values())
+
+
+Language = Literal["ko", "en"]
+JsonDict = dict[str, Any]
+
+
+def _encode_texture_platform_blob(value: Any) -> str | None:
+    """KR: Texture2D platform blob을 base64 문자열로 직렬화한다.
+    EN: Serialize a Texture2D platform blob as a base64 string.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+    elif isinstance(value, list):
+        try:
+            raw = bytes(int(item) & 0xFF for item in value)
+        except Exception:
+            return None
+    else:
+        return None
+    if not raw:
+        return None
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _extract_texture_metadata(texture: Any) -> JsonDict:
+    """KR: Texture2D에서 플랫폼/포맷 메타데이터를 추출한다.
+    EN: Extract platform/format metadata from a Texture2D.
+    """
+    stream_data = getattr(texture, "m_StreamData", None)
+    try:
+        stream_size = int(getattr(stream_data, "size", 0) or 0)
+    except Exception:
+        stream_size = 0
+    image_data = getattr(texture, "image_data", None)
+    image_data_size = len(image_data) if isinstance(image_data, (bytes, bytearray)) else 0
+    return {
+        "width": int(getattr(texture, "m_Width", 0) or 0),
+        "height": int(getattr(texture, "m_Height", 0) or 0),
+        "texture_format": int(getattr(texture, "m_TextureFormat", -1) or -1),
+        "platform": int(getattr(texture, "m_Platform", 0) or 0),
+        "is_readable": bool(getattr(texture, "m_IsReadable", False)),
+        "stream_size": stream_size,
+        "image_data_size": image_data_size,
+        "platform_blob_base64": _encode_texture_platform_blob(
+            getattr(texture, "m_PlatformBlob", None)
+        ),
+    }
+
+# KR: TMP 스키마 경계 버전 (TMP_Info/03_tmpro_unity_combined_changes 참조).
+#     구형: m_glyphInfoList + m_fontInfo, UV 계산에 "1 - ..." 보정 사용.
+#     신형: m_GlyphTable + m_FaceInfo, GlyphRect.y가 bottom-origin으로 직접 사용.
+# EN: TMP schema boundary versions (see TMP_Info/03_tmpro_unity_combined_changes).
+#     Old: m_glyphInfoList + m_fontInfo, UV calculation uses "1 - ..." correction.
+#     New: m_GlyphTable + m_FaceInfo, GlyphRect.y is used directly as bottom-origin.
+_TMP_OLD_ONLY_LAST = (2018, 3, 14)
+_TMP_NEW_SCHEMA_FIRST = (2018, 4, 2)
+
+
+def _configure_logging(level: int = logging.INFO) -> None:
+    """KR: CLI 모드 콘솔 로깅을 구성한다. 이미 핸들러가 있으면 레벨만 변경.
+    EN: Configure console logging for CLI mode. If handlers already exist, only change the level."""
+    if logging.getLogger().handlers:
+        logging.getLogger().setLevel(level)
+        return
+    logging.basicConfig(level=level, format="%(message)s")
+
+
+def _coerce_log_level(message: str, default_level: int = logging.INFO) -> int:
+    """KR: 한/영 로그 메시지 내 키워드로 로그 레벨을 추론한다.
+    EN: Infer log level from keywords in Korean/English log messages."""
+    lowered = message.lower()
+    if "경고" in message or "warning" in lowered:
+        return logging.WARNING
+    if (
+        "오류" in message
+        or "error" in lowered
+        or "failed" in lowered
+        or "실패" in message
+    ):
+        return logging.ERROR
+    return default_level
+
+
+def _log_console(
+    *parts: object,
+    sep: str = " ",
+    level: int | None = None,
+) -> None:
+    """KR: print() 호환 로깅 어댑터. 레벨 미지정 시 메시지 키워드로 자동 추론.
+    EN: print()-compatible logging adapter. Auto-infers level from message keywords when not specified."""
+    message = sep.join(str(part) for part in parts)
+    resolved_level = _coerce_log_level(message) if level is None else level
+    logger.log(resolved_level, message)
+
+
+def _debug_parse_enabled() -> bool:
+    """KR: UFR_DEBUG_PARSE=1 환경변수로 TMP 파싱 디버그 로그 활성화 여부를 반환.
+    EN: Return whether TMP parsing debug logging is enabled via UFR_DEBUG_PARSE=1 env var."""
+    return os.environ.get("UFR_DEBUG_PARSE", "").strip() == "1"
+
+
+def _debug_parse_log(message: str) -> None:
+    """KR: 디버그 모드일 때만 메시지를 출력한다.
+    EN: Print the message only when debug mode is enabled."""
+    if _debug_parse_enabled():
+        _log_console(message)
+
+
+def exit_with_error(lang: Language, message: str) -> NoReturn:
+    """KR: 로컬라이즈된 오류를 출력하고 프로세스를 종료한다(exit code 1).
+    EN: Print a localized error message and terminate the process (exit code 1)."""
+    if lang == "ko":
+        _log_console(f"오류: {message}")
+        input("\n엔터를 눌러 종료...")
+    else:
+        _log_console(f"Error: {message}")
+        input("\nPress Enter to exit...")
+    sys.exit(1)
+
+
+def find_ggm_file(data_path: str) -> str | None:
+    """KR: _Data 폴더에서 globalgamemanagers 계열 파일을 찾아 경로를 반환한다.
+    후보: globalgamemanagers -> globalgamemanagers.assets -> data.unity3d.
+    EN: Find and return the path of a globalgamemanagers-family file in the _Data folder.
+    Candidates: globalgamemanagers -> globalgamemanagers.assets -> data.unity3d."""
+    candidates = [
+        "globalgamemanagers",
+        "globalgamemanagers.assets",
+        "data.unity3d",
+    ]
+    for candidate in candidates:
+        ggm_path = os.path.join(data_path, candidate)
+        if os.path.exists(ggm_path):
+            return ggm_path
+    return None
+
+
+def resolve_game_path(lang: Language, path: str | None = None) -> tuple[str, str]:
+    """KR: 입력 경로를 (game_root, data_path) 튜플로 정규화한다.
+    경로가 *_Data로 끝나면 data_path, 아니면 game_root로 간주하고
+    하위 *_Data 폴더를 탐색한다. globalgamemanagers 존재를 검증.
+
+    EN: Normalize the input path into a (game_root, data_path) tuple.
+    If the path ends with *_Data, treat it as data_path; otherwise treat it as
+    game_root and search for a *_Data subfolder. Validates globalgamemanagers existence."""
+    if path is None:
+        path = os.getcwd()
+
+    path = os.path.normpath(os.path.abspath(path))
+
+    if path.lower().endswith("_data"):
+        data_path = path
+        game_path = os.path.dirname(path)
+    else:
+        game_path = path
+        data_folders = [
+            d
+            for d in os.listdir(path)
+            if d.lower().endswith("_data") and os.path.isdir(os.path.join(path, d))
+        ]
+        if not data_folders:
+            if lang == "ko":
+                exit_with_error(
+                    lang,
+                    f"'{path}'에서 _Data 폴더를 찾을 수 없습니다.\n게임 루트 폴더 또는 _Data 폴더에서 실행해주세요.",
+                )
+            else:
+                exit_with_error(
+                    lang,
+                    f"Could not find the _Data folder in '{path}'.\nRun this from the game root folder or the _Data folder.",
+                )
+        data_path = os.path.join(game_path, data_folders[0])
+
+    ggm_path = find_ggm_file(data_path)
+    if not ggm_path:
+        if lang == "ko":
+            exit_with_error(
+                lang,
+                f"'{data_path}'에서 globalgamemanagers 파일을 찾을 수 없습니다.\n올바른 Unity 게임 폴더인지 확인해주세요.",
+            )
+        else:
+            exit_with_error(
+                lang,
+                f"Could not find the globalgamemanagers file in '{data_path}'.\nPlease check that this is a valid Unity game folder.",
+            )
+
+    return game_path, data_path
+
+
+def get_unity_version(data_path: str) -> str:
+    """KR: globalgamemanagers를 로드하여 Unity 빌드 버전 문자열을 반환한다.
+    EN: Load globalgamemanagers and return the Unity build version string."""
+    ggm_path = find_ggm_file(data_path)
+    if not ggm_path:
+        raise FileNotFoundError(f"globalgamemanagers not found in '{data_path}'")
+    return str(UnityPy.load(ggm_path).objects[0].assets_file.unity_version)
+
+
+def find_assets_files(data_path: str) -> list[str]:
+    """KR: _Data 하위를 재귀 순회하여 Unity 에셋 후보 파일을 수집한다.
+    이미지/오디오/DLL 등 비에셋 확장자는 제외.
+    EN: Recursively walk _Data subdirectories and collect candidate Unity asset files.
+    Excludes non-asset extensions such as images, audio, and DLLs."""
+    assets_files: list[str] = []
+    exclude_exts = {
+        ".dll",
+        ".manifest",
+        ".exe",
+        ".txt",
+        ".json",
+        ".xml",
+        ".log",
+        ".ini",
+        ".cfg",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".wav",
+        ".mp3",
+        ".ogg",
+        ".mp4",
+        ".avi",
+        ".mov",
+    }
+    for root, _, files in os.walk(data_path):
+        for fn in files:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in exclude_exts:
+                assets_files.append(os.path.join(root, fn))
+    return assets_files
+
+
+def get_compile_method(data_path: str) -> str:
+    """KR: Managed 폴더 존재 여부로 빌드 방식(Mono/Il2cpp)을 판별한다.
+    EN: Determine build method (Mono/Il2cpp) by checking for the Managed folder."""
+    return "Mono" if os.path.exists(os.path.join(data_path, "Managed")) else "Il2cpp"
+
+
+def create_generator(
+    unity_version: str,
+    game_path: str,
+    data_path: str,
+    compile_method: str,
+    lang: Language,
+) -> TypeTreeGenerator:
+    """KR: TypeTreeGenerator를 초기화하고 어셈블리 메타데이터를 로드한다.
+    Mono 빌드: Managed/*.dll을 순회하며 load_dll().
+    Il2cpp 빌드: GameAssembly.dll + global-metadata.dat -> load_il2cpp().
+    TypeTree는 UnityPy가 MonoBehaviour를 딕셔너리로 역직렬화할 때 필요.
+
+    EN: Initialize TypeTreeGenerator and load assembly metadata.
+    Mono builds: iterate Managed/*.dll and call load_dll().
+    Il2cpp builds: GameAssembly.dll + global-metadata.dat -> load_il2cpp().
+    TypeTree is required for UnityPy to deserialize MonoBehaviours into dicts."""
+    try:
+        generator = TypeTreeGenerator(unity_version)
+    except ImportError:
+        if lang == "ko":
+            raise RuntimeError(
+                "TypeTreeGeneratorAPI가 설치되지 않아 TMP 폰트 타입트리를 생성할 수 없습니다.\n"
+                "`pip install TypeTreeGeneratorAPI`를 실행해 주세요."
+            )
+        raise RuntimeError(
+            "TypeTreeGeneratorAPI is required to generate TMP typetrees.\n"
+            "Install it with: `pip install TypeTreeGeneratorAPI`."
+        )
+
+    if compile_method == "Mono":
+        managed_dir = os.path.join(data_path, "Managed")
+        for fn in os.listdir(managed_dir):
+            if not fn.endswith(".dll"):
+                continue
+            try:
+                with open(os.path.join(managed_dir, fn), "rb") as f:
+                    generator.load_dll(f.read())
+            except Exception as e:  # pragma: no cover
+                if lang == "ko":
+                    _log_console(f"경고: DLL 로드 실패 '{fn}': {e}")
+                else:
+                    _log_console(f"Warning: failed to load DLL '{fn}': {e}")
+    else:
+        il2cpp_path = os.path.join(game_path, "GameAssembly.dll")
+        metadata_path = os.path.join(
+            data_path, "il2cpp_data", "Metadata", "global-metadata.dat"
+        )
+        if not os.path.exists(il2cpp_path) or not os.path.exists(metadata_path):
+            if lang == "ko":
+                raise RuntimeError(
+                    "Il2cpp 감지됨. 'GameAssembly.dll'과 'global-metadata.dat'가 필요합니다."
+                )
+            raise RuntimeError(
+                "Detected Il2cpp. 'GameAssembly.dll' and 'global-metadata.dat' are required."
+            )
+        with open(il2cpp_path, "rb") as f:
+            il2cpp = f.read()
+        with open(metadata_path, "rb") as f:
+            metadata = f.read()
+        generator.load_il2cpp(il2cpp, metadata)
+
+    return generator
+
+
+@lru_cache(maxsize=256)
+def _parse_unity_version_triplet(version_text: str) -> tuple[int, int, int] | None:
+    """KR: '2020.3.13f1' 등의 Unity 버전 문자열에서 (major, minor, patch) 튜플을 추출한다.
+    EN: Extract a (major, minor, patch) tuple from a Unity version string like '2020.3.13f1'."""
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", version_text or "")
+    if not match:
+        return None
+    try:
+        return int(match.group(1)), int(match.group(2)), int(match.group(3))
+    except Exception:
+        return None
+
+
+def _tmp_version_hint(unity_version: str | None) -> Literal["new", "old"] | None:
+    """KR: Unity 버전으로 TMP 스키마를 추정한다. 경계 밖이면 None.
+    EN: Estimate TMP schema from Unity version. Returns None if outside boundary range."""
+    if not unity_version:
+        return None
+    triplet = _parse_unity_version_triplet(str(unity_version))
+    if triplet is None:
+        return None
+    if triplet <= _TMP_OLD_ONLY_LAST:
+        return "old"
+    if triplet >= _TMP_NEW_SCHEMA_FIRST:
+        return "new"
+    return None
+
+
+def _safe_list_len(value: Any) -> int:
+    """KR: 리스트이면 길이, 아니면 0.
+    EN: Return length if value is a list, otherwise 0."""
+    return len(value) if isinstance(value, list) else 0
+
+
+def _first_atlas_ref(value: Any) -> JsonDict | None:
+    """KR: 리스트에서 첫 번째 딕셔너리 항목을 반환한다(아틀라스 참조용).
+    EN: Return the first dict item from a list (for atlas reference lookup)."""
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if isinstance(item, dict):
+            return cast(JsonDict, item)
+    return None
+
+
+def _atlas_ref_ids(ref: Any) -> tuple[int, int]:
+    """KR: 아틀라스 참조 딕셔너리에서 (m_FileID, m_PathID) 정수 튜플을 추출한다.
+    EN: Extract an (m_FileID, m_PathID) integer tuple from an atlas reference dict."""
+    if not isinstance(ref, dict):
+        return 0, 0
+    try:
+        file_id = int(ref.get("m_FileID", 0) or 0)
+    except Exception:
+        file_id = 0
+    try:
+        path_id = int(ref.get("m_PathID", 0) or 0)
+    except Exception:
+        path_id = 0
+    return file_id, path_id
+
+
+def _normalize_assets_basename(value: Any) -> str | None:
+    """KR: 경로에서 basename만 추출한다. 역슬래시를 슬래시로 정규화.
+    EN: Extract only the basename from a path. Normalizes backslashes to forward slashes."""
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+    normalized = text.replace("\\", "/")
+    name = os.path.basename(normalized)
+    return name or None
+
+
+def _normalize_asset_lookup_path(value: Any) -> str | None:
+    """KR: 에셋 참조 경로를 정규화한다(archive://, file:// 접두사 제거, 소문자화).
+    EN: Normalize an asset reference path (strip archive://, file:// prefixes, lowercase)."""
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+    normalized = text.replace("\\", "/")
+    lowered = normalized.lower()
+    for prefix in ("archive://", "archive:/", "file://"):
+        if lowered.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            lowered = normalized.lower()
+            break
+    while normalized.startswith("/"):
+        normalized = normalized[1:]
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    normalized = re.sub(r"/{2,}", "/", normalized).strip()
+    return normalized.lower() if normalized else None
+
+
+def _normalize_asset_file_key(path: Any) -> str | None:
+    """KR: 파일 경로를 절대 경로 + OS 정규화(normcase)한 키로 변환한다.
+    EN: Convert a file path into an absolute + OS-normalized (normcase) key."""
+    text = str(path).strip() if path is not None else ""
+    if not text:
+        return None
+    return os.path.normcase(os.path.abspath(text))
+
+
+def _normalize_assets_key(value: Any) -> str | None:
+    """KR: basename을 소문자로 변환한 에셋 조회 키를 반환한다.
+    EN: Return an asset lookup key with the basename lowercased."""
+    name = _normalize_assets_basename(value)
+    return name.lower() if name else None
+
+
+def _build_asset_file_index(
+    assets_files: list[str],
+    data_path: str,
+) -> dict[str, Any]:
+    """KR: 에셋 파일 목록을 상대경로/basename 기반 역인덱스로 구축한다.
+    반환 딕셔너리:
+      path_by_key       : 정규화 키 -> 절대 경로
+      relpath_to_keys   : 상대 경로 -> 키 리스트
+      basename_to_keys  : basename -> 키 리스트 (동명 에셋 중복 감지용)
+
+    EN: Build a reverse index of asset files based on relative paths and basenames.
+    Returned dict:
+      path_by_key       : normalized key -> absolute path
+      relpath_to_keys   : relative path -> list of keys
+      basename_to_keys  : basename -> list of keys (for detecting duplicate asset names)
+    """
+    data_root = os.path.abspath(data_path)
+    path_by_key: dict[str, str] = {}
+    relpath_to_keys: dict[str, list[str]] = {}
+    basename_to_keys: dict[str, list[str]] = {}
+    relpath_by_key: dict[str, str] = {}
+    basename_by_key: dict[str, str] = {}
+
+    for candidate_path in sorted(assets_files):
+        asset_key = _normalize_asset_file_key(candidate_path)
+        if not asset_key:
+            continue
+        abs_path = os.path.abspath(candidate_path)
+        rel_path = os.path.relpath(abs_path, data_root).replace("\\", "/").lower()
+        basename = os.path.basename(abs_path).lower()
+        path_by_key[asset_key] = abs_path
+        relpath_by_key[asset_key] = rel_path
+        basename_by_key[asset_key] = basename
+        relpath_to_keys.setdefault(rel_path, []).append(asset_key)
+        basename_to_keys.setdefault(basename, []).append(asset_key)
+
+    return {
+        "data_root": data_root,
+        "path_by_key": path_by_key,
+        "relpath_to_keys": relpath_to_keys,
+        "basename_to_keys": basename_to_keys,
+        "relpath_by_key": relpath_by_key,
+        "basename_by_key": basename_by_key,
+    }
+
+
+def _extract_external_assets_name(external_ref: Any) -> str | None:
+    """KR: UnityPy 외부 참조 객체에서 에셋 파일명(basename)을 추출한다.
+    path -> pathName -> name -> fileName -> asset_name -> assetPath 순서로 시도.
+    EN: Extract the asset filename (basename) from a UnityPy external reference object.
+    Tries in order: path -> pathName -> name -> fileName -> asset_name -> assetPath."""
+    if external_ref is None:
+        return None
+
+    candidates: list[Any] = []
+    if isinstance(external_ref, dict):
+        candidates.extend(
+            [
+                external_ref.get("path"),
+                external_ref.get("pathName"),
+                external_ref.get("name"),
+                external_ref.get("fileName"),
+                external_ref.get("asset_name"),
+                external_ref.get("assetPath"),
+            ]
+        )
+    else:
+        for attr in (
+            "path",
+            "pathName",
+            "name",
+            "fileName",
+            "asset_name",
+            "assetPath",
+        ):
+            candidates.append(getattr(external_ref, attr, None))
+
+    for candidate in candidates:
+        name = _normalize_assets_basename(candidate)
+        if name:
+            return name
+    return None
+
+
+def _extract_external_assets_candidates(external_ref: Any) -> list[str]:
+    """KR: 외부 참조에서 가능한 모든 경로/이름 후보를 정규화하여 반환한다.
+    EN: Normalize and return all possible path/name candidates from an external reference."""
+    if external_ref is None:
+        return []
+
+    raw_candidates: list[Any] = []
+    if isinstance(external_ref, dict):
+        raw_candidates.extend(
+            [
+                external_ref.get("path"),
+                external_ref.get("pathName"),
+                external_ref.get("name"),
+                external_ref.get("fileName"),
+                external_ref.get("asset_name"),
+                external_ref.get("assetPath"),
+            ]
+        )
+    else:
+        for attr in (
+            "path",
+            "pathName",
+            "name",
+            "fileName",
+            "asset_name",
+            "assetPath",
+        ):
+            raw_candidates.append(getattr(external_ref, attr, None))
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for candidate in raw_candidates:
+        normalized_path = _normalize_asset_lookup_path(candidate)
+        if normalized_path and normalized_path not in seen:
+            seen.add(normalized_path)
+            resolved.append(normalized_path)
+        normalized_name = _normalize_assets_basename(candidate)
+        if normalized_name:
+            lowered_name = normalized_name.lower()
+            if lowered_name not in seen:
+                seen.add(lowered_name)
+                resolved.append(lowered_name)
+    return resolved
+
+
+def _resolve_external_ref(source_assets_file: Any, file_id: int) -> Any:
+    """KR: SerializedFile의 externals 목록에서 FileID에 해당하는 외부 참조를 반환한다.
+    UnityPy의 externals는 dict(키=FileID) 또는 list(인덱스=FileID-1)일 수 있다.
+    FileID=0이면 자기 자신(같은 파일)을 가리키므로 None을 반환.
+
+    EN: Return the external reference corresponding to a FileID from a SerializedFile's externals list.
+    UnityPy's externals can be a dict (key=FileID) or list (index=FileID-1).
+    FileID=0 refers to self (same file), so None is returned."""
+    try:
+        resolved_file_id = int(file_id or 0)
+    except Exception:
+        resolved_file_id = 0
+
+    if resolved_file_id == 0:
+        return None
+
+    externals = getattr(source_assets_file, "externals", None)
+    if externals is None:
+        externals = getattr(source_assets_file, "m_Externals", None)
+
+    if isinstance(externals, dict):
+        external_ref = externals.get(resolved_file_id)
+        if external_ref is None:
+            external_ref = externals.get(resolved_file_id - 1)
+        return external_ref
+
+    if isinstance(externals, (list, tuple)):
+        ext_index = resolved_file_id - 1
+        if 0 <= ext_index < len(externals):
+            return externals[ext_index]
+    return None
+
+
+def _resolve_assets_name_from_file_id(source_assets_file: Any, file_id: int) -> str | None:
+    """KR: FileID로 참조되는 에셋 파일의 basename을 해석한다.
+    FileID=0이면 자기 자신의 이름을 반환.
+    EN: Resolve the basename of the asset file referenced by a FileID.
+    If FileID=0, return the name of the file itself."""
+    try:
+        resolved_file_id = int(file_id or 0)
+    except Exception:
+        resolved_file_id = 0
+
+    if resolved_file_id == 0:
+        return _normalize_assets_basename(getattr(source_assets_file, "name", ""))
+
+    externals = getattr(source_assets_file, "externals", None)
+    if externals is None:
+        externals = getattr(source_assets_file, "m_Externals", None)
+
+    external_ref = _resolve_external_ref(source_assets_file, resolved_file_id)
+    if externals is None:
+        return None
+    return _extract_external_assets_name(external_ref)
+
+
+def _collect_asset_file_index_matches(
+    asset_file_index: dict[str, Any] | None,
+    reference: Any,
+) -> list[str]:
+    """KR: 에셋 파일 인덱스에서 참조 문자열과 일치하는 모든 키를 수집한다.
+    상대경로 완전 일치 -> 접미사 일치 -> basename 일치 순서로 탐색.
+    EN: Collect all keys from the asset file index matching a reference string.
+    Search order: exact relative path -> suffix match -> basename match."""
+    if not isinstance(asset_file_index, dict):
+        return []
+
+    normalized_reference = _normalize_asset_lookup_path(reference)
+    if not normalized_reference:
+        normalized_reference = _normalize_assets_basename(reference)
+        if normalized_reference:
+            normalized_reference = normalized_reference.lower()
+    if not normalized_reference:
+        return []
+
+    relpath_to_keys = cast(
+        dict[str, list[str]],
+        asset_file_index.get("relpath_to_keys", {}),
+    )
+    basename_to_keys = cast(
+        dict[str, list[str]],
+        asset_file_index.get("basename_to_keys", {}),
+    )
+    relpath_by_key = cast(dict[str, str], asset_file_index.get("relpath_by_key", {}))
+
+    matches: list[str] = []
+    seen: set[str] = set()
+
+    def _append_match(match_key: str) -> None:
+        if match_key and match_key not in seen:
+            seen.add(match_key)
+            matches.append(match_key)
+
+    for match_key in relpath_to_keys.get(normalized_reference, []):
+        _append_match(match_key)
+
+    if not matches and "/" in normalized_reference:
+        suffix = "/" + normalized_reference
+        for match_key, rel_path in relpath_by_key.items():
+            if rel_path == normalized_reference or rel_path.endswith(suffix):
+                _append_match(match_key)
+
+    basename = os.path.basename(normalized_reference)
+    for match_key in basename_to_keys.get(basename, []):
+        _append_match(match_key)
+
+    return matches
+
+
+def _choose_asset_file_match(
+    asset_file_index: dict[str, Any] | None,
+    matches: list[str],
+    *,
+    current_file_key: str | None,
+    reference_desc: str,
+) -> str | None:
+    """KR: 여러 매칭 후보 중 최적 1개를 선택한다.
+    단독 매칭 -> 같은 디렉토리 형제 우선 -> 사전순 첫 번째 폴백.
+    EN: Choose the best single match from multiple candidates.
+    Single match -> prefer sibling in same directory -> fallback to first alphabetically."""
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    if current_file_key and isinstance(asset_file_index, dict):
+        path_by_key = cast(dict[str, str], asset_file_index.get("path_by_key", {}))
+        current_path = path_by_key.get(current_file_key)
+        if current_path:
+            current_dir = os.path.dirname(current_path)
+            sibling_matches = [
+                match_key
+                for match_key in matches
+                if os.path.dirname(path_by_key.get(match_key, "")) == current_dir
+            ]
+            if len(sibling_matches) == 1:
+                return sibling_matches[0]
+    chosen = sorted(matches)[0]
+    _log_console(
+        f"Warning: ambiguous asset reference '{reference_desc}' matched {len(matches)} files; using first: {chosen}"
+    )
+    return chosen
+
+
+def _resolve_target_outer_key(
+    current_outer_key: str,
+    source_assets_file: Any,
+    file_id: int,
+    target_assets_name: str | None,
+    *,
+    local_assets_keys: set[str] | None = None,
+    asset_file_index: dict[str, Any] | None,
+) -> str | None:
+    """KR: FileID 참조를 실제 에셋 파일 키로 해석한다.
+    FileID=0이면 현재 파일(current_outer_key).
+    외부 참조이면 externals -> 후보 경로 -> 인덱스 매칭 순서로 해석.
+
+    EN: Resolve a FileID reference to an actual asset file key.
+    FileID=0 means the current file (current_outer_key).
+    For external refs, resolves via externals -> candidate paths -> index matching."""
+    try:
+        resolved_file_id = int(file_id or 0)
+    except Exception:
+        resolved_file_id = 0
+    if resolved_file_id == 0:
+        return current_outer_key
+    target_assets_key = _normalize_assets_key(target_assets_name)
+    if target_assets_key and isinstance(local_assets_keys, set):
+        if target_assets_key in local_assets_keys:
+            return current_outer_key
+
+    external_ref = _resolve_external_ref(source_assets_file, resolved_file_id)
+    candidates = _extract_external_assets_candidates(external_ref)
+    if target_assets_name:
+        normalized_assets_name = _normalize_assets_basename(target_assets_name)
+        if normalized_assets_name:
+            candidates.append(normalized_assets_name.lower())
+
+    for candidate in candidates:
+        matches = _collect_asset_file_index_matches(asset_file_index, candidate)
+        chosen = _choose_asset_file_match(
+            asset_file_index,
+            matches,
+            current_file_key=current_outer_key,
+            reference_desc=str(candidate),
+        )
+        if chosen:
+            return chosen
+    return None
+
+
+def _make_assets_object_key(assets_name: str, path_id: int) -> str:
+    """KR: '에셋명|PathID' 형식의 복합 조회 키를 생성한다.
+    EN: Create a composite lookup key in 'assetName|PathID' format."""
+    normalized_assets = _normalize_assets_key(assets_name)
+    if not normalized_assets:
+        normalized_assets = ""
+    return f"{normalized_assets}|{int(path_id)}"
+
+
+def _has_real_atlas_path(ref: Any) -> bool:
+    """KR: PathID > 0이면 실제 텍스처를 가리키는 유효한 참조.
+    EN: A valid reference pointing to an actual texture if PathID > 0."""
+    _, path_id = _atlas_ref_ids(ref)
+    return path_id > 0
+
+
+def _first_valid_atlas_ref(value: Any) -> JsonDict | None:
+    """KR: 리스트에서 PathID > 0인 첫 번째 유효 아틀라스 참조를 반환한다.
+    EN: Return the first valid atlas reference with PathID > 0 from a list."""
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if isinstance(item, dict) and _has_real_atlas_path(item):
+            return cast(JsonDict, item)
+    return None
+
+
+def _best_atlas_ref(
+    data: JsonDict,
+    *,
+    prefer_new: bool,
+) -> JsonDict | None:
+    """KR: 신형(m_AtlasTextures)/구형(atlas) 중 최선의 아틀라스 참조를 반환한다.
+    우선순위: PathID>0인 유효 참조 -> PathID=0이라도 존재하는 참조.
+    prefer_new=True이면 신형을 먼저 시도.
+
+    EN: Return the best atlas reference from new (m_AtlasTextures) or old (atlas) schema.
+    Priority: valid ref with PathID>0 -> any existing ref even with PathID=0.
+    If prefer_new=True, try new schema first."""
+    new_any = _first_atlas_ref(data.get("m_AtlasTextures"))
+    new_valid = _first_valid_atlas_ref(data.get("m_AtlasTextures"))
+    old_any = (
+        cast(JsonDict | None, data.get("atlas"))
+        if isinstance(data.get("atlas"), dict)
+        else None
+    )
+    old_valid = old_any if _has_real_atlas_path(old_any) else None
+
+    ordered = (
+        (new_valid, old_valid, new_any, old_any)
+        if prefer_new
+        else (old_valid, new_valid, old_any, new_any)
+    )
+    for ref in ordered:
+        if isinstance(ref, dict):
+            return ref
+    return None
+
+
+def detect_tmp_version(
+    data: JsonDict, unity_version: str | None = None
+) -> Literal["new", "old"]:
+    """KR: TMP 폰트 데이터의 스키마(신형/구형)를 판별한다.
+    판별 순서:
+      1. 글리프 테이블 존재: m_GlyphTable(신형) vs m_glyphInfoList(구형)
+      2. FaceInfo 존재: m_FaceInfo(신형) vs m_fontInfo(구형)
+      3. 아틀라스 참조: m_AtlasTextures(신형) vs atlas(구형)
+      4. Unity 버전 힌트 (2018.3.14 이하=구형, 2018.4.2 이상=신형)
+      5. 기타 키(m_CharacterTable 등) 존재 시 신형 추정
+
+    EN: Determine the schema (new/old) of TMP font data.
+    Detection order:
+      1. Glyph table presence: m_GlyphTable (new) vs m_glyphInfoList (old)
+      2. FaceInfo presence: m_FaceInfo (new) vs m_fontInfo (old)
+      3. Atlas reference: m_AtlasTextures (new) vs atlas (old)
+      4. Unity version hint (<=2018.3.14 = old, >=2018.4.2 = new)
+      5. Other keys (m_CharacterTable, etc.) present -> assume new
+    """
+    new_glyph_count = _safe_list_len(data.get("m_GlyphTable"))
+    old_glyph_count = _safe_list_len(data.get("m_glyphInfoList"))
+    has_new_glyphs = new_glyph_count > 0
+    has_old_glyphs = old_glyph_count > 0
+
+    has_new_face = isinstance(data.get("m_FaceInfo"), dict)
+    has_old_face = isinstance(data.get("m_fontInfo"), dict)
+    has_new_atlas = _first_atlas_ref(data.get("m_AtlasTextures")) is not None
+    has_old_atlas = isinstance(data.get("atlas"), dict)
+
+    if has_new_glyphs != has_old_glyphs:
+        return "new" if has_new_glyphs else "old"
+    if new_glyph_count != old_glyph_count:
+        return "new" if new_glyph_count > old_glyph_count else "old"
+    if has_new_face != has_old_face:
+        return "new" if has_new_face else "old"
+    if has_new_atlas != has_old_atlas:
+        return "new" if has_new_atlas else "old"
+
+    hint = _tmp_version_hint(unity_version)
+    if hint is not None:
+        return hint
+
+    if has_new_face or has_new_atlas or "m_CharacterTable" in data:
+        return "new"
+    if has_old_face or has_old_atlas:
+        return "old"
+    return "new"
+
+
+def inspect_tmp_font_schema(
+    data: JsonDict,
+    unity_version: str | None = None,
+) -> dict[str, Any]:
+    """KR: TMP 스키마 판별 + 글리프 수/아틀라스 참조 메타를 통합 반환한다.
+    반환 딕셔너리:
+      version      : "new" | "old"
+      is_tmp       : TMP 에셋 여부
+      glyph_count  : 글리프 수
+      atlas_file_id, atlas_path_id : 아틀라스 Texture2D 참조
+
+    EN: Detect TMP schema and return combined glyph count / atlas reference metadata.
+    Returned dict:
+      version      : "new" | "old"
+      is_tmp       : whether it is a TMP asset
+      glyph_count  : number of glyphs
+      atlas_file_id, atlas_path_id : atlas Texture2D reference
+    """
+    target_version = detect_tmp_version(data, unity_version=unity_version)
+    new_glyph_count = _safe_list_len(data.get("m_GlyphTable"))
+    old_glyph_count = _safe_list_len(data.get("m_glyphInfoList"))
+    has_new_face = isinstance(data.get("m_FaceInfo"), dict)
+    has_old_face = isinstance(data.get("m_fontInfo"), dict)
+    new_atlas_ref = _first_atlas_ref(data.get("m_AtlasTextures"))
+    old_atlas_ref = (
+        cast(JsonDict | None, data.get("atlas"))
+        if isinstance(data.get("atlas"), dict)
+        else None
+    )
+
+    if target_version == "new":
+        glyph_count = new_glyph_count if new_glyph_count > 0 else old_glyph_count
+        atlas_ref = _best_atlas_ref(data, prefer_new=True)
+    else:
+        glyph_count = old_glyph_count if old_glyph_count > 0 else new_glyph_count
+        atlas_ref = _best_atlas_ref(data, prefer_new=False)
+
+    atlas_file_id, atlas_path_id = _atlas_ref_ids(atlas_ref)
+
+    is_tmp = bool(
+        new_glyph_count > 0
+        or old_glyph_count > 0
+        or has_new_face
+        or has_old_face
+        or new_atlas_ref is not None
+        or old_atlas_ref is not None
+    )
+    return {
+        "version": target_version,
+        "is_tmp": is_tmp,
+        "glyph_count": int(glyph_count),
+        "atlas_file_id": int(atlas_file_id),
+        "atlas_path_id": int(atlas_path_id),
+    }
+
+
+def is_tmp_font_asset(obj: Any) -> bool:
+    """KR: MonoBehaviour 객체가 TMP FontAsset인지 판별한다.
+    1차: parse_as_object()로 get_type() == "TMP_FontAsset" 확인.
+    2차: parse_as_dict()로 inspect_tmp_font_schema() 호출.
+
+    EN: Determine whether a MonoBehaviour object is a TMP FontAsset.
+    First: check get_type() == "TMP_FontAsset" via parse_as_object().
+    Second: call inspect_tmp_font_schema() via parse_as_dict()."""
+    try:
+        parse_obj = obj.parse_as_object()
+        if hasattr(parse_obj, "get_type") and parse_obj.get_type() == "TMP_FontAsset":
+            return True
+    except Exception as e:  # pragma: no cover
+        _debug_parse_log(
+            f"[export_fonts] parse_as_object failed (PathID: {obj.path_id}): {e}"
+        )
+
+    try:
+        parse_dict = obj.parse_as_dict()
+    except Exception as e:  # pragma: no cover
+        _debug_parse_log(
+            f"[export_fonts] parse_as_dict failed (PathID: {obj.path_id}): {e}"
+        )
+        return False
+
+    unity_version_hint = getattr(
+        getattr(obj, "assets_file", None), "unity_version", None
+    )
+    info = inspect_tmp_font_schema(
+        parse_dict,
+        unity_version=str(unity_version_hint) if unity_version_hint else None,
+    )
+    return bool(info.get("is_tmp"))
+
+
+def extract_tmp_refs(parse_dict: JsonDict) -> dict[str, int] | None:
+    """KR: TMP 폰트 데이터에서 atlas Texture2D와 Material의 참조 ID를 추출한다.
+    반환:
+      atlas_file_id, atlas_path_id, material_file_id, material_path_id
+    또는 유효하지 않으면(글리프 0개, 참조 없음, 외부 stub) None.
+    부수효과: m_CreationSettings.characterSequence를 빈 문자열로 정규화하여
+    직렬화 diff 노이즈를 방지한다.
+
+    EN: Extract atlas Texture2D and Material reference IDs from TMP font data.
+    Returns:
+      atlas_file_id, atlas_path_id, material_file_id, material_path_id
+    or None if invalid (zero glyphs, no reference, or external stub).
+    Side effect: normalizes m_CreationSettings.characterSequence to empty string
+    to prevent noisy serialization diffs."""
+    info = inspect_tmp_font_schema(parse_dict)
+    glyph_count = int(info.get("glyph_count", 0) or 0)
+    version = str(info.get("version", "new"))
+    atlas_ref = _best_atlas_ref(parse_dict, prefer_new=(version == "new"))
+    file_id, path_id = _atlas_ref_ids(atlas_ref)
+    if path_id <= 0:
+        fallback_atlas_ref = _best_atlas_ref(parse_dict, prefer_new=(version != "new"))
+        file_id, path_id = _atlas_ref_ids(fallback_atlas_ref)
+
+    if glyph_count == 0:
+        return None
+    if file_id == 0 and path_id == 0:
+        return None
+
+    # KR: 외부 참조 stub(FileID!=0, PathID=0)은 실제 텍스처를 가리키지 않으므로 제외합니다.
+    # EN: Skip external stubs (FileID!=0, PathID=0) because they do not point to a real texture.
+    if file_id != 0 and path_id == 0:
+        return None
+
+    material_ref = parse_dict.get("m_Material")
+    if not isinstance(material_ref, dict):
+        alt_material = parse_dict.get("material")
+        material_ref = alt_material if isinstance(alt_material, dict) else {}
+    material_file_id, material_path_id = _atlas_ref_ids(material_ref)
+
+    creation_settings = parse_dict.get("m_CreationSettings")
+    if isinstance(creation_settings, dict):
+        # KR: 교체/추출 시 문자열 시퀀스 잡음을 방지하기 위해 빈 문자열로 정규화합니다.
+        # EN: Normalize characterSequence to empty to avoid noisy serialized diffs.
+        creation_settings["characterSequence"] = ""
+
+    return {
+        "atlas_file_id": file_id,
+        "atlas_path_id": path_id,
+        "material_file_id": material_file_id,
+        "material_path_id": material_path_id,
+    }
+
+
+def export_fonts(
+    game_path: str,
+    data_path: str,
+    output_dir: str | None = None,
+    lang: Language = "ko",
+) -> int:
+    """KR: 게임 에셋에서 TMP SDF 폰트를 JSON/PNG로 추출한다.
+    처리 흐름:
+      1패스: 모든 에셋 파일의 MonoBehaviour -> TMP FontAsset 판별 -> JSON 저장
+             + atlas/material 참조를 outer_key별로 수집
+      2패스: 수집된 참조 대상 에셋 파일만 재로드 -> Texture2D -> PNG,
+             Material -> JSON 추출
+    반환: 추출된 SDF 폰트 수.
+
+    EN: Extract TMP SDF fonts from game assets as JSON/PNG.
+    Processing flow:
+      Pass 1: All asset files' MonoBehaviours -> identify TMP FontAsset -> save JSON
+              + collect atlas/material references per outer_key
+      Pass 2: Reload only referenced asset files -> Texture2D -> PNG,
+              Material -> JSON extraction
+    Returns: number of extracted SDF fonts."""
+    if output_dir is None:
+        output_dir = os.getcwd()
+    os.makedirs(output_dir, exist_ok=True)
+
+    unity_version = get_unity_version(data_path)
+    assets_files = find_assets_files(data_path)
+    compile_method = get_compile_method(data_path)
+    generator = create_generator(
+        unity_version, game_path, data_path, compile_method, lang
+    )
+
+    if lang == "ko":
+        _log_console(f"게임 경로: {game_path}")
+        _log_console(f"데이터 경로: {data_path}")
+        _log_console(f"Unity 버전: {unity_version}")
+        _log_console(f"컴파일 방식: {compile_method}")
+        _log_console(f"출력 폴더: {output_dir}")
+    else:
+        _log_console(f"Game path: {game_path}")
+        _log_console(f"Data path: {data_path}")
+        _log_console(f"Unity version: {unity_version}")
+        _log_console(f"Compile method: {compile_method}")
+        _log_console(f"Output folder: {output_dir}")
+    _log_console()
+
+    exported_count = 0
+    asset_file_index = _build_asset_file_index(assets_files, data_path)
+    asset_path_by_key = cast(dict[str, str], asset_file_index.get("path_by_key", {}))
+    basename_to_keys = cast(
+        dict[str, list[str]],
+        asset_file_index.get("basename_to_keys", {}),
+    )
+    texture_targets_by_outer: dict[str, dict[str, str]] = {}
+    material_targets_by_outer: dict[str, dict[str, str]] = {}
+    outer_display_by_key: dict[str, str] = {}
+    duplicate_asset_names: dict[str, list[str]] = {
+        basename: [asset_path_by_key[key] for key in keys if key in asset_path_by_key]
+        for basename, keys in basename_to_keys.items()
+        if len(keys) > 1
+    }
+
+    if duplicate_asset_names:
+        for duplicate_name, duplicate_paths in sorted(duplicate_asset_names.items()):
+            if lang == "ko":
+                _log_console(
+                    f"경고: 동일 basename 에셋이 여러 개 있습니다: '{duplicate_name}'. "
+                    f"가능하면 외부 참조 path를 이용해 해석하지만, 모호하면 첫 경로를 사용합니다. "
+                    f"경로 목록: {duplicate_paths}"
+                )
+            else:
+                _log_console(
+                    f"Warning: duplicate asset basename '{duplicate_name}' detected; "
+                    f"the exporter will try external ref paths first, but falls back to the first match when ambiguous. "
+                    f"Paths: {duplicate_paths}"
+                )
+
+    for outer_key, outer_path in asset_path_by_key.items():
+        assets_file = outer_path
+        outer_name = os.path.basename(assets_file)
+        outer_display_by_key.setdefault(outer_key, outer_name)
+        try:
+            env = UnityPy.load(assets_file)
+            env.typetree_generator = generator
+        except Exception as e:  # pragma: no cover
+            if lang == "ko":
+                _log_console(
+                    f"경고: 파일 로드 실패 '{os.path.basename(assets_file)}': {e}"
+                )
+            else:
+                _log_console(
+                    f"Warning: failed to load '{os.path.basename(assets_file)}': {e}"
+                )
+            continue
+
+        local_assets_keys: set[str] = {outer_key}
+        for env_obj in env.objects:
+            asset_key = _normalize_assets_key(
+                getattr(getattr(env_obj, "assets_file", None), "name", None)
+            )
+            if asset_key:
+                local_assets_keys.add(asset_key)
+
+        for obj in env.objects:
+            if obj.type.name != "MonoBehaviour":
+                continue
+            try:
+                if not is_tmp_font_asset(obj):
+                    continue
+                parse_dict = obj.parse_as_dict()
+                refs = extract_tmp_refs(parse_dict)
+                if not refs:
+                    continue
+
+                objname = obj.peek_name() or f"TMP_FontAsset_{obj.path_id}"
+                source_assets_file = getattr(obj, "assets_file", None)
+                atlas_target_assets_name = _resolve_assets_name_from_file_id(
+                    source_assets_file, refs["atlas_file_id"]
+                ) or _resolve_assets_name_from_file_id(
+                    source_assets_file, 0
+                )
+                atlas_target_outer_key = _resolve_target_outer_key(
+                    outer_key,
+                    source_assets_file,
+                    refs["atlas_file_id"],
+                    atlas_target_assets_name,
+                    local_assets_keys=local_assets_keys,
+                    asset_file_index=asset_file_index,
+                )
+                material_target_assets_name = _resolve_assets_name_from_file_id(
+                    source_assets_file, refs["material_file_id"]
+                ) or _resolve_assets_name_from_file_id(
+                    source_assets_file, 0
+                )
+                material_target_outer_key = _resolve_target_outer_key(
+                    outer_key,
+                    source_assets_file,
+                    refs["material_file_id"],
+                    material_target_assets_name,
+                    local_assets_keys=local_assets_keys,
+                    asset_file_index=asset_file_index,
+                )
+                if lang == "ko":
+                    _log_console(f"SDF 폰트 발견: {objname} (PathID: {obj.path_id})")
+                    _log_console(
+                        f"  Atlas 텍스처: FileID {refs['atlas_file_id']} / "
+                        f"PathID {refs['atlas_path_id']} -> {atlas_target_assets_name}"
+                    )
+                    _log_console(
+                        f"  머티리얼: FileID {refs['material_file_id']} / "
+                        f"PathID {refs['material_path_id']} -> {material_target_assets_name}"
+                    )
+                else:
+                    _log_console(f"SDF font found: {objname} (PathID: {obj.path_id})")
+                    _log_console(
+                        f"  Atlas texture: FileID {refs['atlas_file_id']} / "
+                        f"PathID {refs['atlas_path_id']} -> {atlas_target_assets_name}"
+                    )
+                    _log_console(
+                        f"  Material: FileID {refs['material_file_id']} / "
+                        f"PathID {refs['material_path_id']} -> {material_target_assets_name}"
+                    )
+
+                if atlas_target_assets_name and atlas_target_outer_key:
+                    outer_display_by_key.setdefault(
+                        atlas_target_outer_key,
+                        os.path.basename(
+                            asset_path_by_key.get(atlas_target_outer_key, assets_file)
+                        ),
+                    )
+                    texture_targets_by_outer.setdefault(atlas_target_outer_key, {})[
+                        _make_assets_object_key(
+                            atlas_target_assets_name,
+                            refs["atlas_path_id"],
+                        )
+                    ] = objname.replace(" SDF", " SDF Atlas")
+
+                if (
+                    refs["material_path_id"] > 0
+                    and material_target_assets_name
+                    and material_target_outer_key
+                ):
+                    outer_display_by_key.setdefault(
+                        material_target_outer_key,
+                        os.path.basename(
+                            asset_path_by_key.get(material_target_outer_key, assets_file)
+                        ),
+                    )
+                    material_targets_by_outer.setdefault(material_target_outer_key, {})[
+                        _make_assets_object_key(
+                            material_target_assets_name,
+                            refs["material_path_id"],
+                        )
+                    ] = objname
+
+                json_path = os.path.join(output_dir, f"{objname}.json")
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(parse_dict, indent=4, ensure_ascii=False, fp=f)
+                if lang == "ko":
+                    _log_console(f"  -> {objname}.json 저장됨")
+                else:
+                    _log_console(f"  -> {objname}.json saved")
+                exported_count += 1
+            except Exception as e:  # pragma: no cover
+                if lang == "ko":
+                    _log_console(
+                        f"경고: TMP 파싱 실패 (파일: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}"
+                    )
+                else:
+                    _log_console(
+                        f"Warning: TMP parse failed (file: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}"
+                    )
+
+        _close_env(env)
+
+    unresolved_texture_targets = {
+        outer_key: dict(bucket)
+        for outer_key, bucket in texture_targets_by_outer.items()
+        if bucket
+    }
+    unresolved_material_targets = {
+        outer_key: dict(bucket)
+        for outer_key, bucket in material_targets_by_outer.items()
+        if bucket
+    }
+
+    for outer_key, assets_file in asset_path_by_key.items():
+        outer_name = os.path.basename(assets_file)
+        texture_bucket = unresolved_texture_targets.get(outer_key)
+        material_bucket = unresolved_material_targets.get(outer_key)
+        if not texture_bucket and not material_bucket:
+            continue
+
+        try:
+            env = UnityPy.load(assets_file)
+            env.typetree_generator = generator
+        except Exception as e:  # pragma: no cover
+            if lang == "ko":
+                _log_console(
+                    f"경고: 추출 대상 파일 로드 실패 '{os.path.basename(assets_file)}': {e}"
+                )
+            else:
+                _log_console(
+                    f"Warning: failed to load export target '{os.path.basename(assets_file)}': {e}"
+                )
+            continue
+
+        for obj in env.objects:
+            try:
+                object_assets_name = _resolve_assets_name_from_file_id(
+                    getattr(obj, "assets_file", None), 0
+                ) or outer_name
+                object_key = _make_assets_object_key(object_assets_name, obj.path_id)
+
+                if obj.type.name == "Texture2D" and texture_bucket:
+                    export_name = texture_bucket.pop(object_key, None)
+                    if export_name is None:
+                        continue
+                    tex = obj.parse_as_object()
+                    image = tex.image
+                    texture_meta = _extract_texture_metadata(tex)
+                    if lang == "ko":
+                        _log_console(
+                            f"텍스처 추출: {export_name} "
+                            f"({object_assets_name}, PathID: {obj.path_id})"
+                        )
+                    else:
+                        _log_console(
+                            f"Extracting texture: {export_name} "
+                            f"({object_assets_name}, PathID: {obj.path_id})"
+                        )
+                    png_path = os.path.join(output_dir, f"{export_name}.png")
+                    image.save(png_path)
+                    meta_path = os.path.join(
+                        output_dir, f"{export_name}.texture-meta.json"
+                    )
+                    with open(meta_path, "w", encoding="utf-8") as f:
+                        json.dump(texture_meta, f, indent=4, ensure_ascii=False)
+                    if lang == "ko":
+                        _log_console(f"  -> {export_name}.png 저장됨")
+                        _log_console(f"  -> {export_name}.texture-meta.json 저장됨")
+                    else:
+                        _log_console(f"  -> {export_name}.png saved")
+                        _log_console(f"  -> {export_name}.texture-meta.json saved")
+                elif obj.type.name == "Material" and material_bucket:
+                    source_font_name = material_bucket.pop(object_key, None)
+                    if source_font_name is None:
+                        continue
+                    mat = obj.parse_as_dict()
+                    mat_name = obj.peek_name() or f"Material_{obj.path_id}"
+                    mat_path = os.path.join(output_dir, f"{mat_name}.json")
+                    with open(mat_path, "w", encoding="utf-8") as f:
+                        json.dump(mat, f, indent=4, ensure_ascii=False)
+                    if lang == "ko":
+                        _log_console(
+                            f"머티리얼 추출: {mat_name} "
+                            f"({object_assets_name}, PathID: {obj.path_id}, source: {source_font_name})"
+                        )
+                    else:
+                        _log_console(
+                            f"Extracting material: {mat_name} "
+                            f"({object_assets_name}, PathID: {obj.path_id}, source: {source_font_name})"
+                        )
+            except Exception as e:  # pragma: no cover
+                if lang == "ko":
+                    _log_console(
+                        f"경고: 추출 중 오류 (파일: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}"
+                    )
+                else:
+                    _log_console(
+                        f"Warning: export error (file: {os.path.basename(assets_file)}, PathID: {obj.path_id}): {e}"
+                    )
+
+        _close_env(env)
+
+        if texture_bucket is not None and not texture_bucket:
+            unresolved_texture_targets.pop(outer_key, None)
+        if material_bucket is not None and not material_bucket:
+            unresolved_material_targets.pop(outer_key, None)
+
+    for outer_key, bucket in sorted(unresolved_texture_targets.items()):
+        if not bucket:
+            continue
+        display_name = outer_display_by_key.get(outer_key, outer_key)
+        if lang == "ko":
+            _log_console(
+                f"경고: 텍스처 참조 {len(bucket)}개를 찾지 못했습니다 ({display_name})"
+            )
+        else:
+            _log_console(
+                f"Warning: {len(bucket)} texture reference(s) could not be resolved ({display_name})"
+            )
+
+    for outer_key, bucket in sorted(unresolved_material_targets.items()):
+        if not bucket:
+            continue
+        display_name = outer_display_by_key.get(outer_key, outer_key)
+        if lang == "ko":
+            _log_console(
+                f"경고: 머티리얼 참조 {len(bucket)}개를 찾지 못했습니다 ({display_name})"
+            )
+        else:
+            _log_console(
+                f"Warning: {len(bucket)} material reference(s) could not be resolved ({display_name})"
+            )
+
+    return exported_count
+
+
+def main_cli(lang: Language = "ko") -> None:
+    """KR: SDF 폰트 추출 CLI 엔트리포인트.
+    게임 경로를 인자 또는 대화형 입력으로 받아 export_fonts()를 실행한다.
+    EN: CLI entry point for SDF font extraction.
+    Accepts a game path via argument or interactive input and runs export_fonts()."""
+    _configure_logging()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Unity 게임에서 TMP SDF 폰트를 추출합니다."
+            if lang == "ko"
+            else "Export TMP SDF fonts from a Unity game."
+        )
+    )
+    parser.add_argument(
+        "gamepath",
+        nargs="?",
+        help=(
+            "게임 루트 경로 또는 _Data 경로 (예: D:\\Games\\Muck)"
+            if lang == "ko"
+            else "Game root path or _Data path (e.g. D:\\Games\\Muck)"
+        ),
+    )
+    args = parser.parse_args()
+
+    if lang == "ko":
+        _log_console("=== Unity SDF 폰트 추출기 ===")
+    else:
+        _log_console("=== Unity SDF Font Exporter ===")
+    _log_console()
+
+    input_path = args.gamepath
+    if not input_path:
+        if lang == "ko":
+            input_path = input("게임 경로를 입력하세요: ").strip()
+            if not input_path:
+                exit_with_error(lang, "게임 경로가 필요합니다.")
+        else:
+            input_path = input("Enter game path: ").strip()
+            if not input_path:
+                exit_with_error(lang, "Game path is required.")
+
+    if not os.path.isdir(input_path):
+        if lang == "ko":
+            exit_with_error(lang, f"'{input_path}'는 유효한 디렉토리가 아닙니다.")
+        else:
+            exit_with_error(lang, f"'{input_path}' is not a valid directory.")
+
+    try:
+        game_path, data_path = resolve_game_path(lang, input_path)
+        exported_count = export_fonts(game_path, data_path, lang=lang)
+    except Exception as e:
+        exit_with_error(lang, str(e))
+
+    _log_console()
+    if lang == "ko":
+        _log_console(f"완료! {exported_count}개의 SDF 폰트가 추출되었습니다.")
+        input("\n엔터를 눌러 종료...")
+    else:
+        _log_console(f"Done! Exported {exported_count} SDF font(s).")
+        input("\nPress Enter to exit...")
