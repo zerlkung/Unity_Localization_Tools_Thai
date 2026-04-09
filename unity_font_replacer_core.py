@@ -3374,6 +3374,55 @@ def _apply_ps4_bc_swizzle_to_texture(
     return True, "ok"
 
 
+def _apply_ps4_raw_swizzle_to_texture(
+    parse_dict: Any,
+    *,
+    width: int,
+    height: int,
+) -> tuple[bool, str]:
+    """KR: 비압축 포맷(Alpha8 등) 텍스처에 PS4 pixel-level swizzle을 적용합니다.
+    EN: Apply PS4 pixel-level swizzle to uncompressed textures (Alpha8, RGBA32, etc.).
+    """
+    try:
+        texture_format = int(getattr(parse_dict, "m_TextureFormat", -1) or -1)
+    except Exception:
+        return False, "unknown_format"
+
+    bpp = _PS4_RAW_FORMAT_BPP.get(texture_format)
+    if bpp is None:
+        return False, "unsupported_format"
+
+    try:
+        mip_count = int(getattr(parse_dict, "m_MipCount", 1) or 1)
+    except Exception:
+        mip_count = 1
+    if mip_count > 1:
+        return False, "mips_unsupported"
+
+    raw = getattr(parse_dict, "image_data", None)
+    if not isinstance(raw, (bytes, bytearray)):
+        return False, "missing_image_data"
+    raw_bytes = bytes(raw)
+
+    expected = width * height * bpp
+    if len(raw_bytes) < expected:
+        return False, "data_too_small"
+
+    swizzled = ps4_swizzle_raw(raw_bytes[:expected], width, height, bpp)
+    parse_dict.image_data = swizzled
+    if hasattr(parse_dict, "m_CompleteImageSize"):
+        parse_dict.m_CompleteImageSize = int(len(swizzled))
+    stream_data = getattr(parse_dict, "m_StreamData", None)
+    if stream_data is not None:
+        try:
+            stream_data.offset = 0
+            stream_data.size = 0
+            stream_data.path = ""
+        except Exception:
+            pass
+    return True, "ok"
+
+
 @lru_cache(maxsize=128)
 def _ps5_bit_positions(mask: int) -> tuple[int, ...]:
     """KR: 마스크에서 세트된 비트 위치 목록을 반환합니다.
@@ -3665,6 +3714,44 @@ def ps4_unswizzle_bc_blocks(
         data, width, height, block_width, block_height, block_data_size,
         unswizzle=True,
     )
+
+
+# KR: PS4 비압축 포맷 → 픽셀당 바이트 수.
+# EN: PS4 uncompressed formats → bytes per pixel.
+# 동일한 Morton 8×8 패턴을 픽셀 단위(block_width=1, block_height=1)로 적용한다.
+# The same Morton 8×8 pattern is applied at pixel granularity (block_width=1, block_height=1).
+_PS4_RAW_FORMAT_BPP: dict[int, int] = {
+    1:  1,   # Alpha8
+    2:  2,   # ARGB4444
+    3:  3,   # RGB24
+    4:  4,   # RGBA32
+    5:  4,   # ARGB32
+    7:  2,   # RGB565
+    9:  2,   # R16
+    13: 2,   # RGBA4444
+    62: 2,   # RG16
+    63: 1,   # R8
+    64: 2,   # RHalf
+    65: 4,   # RGHalf
+    66: 8,   # RGBAHalf
+    67: 4,   # RFloat
+    68: 8,   # RGFloat
+    69: 16,  # RGBAFloat
+}
+
+
+def ps4_swizzle_raw(data: bytes, width: int, height: int, bytes_per_pixel: int) -> bytes:
+    """KR: 선형 비압축 픽셀 데이터를 PS4 swizzled order로 변환한다.
+    EN: Convert linear uncompressed pixel data to PS4 swizzled order.
+    """
+    return _ps4_swizzle_bc_blocks(data, width, height, 1, 1, bytes_per_pixel, unswizzle=False)
+
+
+def ps4_unswizzle_raw(data: bytes, width: int, height: int, bytes_per_pixel: int) -> bytes:
+    """KR: PS4 swizzled 비압축 픽셀 데이터를 선형 순서로 복원한다.
+    EN: Restore PS4 swizzled uncompressed pixel data to linear order.
+    """
+    return _ps4_swizzle_bc_blocks(data, width, height, 1, 1, bytes_per_pixel, unswizzle=True)
 
 
 def _texture_format_is_crunched(texture_format: int) -> bool:
